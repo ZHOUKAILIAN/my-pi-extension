@@ -6,9 +6,21 @@
 
 它不是一个用于提醒模型遵守流程的 prompt 集合；它必须以工具白名单、状态转换校验、产物 schema 和审计记录执行控制。
 
+## Work
+
+面向已有代码或已有功能的工作入口。Work 先由 investigator 判断任务类型：局部变更、需求变更、技术方案变更、需要更多证据或需要用户决策的阻塞。已有行为异常或回归必须重路由到 Bug 入口，不能用 Work 的局部变更路径绕过根因调查。需求变更进入需求对齐；技术方案变更进入需求/方案对齐；局部变更不因形式要求被迫走完整设计流程。
+
+## Build
+
+面向新需求或新用户目标的建设入口。Build 必须先经过多 agent 需求和技术方案对齐，形成批准的方案与验收标准，之后才能进入实现、交叉 review 和独立验证。
+
+## Bug
+
+面向已有行为异常或回归的入口。Bug 的第一阶段是事实、影响面和根因调查。调查产物必须判断最小可接受修复路径：`local_fix`、`requirement_change`、`design_change`、`needs_more_evidence` 或 `blocked`。只有有证据表明最小可接受修复必须改变架构、模块边界、数据/API 契约、核心状态机或既有技术决策时，才进入技术方案对齐；需求变化进入需求对齐；证据不足不能伪装成局部修复。
+
 ## Workflow Run
 
-从一个用户目标创建的一次受状态机控制的工作实例，以 `runId` 标识。一个 Workflow Run 由若干阶段、委派记录和产物组成，且绑定工作目录与基准修订版本。
+从一个 Work、Build 或 Bug 入口创建的一次受状态机控制的工作实例，以 `runId` 标识。一个 Workflow Run 由若干阶段、委派记录和产物组成，且绑定工作目录与基准修订版本。
 
 ## Stage
 
@@ -16,7 +28,7 @@ Workflow Run 中受状态机约束的阶段，例如调研、方案提议、质�
 
 ## Role
 
-在一个委派中授予 worker 的职责与权限集合，例如 `investigator`、`architect`、`challenger`、`implementer`、`reviewer`、`verifier`、`arbiter`。Role 不是模型名称，也不是用户身份。
+在一个委派中授予 worker 的职责与权限集合，例如 `investigator`、`requirement_proposer`、`architect`、`challenger`、`implementer`、`reviewer`、`verifier`、`arbiter`。Role 不是模型名称，也不是用户身份。
 
 ## Worker
 
@@ -54,8 +66,8 @@ Skill Routing 不是安全权限控制。即使未被 Pi 发现的 skill，拥�
 
 ## Disposition
 
-对 Review Finding 的正式处理结论：`fixed`、`accepted`、`rejected` 或 `blocked`。实现者不能单独关闭自己的 Finding；必要时由 Reviewer 复核并由 Arbiter 裁决。
+Review Finding 有两个阶段性状态：实现者回应 `fixed_claimed`、`disagree` 或 `blocked`，以及 Reviewer/Arbiter 正式关闭 `resolved_fixed`、`resolved_rejected` 或 `blocked`。实现者不能单独关闭自己的 Finding；`blocked` 不是通过，必需 Finding 只能使 Workflow Run 停在 `BLOCKED`。
 
 ## Arbiter
 
-对达到轮次上限、证据冲突或影响状态推进的争议作出正式决定的 Role。Arbiter 不得兼任当前变更的唯一实现者和唯一审查者。
+对达到轮次上限、证据冲突或影响状态推进的争议作出正式决定的 Role。Arbiter 必须使用不同于当前提案者、挑战者、实现者和唯一 Reviewer 的 `workerId`；不得裁决自己的方案、自己的 Finding 或自己实现的唯一变更。

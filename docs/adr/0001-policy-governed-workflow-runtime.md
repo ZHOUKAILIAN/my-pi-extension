@@ -1,6 +1,6 @@
 # ADR 0001: Use a Policy-Governed Workflow Runtime
 
-- Status: Accepted for prototype
+- Status: Accepted for prototype, revised after 2026-08-18 multi-model review
 - Date: 2026-08-18
 
 ## Context
@@ -21,9 +21,9 @@ Implement the extension as a Policy-Governed Workflow Runtime.
 
 A versioned Policy is the single source of control for each Workflow Run. It defines stages, allowed roles, state transitions, skill routes, Context Capsule construction, tool allowlists, artifact schemas, budgets, approval requirements, and write modes.
 
-The extension validates and executes Policy. The main agent may request a delegation but cannot independently expand its tools, skill set, or worker context beyond Policy.
+The extension validates and executes Policy. The main agent may request a delegation but cannot independently expand its tools, skill set, or worker context beyond Policy. All non-allowlisted tools fail closed.
 
-Workers receive a minimal Context Capsule and exchange information through versioned Artifacts, not through unrestricted inheritance of the main session. The initial worker runtime is a child Pi CLI process. Skill discovery is constrained with `--no-skills` and explicit `--skill` paths. Capability isolation is enforced separately through tool allowlists and, where needed, shell wrappers, worktrees, or containers.
+Workers receive a minimal Context Capsule and exchange information through versioned Artifacts, not through unrestricted inheritance of the main session. Context is either strict and explicitly injected with `--no-context-files`, or inherited with every loaded context file captured in a manifest and hash. The initial worker runtime is a child Pi CLI process. Skill discovery is constrained with `--no-skills` and explicit, hash-pinned `--skill` paths. Capability isolation is enforced separately through tool allowlists and, where needed, shell wrappers, worktrees, process policy, and containers/OS sandboxes. CLI flags and Pi tool lists are resource controls, not a security sandbox.
 
 ## Consequences
 
@@ -39,7 +39,8 @@ Costs:
 - Policy schema design and validation become core product work.
 - Some flexible one-off behavior requires an explicit policy extension or user escalation.
 - Pi CLI resource controls alone do not form a security sandbox; filesystem and shell boundaries need separate implementation and validation.
-- The initial CLI-worker protocol needs structured-result validation and may later migrate to RPC or the Pi SDK.
+- The initial CLI-worker protocol needs structured-result validation and early JSON/RPC evaluation for tool events, usage and resource manifests.
+- Policy, Artifact and trace data must be kept in a worker-unwritable control plane and fixed by digest for each run.
 
 ## Alternatives Considered
 
