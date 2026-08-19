@@ -17,7 +17,7 @@ function commandHarness(options: { answers?: any[]; cwd?: string; model?: any; r
     registerCommand: (_name: string, value: any) => { command = value.handler; },
   };
   const ctx: any = {
-    cwd: options.cwd ?? process.cwd(),
+    cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')),
     model: options.model,
     modelRegistry: options.registry,
     thinkingLevel: 'high',

@@ -13,11 +13,24 @@ test('public parser exposes only a problem description', () => {
     assert.deepEqual(parseBugFixCommand(command), { valid: false, usage });
 });
 
-test('policy defaults and resolves inherited model', () => {
+test('policy defaults use the investigation model and inherit elsewhere', () => {
   const policy = loadModelPolicy('/definitely/missing/workflow-models.json');
-  assert.equal(policy.nodes.investigate.configuredRef, 'inherit');
+  assert.equal(policy.nodes.investigate.configuredRef, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.implement.configuredRef, 'inherit');
+  assert.equal(policy.nodes.verify.configuredRef, 'inherit');
+
   const model = { provider: 'p', id: 'm' };
+  const investigationModel = { provider: 'smartingredients', id: 'gpt-5.6-sol' };
+  assert.equal(resolveModelRef(policy.nodes.investigate.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'smartingredients' && id === 'gpt-5.6-sol' ? investigationModel : undefined }), investigationModel);
   assert.equal(resolveModelRef('inherit', model, undefined), model);
+});
+
+test('fixed investigation default resolves without ctx.model, while inherit does not', () => {
+  const registry = { find: (provider: string, id: string) => ({ provider, id }) };
+  assert.deepEqual(resolveModelRef('smartingredients/gpt-5.6-sol', undefined, registry), {
+    provider: 'smartingredients', id: 'gpt-5.6-sol',
+  });
+  assert.throws(() => resolveModelRef('inherit', undefined, registry), /requires ctx\.model/);
 });
 
 test('policy accepts partial node overrides', () => {

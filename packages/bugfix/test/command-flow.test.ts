@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import extension from '../src/extension.ts';
 import type { Artifact } from '@pi/workflow-contracts';
 
@@ -18,7 +21,7 @@ test('command handler runs injected worker through all stages and checkpoints', 
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     appendEntry: (_type: string, data: any) => entries.push({ customType: 'workflow-run', data }),
   };
-  const ctx: any = { sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
+  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
   extension(pi);
   await command('登录后白屏', ctx);
   assert.equal(calls, 3);
@@ -38,7 +41,7 @@ test('command handler runs injected worker through all stages and checkpoints', 
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     appendEntry: (_type: string, data: any) => retryEntries.push({ customType: 'workflow-run', data }),
   };
-  const retryCtx: any = { sessionManager: { getEntries: () => retryEntries }, ui: { notify() {} } };
+  const retryCtx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => retryEntries }, ui: { notify() {} } };
   extension(retryPi);
   await command('登录后白屏', retryCtx);
   assert.equal(retryCalls, 5);

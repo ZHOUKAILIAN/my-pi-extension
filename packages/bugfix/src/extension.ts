@@ -16,7 +16,10 @@ export default function bugFixExtension(pi: ExtensionAPI) {
     const audits: any[] = [];
     for (const nodeId of nodes) {
       const configuredRef = policy.nodes[nodeId].configuredRef;
-      const resolved = resolveModelRef(configuredRef, (ctx as any).model ?? (injected ? { provider: 'injected', id: 'bugFixWorker' } : undefined), (ctx as any).modelRegistry);
+      const registry = (ctx as any).modelRegistry ?? {
+        find: (provider: string, id: string) => injected && policy.nodes[nodeId].source === 'runtime-default' ? { provider, id } : undefined,
+      };
+      const resolved = resolveModelRef(configuredRef, (ctx as any).model ?? (injected ? { provider: 'injected', id: 'bugFixWorker' } : undefined), registry);
       const model = injected ? ((ctx as any).model ?? resolved) : resolved;
       const worker = injected ?? new PiSdkWorkerExecutor({ model, thinkingLevel: resolvedThinkingLevel });
       const definition = bugFixNodes(worker)[nodeId];
