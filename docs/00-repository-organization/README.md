@@ -1,21 +1,28 @@
 # 00：仓库组织形式
 
-- 状态：`ALIGNING`
+- 状态：`DECIDED`
 - 类型：Extension 集合总体方案
 
 ## 要回答的问题
 
 `my-pi-extension` 这个仓库如何承载多个 Pi extension？
 
-## 待对齐问题
+## 已确认的组织决策
 
-1. 是一个 Pi package，还是一个仓库内多个可独立安装的 package？
-2. 共享 core 是否需要存在？如果需要，哪些能力进入 core？
-3. extension 是独立加载，还是由一个主 extension 统一注册？
-4. Policy、artifact、trace、skill 和测试放在哪里？
-5. extension 之间如何协作：共享库、事件、artifact，还是其他协议？
-6. 如何安装、启用、禁用、升级和回滚单个 extension？
-7. 如何保证一个 extension 的失败不会污染其他 extension？
+1. 一个 Git monorepo 内包含三个独立 Pi package：`build`、`work`、`bug`。
+2. 每个 package 提供一个顶层 workflow extension，分别注册 `/build`、`/work`、`/bug`。
+3. 每个 package 内部使用共享 Workflow Runtime + 自己的 Workflow Definition 和普通 Node。
+4. Worker 通过 Pi SDK 创建独立 `AgentSession`；Artifact 和 Context Capsule 由 Controller 显式交接。
+5. Node 暂不拆成独立 Pi extension 或 package；只有满足独立入口、生命周期、权限、复用、发布、隔离和稳定协议等条件时才重新评审。
+6. `workflow-runtime`、`workflow-contracts` 暂作为 monorepo 内普通 workspace library，不默认作为 Pi package 发布。
+
+## 后续设计问题
+
+1. 三个 package 的 workspace、manifest 和发布流程如何实现？
+2. Workflow Runtime 的 contracts、hooks 和持久化接口如何定义？
+3. 每个 workflow 的 Node、Transition、Policy、Artifact 和 Acceptance Criteria 如何设计？
+4. `workflow-ui` 是否需要独立成为 Pi extension？
+5. 哪些风险场景需要把 SDK Worker 升级为 RPC/CLI 进程隔离？
 
 ## 当前讨论范围
 
@@ -39,7 +46,7 @@ Policy、artifact、trace、skill 和 tests 的具体归属，等 package、exte
 
 ## 下游文档
 
-- [仓库组织技术方案](technical-design.md)
+- [仓库组织技术方案](technical-design.md)（已确定 W1 + P2；进入 Workflow Runtime 框架设计）
 - [Extension 集合目录](../01-extension-catalog/README.md)
 - [Extension 颗粒度技术方案](extension-granularity.md)
 - [Build Extension](../extensions/build.md)

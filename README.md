@@ -22,7 +22,7 @@
 - `bug`：Bug 调查、根因判断和修复。
 - `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
 
-这些只是待评审候选，不代表已经实现或最终确定。
+总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）；每个 package 内基于共享 Workflow Runtime 定义普通 Node，并通过 Pi SDK 创建独立 Worker AgentSession。三个 workflow 的具体业务节点和实现仍未开始。
 
 ## 历史资料
 
