@@ -7,25 +7,33 @@
 
 ## 1. 方案目标
 
-确定 `my-pi-extension` 如何组织一组服务于个人工作流的 Pi extension，包括：
+确定 `my-pi-extension` 如何组织一组服务于个人工作流的 Pi extension。
 
-- Git 仓库边界；
-- Pi package 边界；
-- extension 入口边界；
-- 共享代码和共享协议边界；
-- Policy、skill、artifact、trace 和测试的归属；
-- 安装、加载、启用、禁用和升级方式。
+| 组织问题 | 本文决定范围 |
+|---|---|
+| 源码与版本边界 | Git repository 边界 |
+| 安装与分发边界 | Pi package 边界 |
+| Pi runtime 边界 | extension entry point 边界 |
+| 共享实现边界 | shared core 和共享协议边界 |
+| 资源归属 | Policy、skill、artifact、trace 和测试的位置 |
+| 运行管理 | 安装、加载、启用、禁用、升级和回滚方式 |
 
-本文件只决定仓库组织，不决定具体 extension 的内部技术实现。
+本文件不决定具体 extension 的内部技术实现。
 
 ## 2. 组织层次
 
-```text
-Git Repository
-  └── Pi Package
-        ├── Extension A
-        ├── Extension B
-        └── Shared Core
+```mermaid
+flowchart TD
+    repository[Git Repository]
+    package[Pi Package]
+    extensionA[Extension A]
+    extensionB[Extension B]
+    core[Shared Core]
+
+    repository --> package
+    package --> extensionA
+    package --> extensionB
+    package --> core
 ```
 
 三者职责不同：
@@ -38,83 +46,38 @@ Git Repository
 
 ## 3. 候选方案
 
-### 方案 A：一个仓库、一个 Pi package、多个 extension
+| 方案 | Repository / Package / Extension 关系 | 主要优点 | 主要风险 | 当前判断 |
+|---|---|---|---|---|
+| A：单仓库、单 package、多 extension | 一个 Git repository；一个 Pi package；多个独立 extension entry point；可选 shared core | 同一工作流版本边界；共享协议简单；联调、安装和升级成本低 | 可能形成隐式依赖；默认全加载会扩大工具、命令和权限面；需要启用和依赖规则 | **当前推荐** |
+| B：单仓库、多 package | 一个 Git repository；多个 Pi package；每个 extension 或 extension 组独立发布；可选 core package | 独立安装、升级和禁用；package 依赖边界更显式 | 版本兼容、发布、workspace/core 管理和联调成本高；工作流被拆成多个发布单位 | 暂不采用 |
+| C：单主 extension、内部模块化 | 一个 Git repository；一个 Pi package；一个 extension factory；内部模块 | 初始代码最少；所有状态天然同 runtime | extension 边界消失；权限和状态耦合；难以独立启停/替换；容易演变为超大 extension | 不采用 |
 
-```text
-my-pi-extension/
-├── package.json
-├── extensions/
-│   ├── workflow-router.ts
-│   ├── task-delegation.ts
-│   ├── solution-review.ts
-│   ├── code-review.ts
-│   ├── verification.ts
-│   └── workflow-ui.ts
-├── src/
-│   └── core/
-├── policies/
-├── skills/
-├── tests/
-└── docs/
+三种方案的 runtime 边界如下：
+
+```mermaid
+flowchart LR
+    subgraph optionA[方案 A]
+        ARepo[Repository] --> APkg[Pi Package]
+        APkg --> A1[Extension A]
+        APkg --> A2[Extension B]
+        A1 <--> ACore[Shared Core]
+        A2 <--> ACore
+    end
+
+    subgraph optionB[方案 B]
+        BRepo[Repository] --> BPkg1[Package A]
+        BRepo --> BPkg2[Package B]
+        BPkg1 --> B1[Extension A]
+        BPkg2 --> B2[Extension B]
+    end
+
+    subgraph optionC[方案 C]
+        CRepo[Repository] --> CPkg[Pi Package]
+        CPkg --> C1[Single Main Extension]
+        C1 --> CModuleA[Module A]
+        C1 --> CModuleB[Module B]
+    end
 ```
-
-优点：
-
-- 和你的个人工作流属于同一个版本边界；
-- 共享 `core`、Policy、Artifact 和 Trace 协议简单；
-- extension 之间便于联调；
-- 安装和升级简单；
-- 适合当前从设计到实现的阶段。
-
-风险：
-
-- 单个 package 的 extension 之间可能形成隐式依赖；
-- 默认全部加载时，工具、命令和权限面会扩大；
-- 需要明确 extension 的启用和依赖规则。
-
-### 方案 B：一个仓库、多个 Pi package
-
-```text
-my-pi-extension/
-├── packages/
-│   ├── workflow-router/
-│   ├── task-delegation/
-│   ├── solution-review/
-│   └── code-review/
-└── packages/core/
-```
-
-优点：
-
-- extension 可以独立安装、升级和禁用；
-- 包之间的依赖边界更显式。
-
-风险：
-
-- 需要处理多个 package 的版本兼容；
-- `core` 需要单独发布或通过 workspace 管理；
-- 早期开发和联调复杂度明显增加；
-- 个人工作流被拆成多个发布单位。
-
-### 方案 C：一个主 extension，内部模块化
-
-```text
-my-pi-extension/
-└── extensions/index.ts
-```
-
-优点：
-
-- 初始实现最简单；
-- 所有状态天然在一个 runtime 中。
-
-风险：
-
-- extension 边界消失；
-- 任意模块都可能修改全局状态；
-- 工具、命令、事件和权限耦合；
-- 后续无法独立启用、禁用或替换；
-- 最终容易变成一个超大 extension。
 
 ## 4. 当前推荐
 
@@ -139,71 +102,87 @@ my-pi-extension/
 └── docs/                        # 问题、设计、评审和决策文档
 ```
 
-### 为什么选择这个边界
+### 推荐依据
 
-1. 这些 extension 都服务同一个个人工作流，而不是互不相关的工具集合。
-2. 它们需要共享 Workflow Run、Policy、Artifact、Review 和 Trace 协议。
-3. 当前主要风险是工作流边界是否合理，不是发布拆包能力不足。
-4. 一个 package 可以先验证完整工作流，再根据真实依赖和使用方式拆包。
-5. 独立 entry point 保留了未来按 extension 启用或拆包的可能性。
+| 判断维度 | 方案 A | 对当前阶段的意义 |
+|---|---|---|
+| 工作流一致性 | 所有 extension 同属一个版本边界 | 适合个人工作流而非独立工具产品 |
+| 协议共享 | Workflow Run、Policy、Artifact、Review、Trace 直接共享 | 避免过早发布和维护 core package |
+| 当前主要风险 | 先验证 extension 边界和流程效果 | 不把精力过早投入多 package 发布管理 |
+| 未来演进 | 独立 entry point 可按配置启用，也可以将来拆包 | 保留拆分空间，不提前承担拆分成本 |
 
 ## 5. Extension 的独立性要求
 
 虽然暂时放在一个 package 中，每个 extension 仍必须有独立边界：
 
-- 独立的入口文件和 factory；
-- 独立注册自己的 Pi API；
-- 独立的 Policy 适配；
-- 独立的输入/输出 Artifact；
-- 不直接修改其他 extension 的内存状态；
-- 通过 `src/core`、typed Artifact 或 `pi.events` 协作；
-- 能明确列出上游和下游依赖；
-- 可以被配置禁用，或明确声明为其他 extension 的必需依赖。
+| 约束 | 要求 |
+|---|---|
+| 入口 | 独立入口文件和 factory |
+| Pi API | 只注册自己的 command、tool、event、UI |
+| Policy | 独立的 Policy 适配 |
+| 数据 | 独立的输入/输出 Artifact |
+| 内存状态 | 不直接修改其他 extension 的内存状态 |
+| 协作 | 仅通过 `src/core`、typed Artifact 或 `pi.events` |
+| 依赖 | 显式列出上游和下游依赖 |
+| 启停 | 可被配置禁用，或声明为必需依赖 |
 
-`src/core` 只放真正跨 extension 共享的内容：
+`src/core` 的边界：
 
-- domain types；
-- schema；
-- 状态转换校验；
-- Artifact 和 Trace 协议；
-- worker/runtime 抽象；
-- 通用 Policy 校验。
-
-`src/core` 不直接注册 `/build`、`delegate_task` 或其他用户入口。
+| 可以进入 `src/core` | 不可以进入 `src/core` |
+|---|---|
+| domain types、schema、状态转换校验、Artifact/Trace 协议、worker/runtime 抽象、通用 Policy 校验 | `/build`、`delegate_task` 和其他用户入口的 Pi API 注册 |
 
 ## 6. 加载与启用的初步设计
 
-初步采用：
+初步加载和启用流程：
 
-- 安装单位：整个 repository 对应的一个 Pi package；
-- 代码单位：多个独立 extension entry point；
-- 默认策略：由 package manifest 加载候选 extension；
-- 运行策略：由 project/global settings 或 Policy 决定具体启用项；
-- 依赖策略：extension 显式声明依赖，缺少必需依赖时 fail closed；
-- 版本策略：初期统一版本，后续根据真实使用情况决定是否拆包。
+```mermaid
+flowchart LR
+    install[pi install package] --> manifest[Package Manifest]
+    manifest --> discovered[候选 Extension Entry Points]
+    discovered --> settings[Global / Project Settings]
+    settings --> policy[Active Policy]
+    policy --> enabled[实际启用的 Extensions]
+    enabled --> dependencies{依赖齐全?}
+    dependencies -- 是 --> runtime[Pi Runtime]
+    dependencies -- 否 --> blocked[Fail Closed]
+```
 
-这里的“默认加载候选 extension”和“实际启用 extension”需要在后续实现前进一步验证 Pi package 的过滤和 settings 行为，不能只靠约定。
+| 维度 | 初步设计 | 后续验证点 |
+|---|---|---|
+| 安装单位 | 整个 repository 对应一个 Pi package | package manifest 的实际资源声明 |
+| 代码单位 | 多个独立 extension entry point | 多入口加载顺序和 reload 行为 |
+| 候选加载 | package manifest 声明候选 extension | Pi package 过滤能力 |
+| 实际启用 | project/global settings 或 Policy 决定 | settings 与 Policy 的职责边界 |
+| 依赖 | extension 显式声明依赖；缺失时 fail closed | 依赖校验和错误呈现 |
+| 版本 | 初期统一版本；按真实使用情况决定是否拆包 | 升级、兼容和回滚策略 |
 
 ## 7. 需要后续决定的问题
 
-1. Pi package manifest 如何列出多个 extension entry point？
-2. 是全部自动发现，还是显式列出每一个入口？
-3. extension 禁用配置放在 package settings、Policy，还是两者分工？
-4. extension 依赖如何声明和校验？
-5. `src/core` 是否需要独立测试包或 build step？
-6. 一个 extension 加载失败时，其他 extension 是否继续加载？
-7. 哪些 extension 需要共享同一个 runtime instance？
-8. 未来拆成多个 package 的触发条件是什么？
+| 待决问题 | 需要形成的结论 |
+|---|---|
+| manifest | 如何列出多个 extension entry point？ |
+| 发现方式 | 自动发现还是显式列出每一个入口？ |
+| 启用配置 | package settings、Policy 如何分工？ |
+| 依赖 | extension 依赖如何声明、解析和校验？ |
+| core 工程化 | `src/core` 是否需要独立测试包或 build step？ |
+| 故障隔离 | 一个 extension 加载失败时，其他 extension 是否继续加载？ |
+| runtime 共享 | 哪些 extension 需要共享同一个 runtime instance？ |
+| 拆包门槛 | 何时从单 package 演进为多个 package？ |
 
 ## 8. 评审要求
 
-本方案在进入实现前需要至少经过：
-
-- 一个关注 package/repository 边界的独立方案评审；
-- 一个关注 extension 生命周期和 Pi 加载机制的独立方案评审；
-- 一个关注依赖、故障隔离和升级的独立方案评审；
-- 一个 arbiter 形成最终决策；
-- 用户确认最终组织边界。
+```mermaid
+flowchart LR
+    proposal[仓库组织方案] --> boundaryReview[Repository / Package 边界评审]
+    proposal --> lifecycleReview[Pi 加载与生命周期评审]
+    proposal --> dependencyReview[依赖、故障隔离与升级评审]
+    boundaryReview --> arbiter[Arbiter]
+    lifecycleReview --> arbiter
+    dependencyReview --> arbiter
+    arbiter --> user[用户确认]
+    user --> decision[组织边界决策]
+```
 
 ## 9. 暂定结论
 
