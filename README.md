@@ -22,7 +22,7 @@
 - `bugFix`：Bug 调查、根因判断和修复。
 - `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
 
-总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）。当前已完成 Pi-native workflow runtime bootstrap 和 bugFix command；尚未完成真实模型端到端与 build/work 业务流程。
+总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）。当前已完成 Pi-native workflow runtime bootstrap、bugFix command 及运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。
 
 ## 历史资料
 
@@ -30,6 +30,4 @@
 - [多模型评议记录](docs/reviews/2026-08-18-gpt-5.6-sol-design-review.md)
 - [领域术语](CONTEXT.md)
 
-## 状态
-
-已完成 Pi-native workflow runtime bootstrap 和 bugFix command；尚未完成真实模型端到端与 build/work 业务流程。
+已完成 Pi-native workflow runtime bootstrap、bugFix command 和运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。

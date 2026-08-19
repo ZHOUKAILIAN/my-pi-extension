@@ -20,9 +20,9 @@ test('command handler runs injected worker through all stages and checkpoints', 
   };
   const ctx: any = { sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
   extension(pi);
-  await command('start runId=flow-1', ctx);
+  await command('登录后白屏', ctx);
   assert.equal(calls, 3);
-  assert.equal(entries.map((entry) => entry.data.stage).join(','), 'INVESTIGATING,IMPLEMENTING,VERIFYING,ACCEPTED');
+  assert.equal(entries.filter((entry) => entry.data.stage).map((entry) => entry.data.stage).join(','), 'INVESTIGATING,IMPLEMENTING,VERIFYING,ACCEPTED');
 
   const retryEntries: any[] = [];
   const retryAnswers: Artifact[] = [
@@ -40,7 +40,7 @@ test('command handler runs injected worker through all stages and checkpoints', 
   };
   const retryCtx: any = { sessionManager: { getEntries: () => retryEntries }, ui: { notify() {} } };
   extension(retryPi);
-  await command('start runId=flow-2', retryCtx);
+  await command('登录后白屏', retryCtx);
   assert.equal(retryCalls, 5);
   assert.equal(retryEntries.at(-3).data.stage, 'IMPLEMENTING');
   assert.equal(retryEntries.at(-1).data.stage, 'ACCEPTED');

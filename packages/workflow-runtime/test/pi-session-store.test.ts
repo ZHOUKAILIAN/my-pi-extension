@@ -23,3 +23,33 @@ test('PiSessionRunStore preserves append order for equal timestamps', () => {
   const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
   assert.equal(store.loadLast('r')?.id, 'second');
 });
+
+function runCheckpoint(runId: string, stage: string, position: number) {
+  return { customType: 'workflow-run', data: { runId, stage, at: position, id: `${runId}-${position}`, problem: 'problem' } };
+}
+
+test('latestUncompleted excludes a run whose final checkpoint is ACCEPTED', () => {
+  const entries = [runCheckpoint('bugFix-a', 'INVESTIGATING', 1), runCheckpoint('bugFix-a', 'ACCEPTED', 2)];
+  const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
+  assert.equal(store.latestUncompleted(), undefined);
+});
+
+test('latestUncompleted selects the unfinished run by final checkpoint position', () => {
+  const entries = [
+    runCheckpoint('bugFix-a', 'BLOCKED', 1),
+    runCheckpoint('bugFix-b', 'ACCEPTED', 2),
+    runCheckpoint('bugFix-a', 'VERIFYING', 3),
+  ];
+  const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
+  assert.equal(store.latestUncompleted()?.runId, 'bugFix-a');
+});
+
+test('latestUncompleted selects the later unfinished run when entries are interleaved', () => {
+  const entries = [
+    runCheckpoint('bugFix-a', 'BLOCKED', 1),
+    runCheckpoint('bugFix-b', 'IMPLEMENTING', 2),
+    runCheckpoint('bugFix-a', 'INVESTIGATING', 3),
+  ];
+  const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
+  assert.equal(store.latestUncompleted()?.runId, 'bugFix-a');
+});

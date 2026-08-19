@@ -8,7 +8,7 @@ export type Artifact = InvestigationArtifact|ImplementationArtifact|Verification
 export type Capsule = Record<string, unknown>;
 export interface WorkerExecutor { execute(node: NodeDefinition, task: unknown, capsule: Capsule): Promise<Artifact>; }
 export interface NodeDefinition { id: string; worker?: WorkerExecutor; profile?: WorkerProfile; }
-export interface Checkpoint { runId:string; stage:Stage; at:number; id:string; artifactRefs?:string[]; pendingDecisionRequest?:string; decisionReference?:string; }
+export interface Checkpoint { runId:string; stage:Stage; at:number; id:string; problem?:string; artifactRefs?:string[]; pendingDecisionRequest?:string; decisionReference?:string; }
 export interface RunStore { saveCheckpoint(c:Checkpoint):void; loadLast(runId:string):Checkpoint|undefined; }
 export interface WorkflowDefinition { id:string; initialStage:Stage; nodes?: Record<string, NodeDefinition>; guard(from:Stage,to:Stage,artifact?:Artifact):void; transition(from:Stage,to:Stage,artifact?:Artifact):Stage; }
 export interface WorkerProfile { tools:string[]; skills?:string[]; context?:string[]; }

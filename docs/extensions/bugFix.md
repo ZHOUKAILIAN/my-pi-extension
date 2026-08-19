@@ -1,22 +1,22 @@
 # bugFix Extension
 
-- 状态：`bootstrap 实现，完整流程待补`
-- 颗粒度假设：一个完整工作入口对应一个顶层 Pi extension
-- 上游：[Extension 颗粒度](../00-repository-organization/extension-granularity.md)、[Extension 集合目录](../01-extension-catalog/README.md)
+- 状态：真实模型已接线，尚未完成真实 provider E2E 验证
+
+## 唯一公共入口
+
+唯一命令是 `/bugFix <问题描述>`，每次调用都创建新 run；`start`、`resume`、`decision` 前缀均返回 usage，不是公共协议。恢复对话使用 Pi 原生 `/resume`。在 `session_start` 的 `reason === "resume"` 时，若存在当前主 session 的未完成 run，扩展会显示问题摘要和 stage，确认后继续；拒绝或无 UI 不调用模型。
+
+## 交互边界
+
+工作流进入 `BLOCKED` 后，当前命令最多一次通过主 UI `input` 请求补充信息；非空内容作为下一次 investigate 的 capsule 交给 worker。取消、空输入或无 UI 保持 BLOCKED，后续不循环。`WAITING_FOR_USER` 使用主 UI confirm，单次执行最多确认一次。
+
+模型策略读取 `<cwd>/.pi/workflow-models.json`；文件缺失时所有 node 默认继承当前模型，文件存在时按配置覆盖。每个命令、session resume 和每个 node 都写审计；策略错误或模型解析失败在模型调用前显式失败。
 
 ## 当前边界
 
-`bugFix` 是一个独立的顶层工作流 extension，注册 `/bugFix`，负责已有行为异常的事实调查、根因判断、局部修复或技术方案升级。
+Controller 负责确定性状态迁移和 checkpoint；worker 只提交 artifact。问题摘要在 workflow checkpoint 中持续保留并用于 Pi session resume，审计 entry 不复制问题全文。
 
-总体架构已确定，`bugFix` 必须有明确的 Workflow Controller 负责状态迁移：Worker 只返回事实、根因、最小修复路径、实现、review 或验证 Artifact；Controller 校验结果并决定局部修复、进入需求/方案对齐、补充调查、回到实现或进入 `BLOCKED` / `ACCEPTED`。Controller 与 Node 最终采用普通 TypeScript 模块、同 runtime Node Extension，还是独立 runtime Node Extension，以上游选型文档为准。
-
-调查、根因判断、worker 委派、review 和验证目前都是本 extension 内部节点，不预先拆成独立 Pi 子 extension。
-
-`bugFix` 当前命令支持 `start`、`resume` 和带 `requestId` 的 `decision`；worker 通过 extension 注入，命令只负责选择当前 stage 对应节点、调用 runtime 并持久化 checkpoint，不自行调用模型。
-- 何时走局部修复，何时进入需求/技术方案多 agent 对齐？
-- 日志、数据库、Redis、外部系统等 skill 如何按节点隔离？
-- 顶层 Controller 如何用 Artifact 和 Context Capsule 在 Worker 间交接，而不复制完整 session？
-- `/bugFix` 是否需要和其他顶层 extension 直接通信？
+- 上游：[Extension 颗粒度](../00-repository-organization/extension-granularity.md)、[Extension 集合目录](../01-extension-catalog/README.md)
 
 ## 设计章节
 

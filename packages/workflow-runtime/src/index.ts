@@ -52,6 +52,7 @@ export class WorkflowRuntime {
   private readonly idGen: () => string;
   private gate?: UserDecisionGate;
   private pendingDecision?: string;
+  private problem?: string;
   readonly definition: WorkflowDefinition;
   readonly store: RunStore;
   readonly runId: string;
@@ -83,6 +84,7 @@ export class WorkflowRuntime {
       stage: this.stage,
       at: this.clock(),
       id: this.idGen(),
+      problem: this.problem,
       pendingDecisionRequest: this.pendingDecision,
       decisionReference: artifact?.kind === 'user_decision' ? String(artifact.requestId) : undefined,
       artifactRefs: artifact ? [String(artifact.id ?? artifact.kind)] : undefined,
@@ -90,6 +92,7 @@ export class WorkflowRuntime {
   }
 
   async runNode(node: NodeDefinition, task: unknown, capsule: Record<string, unknown> = {}) {
+    if (typeof task === 'string') this.problem = task;
     if (!node.worker) {
       // 没有 worker 时不执行模型，避免命令看似成功却产生不可追溯副作用。
       throw Error('node worker required');
@@ -123,6 +126,7 @@ export class WorkflowRuntime {
     const runtime = new WorkflowRuntime(definition, store, runId);
     if (checkpoint) {
       runtime.stage = checkpoint.stage;
+      runtime.problem = checkpoint.problem;
       runtime.pendingDecision = checkpoint.pendingDecisionRequest;
     }
     return runtime;

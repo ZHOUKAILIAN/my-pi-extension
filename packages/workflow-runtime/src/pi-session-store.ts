@@ -7,29 +7,22 @@ export class PiSessionRunStore implements RunStore {
   private readonly sessionManager: { getEntries(): readonly unknown[] }; private readonly append: (type: string, data: Checkpoint) => void;
   constructor(sessionManager: { getEntries(): readonly unknown[] }, append: (type: string, data: Checkpoint) => void) { this.sessionManager=sessionManager; this.append=append; }
   saveCheckpoint(c: Checkpoint) { this.append('workflow-run', c); }
+  private parseCheckpoint(entry: unknown): Checkpoint | undefined {
+    const e = entry as { customType?: string; data?: unknown };
+    if (e.customType !== 'workflow-run' || !e.data || typeof e.data !== 'object') return undefined;
+    const c = e.data as Partial<Checkpoint>;
+    return typeof c.runId === 'string' && typeof c.id === 'string' && typeof c.at === 'number' && typeof c.stage === 'string' && STAGES.has(c.stage) ? c as Checkpoint : undefined;
+  }
   loadLast(runId: string) {
-    const entries = this.sessionManager.getEntries();
-    const found: Checkpoint[] = [];
-    for (const entry of entries) {
-      const e = entry as { type?: string; customType?: string; data?: unknown };
-      const value = e.customType === 'workflow-run' ? e.data : undefined;
-      if (!value || typeof value !== 'object') continue;
-      const c = value as Partial<Checkpoint>;
-      if (c.runId === runId && typeof c.id === 'string' && typeof c.at === 'number' && typeof c.stage === 'string' && STAGES.has(c.stage)) found.push(c as Checkpoint);
-    }
-    // Pi session 读取最后一个合法 entry；同一时间戳也按追加顺序，不按 at 排序。
-    return found.at(-1);
+    return this.sessionManager.getEntries().map(e => this.parseCheckpoint(e)).filter((c): c is Checkpoint => !!c && c.runId === runId).at(-1);
   }
-  latestRunId(prefix = 'bugFix-') {
-    let latest: Checkpoint | undefined;
-    for (const entry of this.sessionManager.getEntries()) {
-      const e = entry as { customType?: string; data?: unknown };
-      if (e.customType !== 'workflow-run' || !e.data || typeof e.data !== 'object') continue;
-      const c = e.data as Partial<Checkpoint>;
-      if (typeof c.runId !== 'string' || !c.runId.startsWith(prefix) || typeof c.id !== 'string' || typeof c.at !== 'number' || typeof c.stage !== 'string' || !STAGES.has(c.stage)) continue;
-      // 不按时间排序：Pi entry 的追加顺序才是同 timestamp checkpoint 的确定顺序。
-      latest = c as Checkpoint;
-    }
-    return latest?.runId;
+  latestUncompleted(prefix = 'bugFix-') {
+    const lastByRun = new Map<string, { checkpoint: Checkpoint; position: number }>();
+    this.sessionManager.getEntries().forEach((entry, position) => {
+      const c = this.parseCheckpoint(entry);
+      if (c?.runId.startsWith(prefix)) lastByRun.set(c.runId, { checkpoint: c, position });
+    });
+    return [...lastByRun.values()].filter(x => x.checkpoint.stage !== 'ACCEPTED').sort((a, b) => a.position - b.position).at(-1)?.checkpoint;
   }
+
 }

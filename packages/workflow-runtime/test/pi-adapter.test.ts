@@ -6,6 +6,7 @@ test('PiSdk adapter uses an isolated SDK session and captures submit_artifact', 
   let options: any;
   const resourceLoader: any = { reload: async () => {} };
   const executor = new PiSdkWorkerExecutor({
+    thinkingLevel: 'high',
     resourceLoader,
     createSession: async (request: any) => {
       options = request;
@@ -23,6 +24,7 @@ test('PiSdk adapter uses an isolated SDK session and captures submit_artifact', 
   assert.deepEqual(options.tools, ['read']);
   assert.equal(options.sessionManager.constructor.name, 'SessionManager');
   assert.equal(options.resourceLoader, resourceLoader);
+  assert.equal(options.thinkingLevel, 'high');
   assert.equal(options.customTools[0].name, 'submit_artifact');
   assert.equal(result.kind, 'investigation');
 });
