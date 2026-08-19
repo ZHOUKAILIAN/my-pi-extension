@@ -2,7 +2,7 @@
 
 个人工作流 Pi extension 集合。
 
-这个仓库不是单个 `delegate_task` extension，而是用多个 extension 固化 `build`、`work`、`bug`、方案评审、代码评审和独立验证等工作方式。每个 extension 都单独做需求对齐和技术方案评审；skill 路由、context 隔离、worker 选型、review 和 verification 都属于对应 extension 的设计内容。
+这个仓库不是单个 `delegate_task` extension，而是一组独立的顶层工作流 extension。当前候选是 `/build`、`/work`、`/bug`：每个入口各自拥有 command、主 agent -> worker 编排、内部工作流节点和 session 级记忆交接。需求对齐、方案评审、代码 review、验证、skill 路由和 context 隔离首先属于对应顶层 extension 的内部设计，不预先拆成 Pi 子 extension。
 
 ## 文档入口
 
@@ -10,18 +10,17 @@
 
 1. [仓库组织形式](docs/00-repository-organization/README.md)：这个仓库如何承载多个 Pi extension。
    - [仓库组织技术方案](docs/00-repository-organization/technical-design.md)
+   - [Extension 颗粒度技术方案](docs/00-repository-organization/extension-granularity.md)
 2. [Extension 集合目录](docs/01-extension-catalog/README.md)：集合里有哪些 extension，以及每个 extension 的职责边界。
 
 之后进入 [extensions/](docs/extensions/) 下的单个 extension 设计文档。
 
 ## 当前候选 Extension
 
-- `workflow-router`：路由 `build`、`work`、`bug`。
-- `task-delegation`：主 agent 委派 worker。
-- `solution-review`：需求和技术方案多 agent 对齐。
-- `code-review`：A/B review、rebuttal 和 arbiter。
-- `verification`：独立验证和最终验收。
-- `workflow-ui`：展示 run、stage、artifact、finding 和阻塞状态。
+- `build`：新需求的完整工作流。
+- `work`：已有功能继续工作、分类和变更。
+- `bug`：Bug 调查、根因判断和修复。
+- `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
 
 这些只是待评审候选，不代表已经实现或最终确定。
 

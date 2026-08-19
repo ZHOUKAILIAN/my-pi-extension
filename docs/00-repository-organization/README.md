@@ -41,4 +41,7 @@ Policy、artifact、trace、skill 和 tests 的具体归属，等 package、exte
 
 - [仓库组织技术方案](technical-design.md)
 - [Extension 集合目录](../01-extension-catalog/README.md)
-- [Workflow Router](../extensions/workflow-router.md)
+- [Extension 颗粒度技术方案](extension-granularity.md)
+- [Build Extension](../extensions/build.md)
+- [Work Extension](../extensions/work.md)
+- [Bug Extension](../extensions/bug.md)

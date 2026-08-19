@@ -12,28 +12,23 @@
 
 | Extension | 解决的问题 | 关键入口 | 当前状态 |
 |---|---|---|---|
-| `workflow-router` | 把 `build`、`work`、`bug` 路由到正确工作流 | `/build`、`/work`、`/bug` 或等价输入 | `TODO` |
-| `task-delegation` | 主 agent 按 Policy 委派 worker | `delegate_task` | `TODO` |
-| `solution-review` | 需求和技术方案的多 agent 对齐 | 方案评审阶段 | `TODO` |
-| `code-review` | A/B review、rebuttal、arbiter | 代码变更阶段 | `TODO` |
-| `verification` | 独立验证和最终验收 | 验证阶段 | `TODO` |
-| `workflow-ui` | 展示 run、stage、artifact、finding 和阻塞 | TUI 状态展示 | `TODO` |
+| `build` | 新需求的完整工作流 | `/build` | `TODO` |
+| `work` | 已有功能继续工作、分类和变更 | `/work` | `TODO` |
+| `bug` | Bug 调查、根因判断和修复 | `/bug` | `TODO` |
+| `workflow-ui` | 可选：展示 run、stage、artifact、finding 和阻塞状态 | TUI 状态展示 | `TODO` |
 
 ## 待对齐问题
 
-1. 上述 extension 是否都应该存在？
-2. 哪些 extension 可以合并，哪些必须独立？
-3. 哪个 extension 拥有 Workflow Run 的状态机控制权？
-4. `solution-review` 和 `code-review` 是否共享 review 协议但保持独立入口？
-5. `verification` 是独立 extension，还是 code-review 的最后阶段？
-6. `workflow-ui` 是否第一阶段就需要？
-7. extension 之间共享哪些 artifact、Policy 和事件？
+1. `/build`、`/work`、`/bug` 是否分别作为顶层 extension？
+2. 需求对齐、方案对齐、委派、review、验证是否都先作为各自 extension 内部节点？
+3. 哪些重复规则达到什么条件后才抽成普通共享模块？
+4. 是否需要一个独立的 `workflow-ui` extension？
+5. 顶层 extension 之间是否需要直接协作，还是各自管理自己的 worker 和 session？
+6. 顶层 extension 之间共享哪些 Artifact、Policy 或协议？
 
 ## 下游文档
 
-- [Workflow Router](../extensions/workflow-router.md)
-- [Task Delegation](../extensions/task-delegation.md)
-- [Solution Review](../extensions/solution-review.md)
-- [Code Review](../extensions/code-review.md)
-- [Verification](../extensions/verification.md)
+- [Build Extension](../extensions/build.md)
+- [Work Extension](../extensions/work.md)
+- [Bug Extension](../extensions/bug.md)
 - [Workflow UI](../extensions/workflow-ui.md)

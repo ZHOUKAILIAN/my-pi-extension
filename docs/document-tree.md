@@ -7,17 +7,16 @@ docs/
 ├── document-tree.md                         # 本文件：文档导航
 ├── 00-repository-organization/              # 仓库组织形式
 │   ├── README.md                            # 问题定义和待对齐项
-│   └── technical-design.md                  # 仓库组织技术方案
+│   ├── technical-design.md                  # 仓库/package 组织技术方案
+│   └── extension-granularity.md             # 顶层 extension 与内部节点的颗粒度
 ├── 01-extension-catalog/                    # Extension 集合目录
 │   └── README.md                            # 集合成员和边界
 │
 ├── extensions/                             # 每个 Pi extension 的独立设计文档
-│   ├── workflow-router.md                   # build/work/bug 入口路由
-│   ├── task-delegation.md                   # 主 agent 委派 worker
-│   ├── solution-review.md                   # 需求/技术方案多 agent 对齐
-│   ├── code-review.md                       # A/B 代码评审和 rebuttal
-│   ├── verification.md                      # 独立验证和最终验收
-│   └── workflow-ui.md                       # 状态、产物和 trace 展示
+│   ├── build.md                             # /build 顶层工作流 extension
+│   ├── work.md                              # /work 顶层工作流 extension
+│   ├── bug.md                               # /bug 顶层工作流 extension
+│   └── workflow-ui.md                       # 可选：状态、产物和 trace 展示
 │
 ├── adr/                                     # 已定且需要长期保留的架构决策
 ├── reviews/                                 # 多 agent 评审原文和汇总
@@ -64,13 +63,12 @@ skill 隔离、上下文隔离、worker 选型和验证都属于具体 extension
 
 1. `00-repository-organization/README.md`
 2. `00-repository-organization/technical-design.md`
-3. `01-extension-catalog/README.md`
-4. `extensions/workflow-router.md`
-5. `extensions/task-delegation.md`
-6. `extensions/solution-review.md`
-7. `extensions/code-review.md`
-8. `extensions/verification.md`
-9. `extensions/workflow-ui.md`
+3. `00-repository-organization/extension-granularity.md`
+4. `01-extension-catalog/README.md`
+5. `extensions/build.md`
+6. `extensions/work.md`
+7. `extensions/bug.md`
+8. `extensions/workflow-ui.md`
 
 前两个总体问题没有对齐前，不开始实现任何 extension。
 
