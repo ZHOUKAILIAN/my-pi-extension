@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import extension from '../src/extension.ts';
 import type { Artifact } from '@pi/workflow-contracts';
 
@@ -14,7 +17,7 @@ function harness(answers: Artifact[], initial: any[] = [], input?: string) {
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
   };
-  const ctx: any = { sessionManager: { getEntries: () => entries }, hasUI: true,
+  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => entries }, hasUI: true,
     ui: { notify: (v: string) => notifications.push(v), input: async () => input } };
   extension(pi);
   return { command, ctx, entries, notifications, capsules, calls: () => calls };

@@ -9,7 +9,7 @@ function validRef(value: unknown): value is ModelRef {
   return value === 'inherit' || (typeof value === 'string' && /^[^/]+\/[^/]+$/.test(value));
 }
 export function loadModelPolicy(path: string): ModelPolicy {
-  const defaults = { investigate: 'inherit', implement: 'inherit', verify: 'inherit' } as Record<typeof NODES[number], ModelRef>;
+  const defaults = { investigate: 'smartingredients/gpt-5.6-sol', implement: 'inherit', verify: 'inherit' } as Record<typeof NODES[number], ModelRef>;
   if (!fs.existsSync(path)) return { version: 1, defaultRef: 'inherit', nodes: Object.fromEntries(NODES.map(n => [n, { configuredRef: defaults[n], source: 'runtime-default' }])) as ModelPolicy['nodes'] };
   let raw: any;
   try { raw = JSON.parse(fs.readFileSync(path, 'utf8')); } catch { throw Error(`invalid workflow model policy JSON: ${path}`); }

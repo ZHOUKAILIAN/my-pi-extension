@@ -20,7 +20,7 @@ function harness(entries: any[], confirm = true, options: { cwd?: string; truste
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
     registerCommand: () => {},
   };
-  const ctx: any = { cwd: options.cwd ?? '.', hasUI: true, thinkingLevel: 'high', isProjectTrusted: () => options.trusted ?? true,
+  const ctx: any = { cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), hasUI: true, thinkingLevel: 'high', isProjectTrusted: () => options.trusted ?? true,
     sessionManager: { getEntries: () => entries }, ui: { confirm: async () => { confirmCalls += 1; return confirm; }, notify: () => {} } };
   extension(pi);
   return { start: (reason: string) => onStart({ reason }, ctx), calls: () => calls, confirmCalls: () => confirmCalls };

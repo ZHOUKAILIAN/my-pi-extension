@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "default": "inherit",
+  "nodes": {
+    "investigate": "smartingredients/gpt-5.6-sol",
+    "implement": "smartingredients/gpt-5.6-luna",
+    "verify": "smartingredients/gpt-5.6-terra"
+  }
+}
