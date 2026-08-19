@@ -9,8 +9,8 @@
 
 ## 已确认的组织决策
 
-1. 一个 Git monorepo 内包含三个独立 Pi package：`build`、`work`、`bug`。
-2. 每个 package 提供一个顶层 workflow extension，分别注册 `/build`、`/work`、`/bug`。
+1. 一个 Git monorepo 内包含三个独立 Pi package：`build`、`work`、`bugFix`。
+2. 每个 package 提供一个顶层 workflow extension，分别注册 `/build`、`/work`、`/bugFix`。
 3. 每个 package 内部使用共享 Workflow Runtime + 自己的 Workflow Definition 和普通 Node。
 4. Worker 通过 Pi SDK 创建独立 `AgentSession`；Artifact 和 Context Capsule 由 Controller 显式交接。
 5. Node 暂不拆成独立 Pi extension 或 package；只有满足独立入口、生命周期、权限、复用、发布、隔离和稳定协议等条件时才重新评审。
@@ -51,4 +51,4 @@ Policy、artifact、trace、skill 和 tests 的具体归属，等 package、exte
 - [Extension 颗粒度技术方案](extension-granularity.md)
 - [Build Extension](../extensions/build.md)
 - [Work Extension](../extensions/work.md)
-- [Bug Extension](../extensions/bug.md)
+- [bugFix Extension](../extensions/bugFix.md)

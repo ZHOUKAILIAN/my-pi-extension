@@ -14,7 +14,7 @@
 ```text
 /build：从新需求对齐到实现、Review、验证
 /work：对已有功能继续工作、分类和变更
-/bug：对异常行为调查、定位根因和修复
+/bugFix：对异常行为调查、定位根因和修复
 ```
 
 它们不是同一条业务流程的前后步骤，但有共同的运行需求：主 agent 需要按阶段派 Worker、限制每个 Worker 的上下文和能力、拿到结构化结果、在必要时向用户确认，并让流程可恢复、可审计、可验证。
@@ -25,7 +25,7 @@ Pi 已经提供了 extension、command、SDK `AgentSession`、tools、skills、s
 
 ```mermaid
 flowchart LR
-    input[用户输入<br/>/build /work /bug] --> agent[主 Agent]
+    input[用户输入<br/>/build /work /bugFix] --> agent[主 Agent]
     agent --> workers[多个 Worker]
 
     workers --> p1[问题 1：Worker 可能共享/携带过多上下文]
@@ -43,13 +43,13 @@ flowchart LR
 | 流程只靠 prompt | 模型可能跳过需求对齐、Review、验证，或自行宣布完成 | Controller、Transition Guard、Acceptance Gate |
 | 结果没有正式交接 | 自然语言摘要不可校验、不可追溯，reload/resume 后状态丢失 | Output Schema、Artifact、`pi.appendEntry()` checkpoint、Run Store |
 | 用户确认脱离流程 | 高风险选择或需求歧义无法暂停、记录和恢复 | `WAITING_FOR_USER` + 主 Pi Session 的 Human Decision Gate |
-| 顶层入口边界不清 | 安装 `/build` 时默认携带不需要的 `/work`、`/bug` 资源；发布和回滚耦合 | 每顶层 Extension 一个 Pi package |
+| 顶层入口边界不清 | 安装 `/build` 时默认携带不需要的 `/work`、`/bugFix` 资源；发布和回滚耦合 | 每顶层 Extension 一个 Pi package |
 
 ### 1.3 方案要达成的结果
 
 | 目标 | 可验证结果 |
 |---|---|
-| 三个独立入口 | `/build`、`/work`、`/bug` 可分别安装、启用、升级和回滚 |
+| 三个独立入口 | `/build`、`/work`、`/bugFix` 可分别安装、启用、升级和回滚 |
 | 受控 Worker 执行 | 每个 Node Worker 只能获得该 Node 授权的 Task、Policy、tools、skills 和 Context Capsule |
 | 显式交接 | Worker 通过结构化 Artifact 交接；不复制完整 session |
 | 工程化 loop | 只有 Runtime 能执行状态迁移；每条边有 Guard；最终由 Acceptance Gate 决定 `ACCEPTED` |
@@ -65,7 +65,7 @@ flowchart LR
 一个 Git monorepo
   ├── build Pi package  -> /build 顶层 Extension
   ├── work Pi package   -> /work 顶层 Extension
-  └── bug Pi package    -> /bug 顶层 Extension
+  └── bugFix Pi package    -> /bugFix 顶层 Extension
 
 三个 package 共同依赖普通 TypeScript workspace library：
   ├── workflow-contracts：Task / Policy / Capsule / Artifact / Run 类型
@@ -78,12 +78,12 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    user[用户：/build /work /bug]
+    user[用户：/build /work /bugFix]
 
     subgraph packages[Git Monorepo：三个独立 Pi Package]
         build[build package<br/>/build Extension + Build Definition]
         work[work package<br/>/work Extension + Work Definition]
-        bug[bug package<br/>/bug Extension + Bug Definition]
+        bug[bugFix package<br/>/bugFix Extension + Bug Definition]
     end
 
     subgraph shared[普通 TypeScript Workspace Libraries]
@@ -108,7 +108,7 @@ flowchart TB
 
 | 判断 | 决定 | 原因 |
 |---|---|---|
-| 顶层工作入口是独立产品边界 | `/build`、`/work`、`/bug` 各自一个 Pi package + 一个顶层 Extension | 可以独立安装、启用、升级、回滚；不让不相关 command、skill、依赖默认一起安装 |
+| 顶层工作入口是独立产品边界 | `/build`、`/work`、`/bugFix` 各自一个 Pi package + 一个顶层 Extension | 可以独立安装、启用、升级、回滚；不让不相关 command、skill、依赖默认一起安装 |
 | Node 需要隔离，但不需要先成为 Pi Extension | Node 先是普通 TypeScript Definition；每个 Node 使用独立 SDK `AgentSession` Worker | 当前需要隔离的是 worker history、tools、skills、context、Artifact 和状态权限；W1 已能满足，不必引入 Node Extension 生命周期与跨 runtime 协议 |
 | Loop 需要工程化控制，不能依赖 prompt | 建设共享 Workflow Runtime；只有 Runtime 能迁移状态、重试、阻塞和验收 | 模型可做具体工作，但不能自行决定跳阶段、接受结果或绕过用户确认 |
 
@@ -120,7 +120,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    need[目标：/build、/work、/bug 独立演进] --> install[独立安装 / 禁用]
+    need[目标：/build、/work、/bugFix 独立演进] --> install[独立安装 / 禁用]
     need --> release[独立升级 / 回滚]
     need --> surface[不默认加载其他入口的资源]
     install --> p2[P2：每顶层 Extension 一个 Pi Package]
@@ -217,7 +217,7 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    command[用户入口<br/>/build /work /bug]
+    command[用户入口<br/>/build /work /bugFix]
     extension[顶层 Pi Extension<br/>一个 package 一个入口]
     runtime[Workflow Runtime<br/>普通 TypeScript library]
     node[Workflow Node Definition<br/>普通 TypeScript hooks]
@@ -229,7 +229,7 @@ flowchart TB
 | 层 | 是什么 | 责任 | 不是什么 |
 |---|---|---|---|
 | Pi Package | 安装、分发、版本边界 | 单独安装/升级/回滚一个顶层 workflow | 不是 session 或进程隔离边界 |
-| 顶层 Pi Extension | Pi runtime 插件 / 用户入口 | 注册 `/build`、`/work` 或 `/bug`；接入主 Pi Session/UI | 不等于每个流程 Node |
+| 顶层 Pi Extension | Pi runtime 插件 / 用户入口 | 注册 `/build`、`/work` 或 `/bugFix`；接入主 Pi Session/UI | 不等于每个流程 Node |
 | Workflow Runtime | 共享普通 TS library | Run、Loop、Guard、Worker、checkpoint、验收、用户确认 | 不注册 Pi command/tool/event |
 | Node Definition | 当前业务阶段的 hooks | 定义 Task、Policy、Context、Artifact、Guard | 不拥有 Run 状态，不直接调用 Pi API |
 | Worker AgentSession | 当前 Node 的独立 agent 会话 | 在受控 tools/skills/context 下完成工作并提交 Artifact | 不直接与其他 Worker 通信 |
@@ -240,7 +240,7 @@ flowchart TB
 
 ```ts
 type WorkflowDefinition = {
-  id: "build" | "work" | "bug";
+  id: "build" | "work" | "bugFix";
   initialStage: string;
   nodes: Record<string, WorkflowNodeDefinition>;
   transitions: TransitionDefinition[];
@@ -350,8 +350,8 @@ flowchart LR
 
 | 方案 | Package 边界 | 优点 | 代价 | 结论 |
 |---|---|---|---|---|
-| P1 | 一个 package 包含 build/work/bug | 最简单的安装和内部联调 | 顶层入口不能天然独立安装、升级和回滚 | 不选 |
-| **P2** | build/work/bug 各一个 package，保持单 monorepo | 与独立工作入口一致；可按入口独立安装/发布 | workspace、显式 contracts、兼容测试 | **已选** |
+| P1 | 一个 package 包含 build/work/bugFix | 最简单的安装和内部联调 | 顶层入口不能天然独立安装、升级和回滚 | 不选 |
+| **P2** | build/work/bugFix 各一个 package，保持单 monorepo | 与独立工作入口一致；可按入口独立安装/发布 | workspace、显式 contracts、兼容测试 | **已选** |
 | P3 | 每个 Node 也独立 package | 成熟 Node 可独立发布/维护 | 版本矩阵和协议成本快速膨胀 | 暂不选 |
 | P4 | 多仓库、多 package | 最强组织独立性 | 跨仓库协作/contract 发布成本高 | 当前无需求 |
 
@@ -366,28 +366,25 @@ my-pi-extension/
 ├── package.json                         # workspace root
 ├── packages/
 │   ├── workflow-contracts/              # 普通 TS library：类型 / schema
+│   │   ├── src/
+│   │   └── test/
 │   ├── workflow-runtime/                # 普通 TS library：loop / guard / executor / store
-│   ├── build/                           # Pi package：注册 /build
-│   │   ├── package.json
-│   │   ├── extensions/build.ts
-│   │   └── src/workflow-definition.ts
-│   ├── work/                            # Pi package：注册 /work
-│   │   ├── package.json
-│   │   ├── extensions/work.ts
-│   │   └── src/workflow-definition.ts
-│   └── bug/                             # Pi package：注册 /bug
+│   │   ├── src/
+│   │   └── test/                        # runtime / store / SDK / decision 行为测试
+│   └── bugfix/                           # Pi package：注册 /bugFix
 │       ├── package.json
-│       ├── extensions/bug.ts
-│       └── src/workflow-definition.ts
-├── tests/
+│       ├── src/extension.ts
+│       └── test/                         # command 行为测试
 └── docs/
 ```
+
+当前仅实现 `bugfix` package；`build`、`work` package 仍是后续 P2 工作。
 
 `workflow-runtime` 和 `workflow-contracts` 是 workspace 内的普通 TypeScript library：
 
 ```text
 不是 Pi Extension
-不注册 /build /work /bug
+不注册 /build /work /bugFix
 不注册全局 Pi API
 不保存跨 workflow 的隐式内存状态
 ```
@@ -443,7 +440,7 @@ flowchart LR
 | 3 | SDK Worker Session、tools/skills/context 限制、`submit_artifact` | 进程级隔离 |
 | 4 | `pi.appendEntry()` checkpoint、恢复、幂等、trace | 事务型外部 Run Store |
 | 5 | Acceptance Gate、User Decision Gate | 完整 Workflow UI |
-| 6 | build/work/bug 的 Node、Transition、Policy、Artifact、验收定义 | 强行让三条业务流程使用同一状态图 |
+| 6 | build/work/bugFix 的 Node、Transition、Policy、Artifact、验收定义 | 强行让三条业务流程使用同一状态图 |
 | 7 | runtime contract tests + 三条流程 E2E | 发布 Node package |
 
 ### 7.1 后续重新评审 W3 / Node Extension 的门槛
@@ -470,7 +467,7 @@ flowchart LR
 
 仍待各 workflow 设计文档确定：
 
-- `/build`、`/work`、`/bug` 各自的 Node 列表和状态图；
+- `/build`、`/work`、`/bugFix` 各自的 Node 列表和状态图；
 - 真实 Artifact / Acceptance Criteria 字段；
 - workspace 包管理与发布工具；
 - `workflow-ui` 是否成为独立 Extension；

@@ -9,7 +9,7 @@
 
 一个 Pi extension 的边界应该是：
 
-- 一个完整工作入口，例如 `/build`、`/work` 或 `/bug`；
+- 一个完整工作入口，例如 `/build`、`/work` 或 `/bugFix`；
 - 一个工作流节点，例如需求对齐、代码 review 或验证；
 - 或一个工作入口 extension 加内部普通模块。
 
@@ -19,7 +19,7 @@
 
 | Pi 能力 | 作用范围 | 能否用于子 Pi CLI worker 间直接通信 | 对本方案的含义 |
 |---|---|---:|---|
-| `pi.registerCommand()` | 当前 Pi runtime | 否 | 顶层 extension 可以独立注册 `/build`、`/work`、`/bug` |
+| `pi.registerCommand()` | 当前 Pi runtime | 否 | 顶层 extension 可以独立注册 `/build`、`/work`、`/bugFix` |
 | `pi.events` | 同一个 Pi runtime 中加载的 extension | 否 | 只适合同进程 extension 协作，不是 child worker IPC |
 | `pi.appendEntry()` | 当前 session，可跨 reload/重启恢复 | 否 | 可保存顶层工作流状态或 Artifact；默认不进 LLM context |
 | `pi.sendMessage()` | 当前主 session 的 LLM context | 否 | 可向主 session 注入消息；不自动传给 child worker |
@@ -37,7 +37,7 @@
 flowchart TB
     subgraph host[主 Pi Runtime]
         mainSession[主 Pi Session<br/>用户消息 / 主 agent 上下文]
-        extension[顶层工作流 Extension<br/>/build、/work 或 /bug]
+        extension[顶层工作流 Extension<br/>/build、/work 或 /bugFix]
         state[Workflow State<br/>阶段 / Artifact 索引 / 审计摘要]
 
         mainSession <--> extension
@@ -148,7 +148,7 @@ Acceptance Gate = 最终完成的总卡扣
 
 ```mermaid
 flowchart TB
-    input[/build、/work 或 /bug command/] --> controller[顶层 Extension Controller]
+    input[/build、/work 或 /bugFix command/] --> controller[顶层 Extension Controller]
     controller --> stateMachine[确定性状态机]
     stateMachine -->|生成当前阶段任务| worker[独立 Worker Runtime]
     worker -->|结构化结果| validator[Artifact Validator]
@@ -169,7 +169,7 @@ Pi 没有 `WorkflowNode`、`WorkflowRun`、状态机、Transition Guard 或跨 w
 
 | 概念 | 是否由 Pi 原生提供 | 本方案中的实现归属 |
 |---|---:|---|
-| 顶层 `/build`、`/work`、`/bug` command | 是：`pi.registerCommand()` | 各顶层 extension 的入口 |
+| 顶层 `/build`、`/work`、`/bugFix` command | 是：`pi.registerCommand()` | 各顶层 extension 的入口 |
 | Pi extension 生命周期 | 是：factory、`session_start`、`session_shutdown` 等事件 | Pi runtime 管理；extension 负责初始化和清理 Controller |
 | Worker agent loop / 模型调用 / tool execution | 是：SDK `createAgentSession()` / `AgentSession`，或隔离更强的 `pi -p` / RPC 子进程 | Worker Executor 调用 Pi SDK 或 CLI；不自建 LLM runtime |
 | Worker 的独立 session | 是：`SessionManager.inMemory()` 或持久化 `SessionManager` | 每个 Worker Runtime 创建自己的 session |
@@ -203,7 +203,7 @@ extensions/
     └── run-store.ts                    # session entry checkpoint 的读取和恢复
 ```
 
-`/work` 和 `/bug` 也采用同一形状，但各自拥有不同的 Node、Artifact 和转移图。只有当三套实现出现稳定、经过验证的重复后，才提取最小普通模块，例如 `shared/workflow-runtime/transition.ts`；它仍不是 Pi extension。
+`/work` 和 `/bugFix` 也采用同一形状，但各自拥有不同的 Node、Artifact 和转移图。只有当三套实现出现稳定、经过验证的重复后，才提取最小普通模块，例如 `shared/workflow-runtime/transition.ts`；它仍不是 Pi extension。
 
 ### 4.3.3 一个 Node 在代码中是什么
 
@@ -377,7 +377,7 @@ flowchart LR
 
 | 控制点 | 规则 |
 |---|---|
-| Command 接管 | `/build`、`/work`、`/bug` 由顶层 extension command 接管，不只是 prompt template |
+| Command 接管 | `/build`、`/work`、`/bugFix` 由顶层 extension command 接管，不只是 prompt template |
 | 状态写入 | 只有 Controller 的 `transition()` 可以改变阶段 |
 | Worker 权限 | Worker 只能产生当前阶段 Artifact，不能直接写 `nextStage` 或 `ACCEPTED` |
 | 主 agent 工具 | 通过 active tool allowlist 和 `tool_call` hook 阻止 Policy 外工具 |
@@ -395,7 +395,7 @@ flowchart LR
 | 概念 | 含义 | 当前方案 |
 |---|---|---|
 | Command | 用户进入 Pi 工作流的命令，例如 `/build` | 由顶层 extension 注册；一个 extension 可以注册一个或多个 command |
-| Extension | 被 Pi 加载、拥有 Pi API 生命周期的运行时插件 | `/build`、`/work`、`/bug` 各自对应一个顶层工作流 extension |
+| Extension | 被 Pi 加载、拥有 Pi API 生命周期的运行时插件 | `/build`、`/work`、`/bugFix` 各自对应一个顶层工作流 extension |
 | Node / Stage | 工作流中的业务阶段，例如需求对齐、实现、Review、验证 | 由顶层 extension 内的普通 TypeScript 模块实现 |
 | Session / AgentSession | 一次 agent 的上下文、消息、工具和事件生命周期 | Controller 为每个 Worker 按需创建独立 session |
 
@@ -525,7 +525,7 @@ Controller version
 
 | 判断标准 | 具体问题 |
 |---|---|
-| 独立入口 | 用户或其他宿主需要直接调用它，而不经过 `/build`、`/work` 或 `/bug` |
+| 独立入口 | 用户或其他宿主需要直接调用它，而不经过 `/build`、`/work` 或 `/bugFix` |
 | 独立生命周期 | 它需要独立启动、停止、reload 和资源清理 |
 | 独立权限 | 它需要与顶层工作流不同的工具、文件、网络或凭证边界 |
 | 独立复用 | 多个工作流需要以相同协议调用它，而不是复用几段 helper |
@@ -551,7 +551,7 @@ Controller version
 
 ```text
 工作入口边界
-  = /build、/work、/bug 是否分别成为顶层 Extension
+  = /build、/work、/bugFix 是否分别成为顶层 Extension
 
 工作流控制边界
   = Controller、Guard、Artifact、Context Capsule 必须由某个明确的宿主负责
@@ -573,7 +573,7 @@ Node 是否成为 extension，必须与 package 选型分开判断。完整的�
 
 | 已确认事实 | 对选型的影响 |
 |---|---|
-| `/build`、`/work`、`/bug` 是相互独立的用户入口 | 可以作为独立顶层 extension，也可以由一个 extension 注册多个 command；需要按独立安装、权限和发布需求判断 |
+| `/build`、`/work`、`/bugFix` 是相互独立的用户入口 | 可以作为独立顶层 extension，也可以由一个 extension 注册多个 command；需要按独立安装、权限和发布需求判断 |
 | Node 不是 Pi 原生对象 | 可以实现为普通 TypeScript Node，也可以实现为 Pi extension；后者不能省掉 Controller |
 | 独立 `AgentSession` 不等于独立 extension | W1 已能隔离 Worker 上下文；是否升级 Node Extension 要看生命周期、权限、复用和发布需求 |
 | `pi.events` 只在同一 runtime 内工作 | W2 不能仅靠事件代替 Artifact、Guard、Run Store 或可靠交接 |
@@ -612,7 +612,7 @@ Node 是否成为 extension，必须与 package 选型分开判断。完整的�
 
 | 问题 | 不能直接得出的结论 | 需要进入的选型 |
 |---|---|---|
-| `/build`、`/work`、`/bug` 是独立入口 | 不等于必须三个 package | P1 vs P2 |
+| `/build`、`/work`、`/bugFix` 是独立入口 | 不等于必须三个 package | P1 vs P2 |
 | 每个 Node 可以有独立 Worker Session | 不等于 Node 必须是 extension/package | W1 vs W2 vs W3；必要时 P3 |
 | Node 想复用 | 不等于必须拆 package | 先验证普通 contract/module 是否足够 |
 | Node 需要强隔离 | 不等于只靠 package 能解决 | W3 的独立 SDK runtime 或 RPC/CLI 子进程 |
@@ -643,7 +643,7 @@ W1 + P2
 
 本文件的颗粒度结论同步为：
 
-- `/build`、`/work`、`/bug` 是三个顶层 Pi Extension；
+- `/build`、`/work`、`/bugFix` 是三个顶层 Pi Extension；
 - 需求对齐、方案设计、实现、Review、验证首先是各 package 内的普通 Node；
 - Node 通过 Workflow Runtime 的受控 hooks 定义任务、Policy、Context Capsule、Artifact 和 Guard；
 - Node 暂不单独成为 Pi Extension 或 Pi package；

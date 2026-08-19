@@ -2,7 +2,7 @@
 
 个人工作流 Pi extension 集合。
 
-这个仓库不是单个 `delegate_task` extension，而是一组独立的顶层工作流 extension。当前候选是 `/build`、`/work`、`/bug`：每个入口各自拥有 command、主 agent -> worker 编排、内部工作流节点和 session 级记忆交接。需求对齐、方案评审、代码 review、验证、skill 路由和 context 隔离首先属于对应顶层 extension 的内部设计，不预先拆成 Pi 子 extension。
+这个仓库不是单个 `delegate_task` extension，而是一组独立的顶层工作流 extension。当前候选是 `/build`、`/work`、`/bugFix`：每个入口各自拥有 command、主 agent -> worker 编排、内部工作流节点和 session 级记忆交接。需求对齐、方案评审、代码 review、验证、skill 路由和 context 隔离首先属于对应顶层 extension 的内部设计，不预先拆成 Pi 子 extension。
 
 ## 文档入口
 
@@ -19,10 +19,10 @@
 
 - `build`：新需求的完整工作流。
 - `work`：已有功能继续工作、分类和变更。
-- `bug`：Bug 调查、根因判断和修复。
+- `bugFix`：Bug 调查、根因判断和修复。
 - `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
 
-总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）；每个 package 内基于共享 Workflow Runtime 定义普通 Node，并通过 Pi SDK 创建独立 Worker AgentSession。三个 workflow 的具体业务节点和实现仍未开始。
+总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）。当前已完成 Pi-native workflow runtime bootstrap 和 bugFix command；尚未完成真实模型端到端与 build/work 业务流程。
 
 ## 历史资料
 
@@ -32,4 +32,4 @@
 
 ## 状态
 
-文档对齐阶段。尚未实现、发布或安装任何 extension。
+已完成 Pi-native workflow runtime bootstrap 和 bugFix command；尚未完成真实模型端到端与 build/work 业务流程。

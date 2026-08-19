@@ -15,7 +15,7 @@ docs/
 ├── extensions/                             # 每个 Pi extension 的独立设计文档
 │   ├── build.md                             # /build 顶层工作流 extension
 │   ├── work.md                              # /work 顶层工作流 extension
-│   ├── bug.md                               # /bug 顶层工作流 extension
+│   ├── bugFix.md                               # /bugFix 顶层工作流 extension
 │   └── workflow-ui.md                       # 可选：状态、产物和 trace 展示
 │
 ├── adr/                                     # 已定且需要长期保留的架构决策
@@ -67,7 +67,7 @@ skill 隔离、上下文隔离、worker 选型和验证都属于具体 extension
 4. `01-extension-catalog/README.md`
 5. `extensions/build.md`
 6. `extensions/work.md`
-7. `extensions/bug.md`
+7. `extensions/bugFix.md`
 8. `extensions/workflow-ui.md`
 
 前两个总体问题没有对齐前，不开始实现任何 extension。

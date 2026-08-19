@@ -14,12 +14,12 @@
 |---|---|---|---|
 | `build` | 新需求的完整工作流 | `/build` | `PACKAGE_DECIDED` |
 | `work` | 已有功能继续工作、分类和变更 | `/work` | `PACKAGE_DECIDED` |
-| `bug` | Bug 调查、根因判断和修复 | `/bug` | `PACKAGE_DECIDED` |
+| `bugFix` | Bug 调查、根因判断和修复 | `/bugFix` | `PACKAGE_DECIDED` |
 | `workflow-ui` | 可选：展示 run、stage、artifact、finding 和阻塞状态 | TUI 状态展示 | `TODO` |
 
 ## 已确认边界
 
-1. `/build`、`/work`、`/bug` 分别作为三个顶层 workflow extension。
+1. `/build`、`/work`、`/bugFix` 分别作为三个顶层 workflow extension。
 2. 每个顶层 workflow extension 对应一个独立 Pi package，但三个 package 保持在同一个 Git monorepo。
 3. 需求对齐、方案对齐、委派、review、验证首先作为各自 package 内的普通 Workflow Node。
 4. 三个 package 基于共享 Workflow Runtime 和 Contracts workspace library 定义自己的 loop 和 hooks。
@@ -30,5 +30,5 @@
 
 - [Build Extension](../extensions/build.md)
 - [Work Extension](../extensions/work.md)
-- [Bug Extension](../extensions/bug.md)
+- [bugFix Extension](../extensions/bugFix.md)
 - [Workflow UI](../extensions/workflow-ui.md)

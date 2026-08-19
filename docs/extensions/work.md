@@ -8,7 +8,7 @@
 
 `work` 是一个独立的顶层工作流 extension，注册 `/work`，负责已有功能继续工作、任务分类、局部变更、需求变更和技术方案变更。
 
-待总体运行时选型确认后，`work` 必须有明确的 Workflow Controller 负责状态迁移：Worker 只返回调查、分类、实现、review 或验证 Artifact；Controller 校验结果并决定局部实现、进入多 agent 对齐、重路由到 `/bug`、回到实现或进入 `BLOCKED` / `ACCEPTED`。Controller 与 Node 最终采用普通 TypeScript 模块、同 runtime Node Extension，还是独立 runtime Node Extension，以上游选型文档为准。
+待总体运行时选型确认后，`work` 必须有明确的 Workflow Controller 负责状态迁移：Worker 只返回调查、分类、实现、review 或验证 Artifact；Controller 校验结果并决定局部实现、进入多 agent 对齐、重路由到 `/bugFix`、回到实现或进入 `BLOCKED` / `ACCEPTED`。Controller 与 Node 最终采用普通 TypeScript 模块、同 runtime Node Extension，还是独立 runtime Node Extension，以上游选型文档为准。
 
 调查、分类、worker 委派、review 和验证目前都是本 extension 内部节点，不预先拆成独立 Pi 子 extension。
 
