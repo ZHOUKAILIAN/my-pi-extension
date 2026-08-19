@@ -8,8 +8,9 @@
 
 从 [文档树](docs/document-tree.md) 开始，按两个问题推进：
 
-1. [仓库组织形式](docs/00-repository-organization.md)：这个仓库如何承载多个 Pi extension。
-2. [Extension 集合目录](docs/01-extension-catalog.md)：集合里有哪些 extension，以及每个 extension 的职责边界。
+1. [仓库组织形式](docs/00-repository-organization/README.md)：这个仓库如何承载多个 Pi extension。
+   - [仓库组织技术方案](docs/00-repository-organization/technical-design.md)
+2. [Extension 集合目录](docs/01-extension-catalog/README.md)：集合里有哪些 extension，以及每个 extension 的职责边界。
 
 之后进入 [extensions/](docs/extensions/) 下的单个 extension 设计文档。
 

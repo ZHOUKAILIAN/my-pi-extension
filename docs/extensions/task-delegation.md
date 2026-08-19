@@ -1,7 +1,7 @@
 # Task Delegation Extension
 
 - 状态：`TODO`
-- 上游：[仓库组织形式](../00-repository-organization.md)、[Extension 集合目录](../01-extension-catalog.md)
+- 上游：[仓库组织形式](../00-repository-organization/README.md)、[Extension 集合目录](../01-extension-catalog/README.md)
 
 ## 1. 目标与边界
 

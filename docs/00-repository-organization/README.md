@@ -17,19 +17,18 @@
 6. 如何安装、启用、禁用、升级和回滚单个 extension？
 7. 如何保证一个 extension 的失败不会污染其他 extension？
 
-## 当前候选结构
+## 当前讨论范围
+
+这里暂时只记录需要做出的组织决策，不把候选目录结构写成既定事实。当前需要比较的是：
 
 ```text
-my-pi-extension/
-├── package.json
-├── src/                         # 共享 TypeScript 实现
-│   ├── core/                    # 只有明确共享的协议和运行时能力
-│   └── extensions/              # 每个 Pi extension 的入口
-├── policies/                    # 可版本化策略
-├── skills/                      # 本集合自带 skill（如需要）
-├── tests/
-└── docs/
+一个仓库
+  -> 一个 Pi package 或多个 Pi package
+      -> 一个主 extension 或多个独立 extension entry point
+          -> 是否存在共享 core
 ```
+
+Policy、artifact、trace、skill 和 tests 的具体归属，等 package、extension 和 core 的边界确定后再落目录。
 
 ## 本文暂不决定
 
@@ -40,5 +39,6 @@ my-pi-extension/
 
 ## 下游文档
 
-- [Extension 集合目录](01-extension-catalog.md)
-- [Workflow Router](extensions/workflow-router.md)
+- [仓库组织技术方案](technical-design.md)
+- [Extension 集合目录](../01-extension-catalog/README.md)
+- [Workflow Router](../extensions/workflow-router.md)

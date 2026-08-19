@@ -2,7 +2,7 @@
 
 - 状态：`ALIGNING`
 - 类型：Extension 集合总体方案
-- 上游：[仓库组织形式](00-repository-organization.md)
+- 上游：[仓库组织形式](../00-repository-organization/README.md)
 
 ## 要回答的问题
 
@@ -31,9 +31,9 @@
 
 ## 下游文档
 
-- [Workflow Router](extensions/workflow-router.md)
-- [Task Delegation](extensions/task-delegation.md)
-- [Solution Review](extensions/solution-review.md)
-- [Code Review](extensions/code-review.md)
-- [Verification](extensions/verification.md)
-- [Workflow UI](extensions/workflow-ui.md)
+- [Workflow Router](../extensions/workflow-router.md)
+- [Task Delegation](../extensions/task-delegation.md)
+- [Solution Review](../extensions/solution-review.md)
+- [Code Review](../extensions/code-review.md)
+- [Verification](../extensions/verification.md)
+- [Workflow UI](../extensions/workflow-ui.md)

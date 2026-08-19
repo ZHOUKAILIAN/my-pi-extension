@@ -5,8 +5,11 @@
 ```text
 docs/
 ├── document-tree.md                         # 本文件：文档导航
-├── 00-repository-organization.md            # 仓库组织形式
-├── 01-extension-catalog.md                  # Extension 集合目录
+├── 00-repository-organization/              # 仓库组织形式
+│   ├── README.md                            # 问题定义和待对齐项
+│   └── technical-design.md                  # 仓库组织技术方案
+├── 01-extension-catalog/                    # Extension 集合目录
+│   └── README.md                            # 集合成员和边界
 │
 ├── extensions/                             # 每个 Pi extension 的独立设计文档
 │   ├── workflow-router.md                   # build/work/bug 入口路由
@@ -59,14 +62,15 @@ skill 隔离、上下文隔离、worker 选型和验证都属于具体 extension
 
 ## 推进顺序
 
-1. `00-repository-organization.md`
-2. `01-extension-catalog.md`
-3. `extensions/workflow-router.md`
-4. `extensions/task-delegation.md`
-5. `extensions/solution-review.md`
-6. `extensions/code-review.md`
-7. `extensions/verification.md`
-8. `extensions/workflow-ui.md`
+1. `00-repository-organization/README.md`
+2. `00-repository-organization/technical-design.md`
+3. `01-extension-catalog/README.md`
+4. `extensions/workflow-router.md`
+5. `extensions/task-delegation.md`
+6. `extensions/solution-review.md`
+7. `extensions/code-review.md`
+8. `extensions/verification.md`
+9. `extensions/workflow-ui.md`
 
 前两个总体问题没有对齐前，不开始实现任何 extension。
 
@@ -84,6 +88,9 @@ skill 隔离、上下文隔离、worker 选型和验证都属于具体 extension
 
 ## 历史文档
 
+- [仓库组织问题](00-repository-organization/README.md)
+- [仓库组织技术方案](00-repository-organization/technical-design.md)
+- [Extension 集合目录](01-extension-catalog/README.md)
 - [历史整体方案选型](architecture-selection.md)
 - [gpt-5.6-sol 多模型评审](reviews/2026-08-18-gpt-5.6-sol-design-review.md)
 - [Policy 治理 runtime ADR](adr/0001-policy-governed-workflow-runtime.md)
