@@ -1,0 +1,15 @@
+{
+  "name": "pi-native-workflow-runtime",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck": "tsc -b",
+    "test": "node --experimental-strip-types --test packages/*/test/*.test.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "typescript": "^5.7.0"
+  }
+}

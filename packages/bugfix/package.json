@@ -1,0 +1,9 @@
+{
+  "name": "@pi/bugfix",
+  "version": "0.1.0",
+  "type": "module",
+  "pi": { "extensions": ["src/extension.ts"] },
+  "peerDependencies": { "@earendil-works/pi-coding-agent": "*" },
+  "dependencies": { "@pi/workflow-runtime": "^0.1.0", "@pi/workflow-contracts": "^0.1.0" },
+  "scripts": { "manifest:test": "node --experimental-strip-types --test test/extension.test.ts" }
+}
