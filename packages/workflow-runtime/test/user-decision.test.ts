@@ -6,7 +6,7 @@ test('requirement/design investigation waits, checkpoints, and resumes only with
   const checkpoints: any[] = []; const gate = new InMemoryUserDecisionGate();
   const r = new WorkflowRuntime(bugFixDefinition, { saveCheckpoint: c => checkpoints.push(c), loadLast: () => checkpoints.at(-1) }, 'r', () => 1, () => 'c');
   r.setDecisionGate(gate);
-  await r.runNode({ id: 'investigate', worker: { execute: async () => ({ kind: 'investigation', route: 'design_change', evidence: ['x'] }) } }, {});
+  await r.runNode({ id: 'investigate', worker: { execute: async () => ({ kind: 'investigation', route: 'design_change', rootCause: 'cause', evidence: ['x'] }) } }, {});
   assert.equal(r.stage, 'WAITING_FOR_USER'); assert.equal(checkpoints.at(-1).stage, 'WAITING_FOR_USER');
   assert.throws(() => r.resume(), /decision/);
   gate.decide({ kind: 'user_decision', decision: 'continue_investigating', requestId: 'unused' });

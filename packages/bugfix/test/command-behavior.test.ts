@@ -27,20 +27,20 @@ const blocked = { customType: 'workflow-run', data: { runId: 'blocked-1', stage:
 
 test('current BLOCKED command collects one supplement and reaches ACCEPTED', async () => {
   const h = harness([
-    { kind: 'investigation', route: 'needs_more_evidence', evidence: ['not enough'] },
-    { kind: 'investigation', route: 'local_fix', evidence: ['new evidence'] },
-    { kind: 'implementation', artifact: 'patch' },
-    { kind: 'verification', accepted: true, evidence: ['pass'] },
+    { kind: 'investigation', route: 'needs_more_evidence', rootCause: 'evidence incomplete', evidence: ['not enough'] },
+    { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['new evidence'] },
+    { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
+    { kind: 'verification', accepted: true, evidence: ['pass'], candidateRevision: 'rev-1' },
   ], [blocked], '补充信息');
   await h.command('登录后白屏', h.ctx);
   assert.equal(h.calls(), 4);
   assert.deepEqual(h.capsules[1], { supplementalInformation: '补充信息' });
-  assert.equal(h.entries.at(-1).data.stage, 'ACCEPTED');
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'ACCEPTED');
 });
 
 test('cancel or empty BLOCKED input stays blocked and does not repeat input', async () => {
   for (const input of [undefined, '']) {
-    const h = harness([{ kind: 'investigation', route: 'needs_more_evidence', evidence: ['not enough'] }], [blocked], input);
+    const h = harness([{ kind: 'investigation', route: 'needs_more_evidence', rootCause: 'evidence incomplete', evidence: ['not enough'] }], [blocked], input);
     await h.command('登录后白屏', h.ctx);
     assert.equal(h.calls(), 1);
     assert.match(h.notifications.at(-1), /BLOCKED/);

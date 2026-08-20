@@ -7,6 +7,7 @@ import extension from '../src/extension.ts';
 
 function commandHarness(options: { answers?: any[]; cwd?: string; model?: any; registry?: any; hasUI?: boolean; input?: string } = {}) {
   const entries: any[] = [];
+  const notifications: string[] = [];
   let command: any;
   let calls = 0;
   let inputCalls = 0;
@@ -26,17 +27,17 @@ function commandHarness(options: { answers?: any[]; cwd?: string; model?: any; r
     sessionManager: { getEntries: () => entries },
     ui: {
       input: async () => { inputCalls += 1; return options.input; },
-      notify: () => {},
+      notify: (message: string) => notifications.push(message),
     },
   };
   extension(pi);
-  return { command, ctx, entries, calls: () => calls, inputCalls: () => inputCalls };
+  return { command, ctx, entries, notifications, calls: () => calls, inputCalls: () => inputCalls };
 }
 
 const acceptedAnswers = () => [
-  { kind: 'investigation', route: 'local_fix', evidence: ['trace'] },
-  { kind: 'implementation', artifact: 'patch' },
-  { kind: 'verification', accepted: true, evidence: ['tests'] },
+  { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
+  { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
+  { kind: 'verification', accepted: true, evidence: ['tests'], candidateRevision: 'rev-1' },
 ];
 
 test('each identical problem starts a distinct run', async () => {
@@ -71,10 +72,39 @@ test('a missing configured model writes no command, checkpoint, audit, or worker
 test('a BLOCKED run without UI does not ask for input or retry', async () => {
   const h = commandHarness({
     hasUI: false,
-    answers: [{ kind: 'investigation', route: 'needs_more_evidence', evidence: ['missing'] }],
+    answers: [{ kind: 'investigation', route: 'needs_more_evidence', rootCause: 'evidence incomplete', evidence: ['missing'] }],
   });
   await h.command('登录后白屏', h.ctx);
   assert.equal(h.calls(), 1);
   assert.equal(h.inputCalls(), 0);
-  assert.equal(h.entries.at(-1).data.stage, 'BLOCKED');
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'BLOCKED');
+});
+
+test('an invalid implementation artifact is retried and only a valid retry advances the workflow', async () => {
+  const h = commandHarness({
+    answers: [
+      { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
+      { kind: 'implementation', artifact: { summary: 'missing revision', filesChanged: ['a.ts'] } },
+      { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
+      { kind: 'verification', accepted: true, evidence: ['tests'], candidateRevision: 'rev-1' },
+    ],
+  });
+  await h.command('登录后白屏', h.ctx);
+  assert.equal(h.calls(), 4);
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'ACCEPTED');
+});
+
+test('a repeatedly invalid implementation result pauses with an IMPLEMENTING checkpoint', async () => {
+  const h = commandHarness({
+    answers: [
+      { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
+      { kind: 'implementation', artifact: { summary: 'missing revision', filesChanged: ['a.ts'] } },
+      { kind: 'implementation', artifact: { summary: 'still missing revision', filesChanged: ['a.ts'] } },
+    ],
+  });
+  await h.command('登录后白屏', h.ctx);
+  assert.equal(h.calls(), 3);
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'IMPLEMENTING');
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-node-failure').at(-1).data.code, 'MISSING_CANDIDATE_REVISION');
+  assert.match(h.notifications.at(-1), /IMPLEMENTING paused/);
 });

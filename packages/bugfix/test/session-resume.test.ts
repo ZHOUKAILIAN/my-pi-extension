@@ -10,9 +10,9 @@ function harness(entries: any[], confirm = true, options: { cwd?: string; truste
   let calls = 0;
   let confirmCalls = 0;
   const results: any[] = [
-    { kind: 'investigation', route: 'local_fix', evidence: ['ok'] },
-    { kind: 'implementation', artifact: 'patch' },
-    { kind: 'verification', accepted: true, evidence: ['ok'] },
+    { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['ok'] },
+    { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
+    { kind: 'verification', accepted: true, evidence: ['ok'], candidateRevision: 'rev-1' },
   ];
   const pi: any = {
     on: (_event: string, handler: any) => { onStart = handler; },
