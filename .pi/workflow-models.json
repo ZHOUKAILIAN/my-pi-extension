@@ -2,8 +2,22 @@
   "version": 1,
   "default": "inherit",
   "nodes": {
-    "investigate": "smartingredients/gpt-5.6-sol",
-    "implement": "smartingredients/gpt-5.6-luna",
-    "verify": "smartingredients/gpt-5.6-terra"
+    "investigate": {
+      "model": "smartingredients/gpt-5.6-sol",
+      "skills": [
+        "cst-plus",
+        "aliyun-sls-query",
+        "mysql-readonly",
+        "redis-readonly"
+      ]
+    },
+    "implement": {
+      "model": "smartingredients/gpt-5.6-luna",
+      "skills": ["tdd"]
+    },
+    "verify": {
+      "model": "smartingredients/gpt-5.6-terra",
+      "skills": ["backend-service-verification"]
+    }
   }
 }

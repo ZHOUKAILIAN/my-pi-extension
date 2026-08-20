@@ -33,13 +33,28 @@ test('fixed investigation default resolves without ctx.model, while inherit does
   assert.throws(() => resolveModelRef('inherit', undefined, registry), /requires ctx\.model/);
 });
 
-test('policy accepts partial node overrides', () => {
+test('policy keeps legacy string node references compatible', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bugfix-policy-'));
   const path = join(dir, 'models.json');
-  writeFileSync(path, JSON.stringify({ version: 1, default: 'p/default', nodes: { investigate: 'p/special' } }));
+  writeFileSync(path, JSON.stringify({ version: 1, nodes: { investigate: 'p/legacy' } }));
+  const policy = loadModelPolicy(path);
+  assert.equal(policy.nodes.investigate.configuredRef, 'p/legacy');
+  assert.deepEqual(policy.nodes.investigate.skills, []);
+});
+
+test('policy accepts object node overrides with node-scoped skills', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bugfix-policy-'));
+  const path = join(dir, 'models.json');
+  writeFileSync(path, JSON.stringify({
+    version: 1,
+    default: 'p/default',
+    nodes: { investigate: { model: 'p/special', skills: ['cst-plus', 'aliyun-sls-query'] } },
+  }));
   const policy = loadModelPolicy(path);
   assert.equal(policy.nodes.investigate.configuredRef, 'p/special');
+  assert.deepEqual(policy.nodes.investigate.skills, ['cst-plus', 'aliyun-sls-query']);
   assert.equal(policy.nodes.implement.configuredRef, 'p/default');
+  assert.deepEqual(policy.nodes.implement.skills, []);
   assert.equal(policy.nodes.verify.source, 'project-file');
 });
 
@@ -52,9 +67,12 @@ test('policy rejects bad JSON, schema, and model refs', () => {
   check('{', 'JSON');
   check(JSON.stringify({ version: 2 }), 'schema');
   check(JSON.stringify({ version: 1, nodes: null }), 'schema');
-  check(JSON.stringify({ version: 1, default: 'invalid' }), 'schema|ref');
-  check(JSON.stringify({ version: 1, nodes: { investigate: 'invalid' } }), 'schema|ref');
+  check(JSON.stringify({ version: 1, default: 'invalid' }), 'schema|ref|node policy');
+  check(JSON.stringify({ version: 1, nodes: { investigate: 'invalid' } }), 'schema|ref|node policy');
   check(JSON.stringify({ version: 1, nodes: { investigat: 'inherit' } }), 'unknown');
+  check(JSON.stringify({ version: 1, nodes: { investigate: { model: 'inherit', skills: ['invalid_skill'] } } }), 'node policy');
+  check(JSON.stringify({ version: 1, nodes: { investigate: { model: 'inherit', skills: ['cst-plus', 'cst-plus'] } } }), 'node policy');
+  check(JSON.stringify({ version: 1, nodes: { investigate: { model: 'inherit', unknown: true } } }), 'node policy');
 });
 
 // Keep the public parser contract explicit for callers that previously used operation fields.

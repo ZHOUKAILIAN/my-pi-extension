@@ -21,11 +21,11 @@ export default function bugFixExtension(pi: ExtensionAPI) {
       };
       const resolved = resolveModelRef(configuredRef, (ctx as any).model ?? (injected ? { provider: 'injected', id: 'bugFixWorker' } : undefined), registry);
       const model = injected ? ((ctx as any).model ?? resolved) : resolved;
-      const worker = injected ?? new PiSdkWorkerExecutor({ model, thinkingLevel: resolvedThinkingLevel });
-      const definition = bugFixNodes(worker)[nodeId];
+      const worker = injected ?? new PiSdkWorkerExecutor({ model, thinkingLevel: resolvedThinkingLevel, skills: policy.nodes[nodeId].skills, cwd: ctx.cwd });
+      const definition = bugFixNodes(worker, { [nodeId]: policy.nodes[nodeId].skills })[nodeId];
       workers[nodeId] = worker;
       definitions[nodeId] = definition;
-      audits.push({ runNode: nodeId, source: policy.nodes[nodeId].source, configuredRef, resolved: { provider: model.provider, id: model.id }, thinkingLevel: resolvedThinkingLevel, tools: definition.profile?.tools });
+      audits.push({ runNode: nodeId, source: policy.nodes[nodeId].source, configuredRef, resolved: { provider: model.provider, id: model.id }, thinkingLevel: resolvedThinkingLevel, skills: definition.profile?.skills, tools: definition.profile?.tools });
     }
     return { policy, workers, definitions, audits, resolvedThinkingLevel };
   };
