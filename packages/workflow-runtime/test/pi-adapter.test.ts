@@ -87,10 +87,35 @@ test('PiSdk adapter uses an isolated SDK session and captures submit_artifact', 
   assert.equal(result.kind, 'investigation');
 });
 
-test('PiSdk adapter rejects a session that does not submit an artifact', async () => {
+test('PiSdk adapter includes the node artifact contract and retries once after plain text', async () => {
+  const prompts: string[] = [];
+  let attempts = 0;
   const executor = new PiSdkWorkerExecutor({
     resourceLoader: { reload: async () => {}, getSkills: () => ({ skills: [], diagnostics: [] }) } as any,
-    createSession: async () => ({ session: { prompt: async () => {} } }) as any,
+    createSession: async (request: any) => ({ session: { prompt: async (value: string) => {
+      prompts.push(value);
+      attempts += 1;
+      if (attempts === 2) {
+        const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
+        await tool.execute('call-2', { kind: 'investigation', route: 'local_fix', evidence: ['trace'] });
+      }
+    } } }) as any,
   });
-  await assert.rejects(() => executor.execute({ id: 'n', profile: { tools: [] } }, '', {}), /did not submit artifact/);
+  const result = await executor.execute({ id: 'investigate', profile: { tools: [] } }, 'white screen', { userId: 'u-1' });
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[0], /Call submit_artifact exactly once/);
+  assert.match(prompts[0], /white screen/);
+  assert.match(prompts[0], /userId/);
+  assert.match(prompts[1], /previous response did not call submit_artifact/);
+  assert.equal(result.kind, 'investigation');
+});
+
+test('PiSdk adapter rejects a session that does not submit an artifact after retry', async () => {
+  let prompts = 0;
+  const executor = new PiSdkWorkerExecutor({
+    resourceLoader: { reload: async () => {}, getSkills: () => ({ skills: [], diagnostics: [] }) } as any,
+    createSession: async () => ({ session: { prompt: async () => { prompts += 1; } } }) as any,
+  });
+  await assert.rejects(() => executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {}), /did not submit artifact/);
+  assert.equal(prompts, 2);
 });
