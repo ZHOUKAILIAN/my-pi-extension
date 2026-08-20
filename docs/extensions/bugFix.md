@@ -10,7 +10,7 @@
 
 工作流进入 `BLOCKED` 后，当前命令最多一次通过主 UI `input` 请求补充信息；非空内容作为下一次 investigate 的 capsule 交给 worker。取消、空输入或无 UI 保持 BLOCKED，后续不循环。`WAITING_FOR_USER` 使用主 UI confirm，单次执行最多确认一次。
 
-模型策略读取 `<cwd>/.pi/workflow-models.json`；文件存在时按配置覆盖以下运行时默认值（未配置文件时生效）：
+Pi 仅在项目已被信任时读取 `<cwd>/.pi/workflow-models.json`；未信任项目直接使用运行时默认值，不加载项目声明的模型或 skills。文件存在时按配置覆盖以下运行时默认值（未配置文件时生效）：
 
 | 节点 | 默认模型 |
 | --- | --- |
@@ -18,7 +18,7 @@
 | implement | `inherit` |
 | verify | `inherit` |
 
-项目配置可对单个节点或默认值进行覆盖。`inherit` 继承当前主模型，因此 implement/verify 在缺失 `ctx.model` 时会失败；investigate 的固定默认模型可独立解析。每个命令、session resume 和每个 node 都写审计；策略错误或模型解析失败在模型调用前显式失败。
+项目配置可对单个节点或默认值进行覆盖。Node 既可使用原有字符串模型引用，也可使用 `{ "model": "provider/model", "skills": ["skill-name"] }` 对象；创建独立 Worker Session 时只注入该 Node 显式列出的 skills，未列出的全局 skill 不会继承。未知 skill 在创建 session 前失败。`inherit` 继承当前主模型，因此 implement/verify 在缺失 `ctx.model` 时会失败；investigate 的固定默认模型可独立解析。skill 只提供调查方法和输出规范，不会自动扩大 tools allowlist 或获得 `bash`、数据库、Redis、SLS 的权限。每个命令、session resume 和每个 node 都写审计，记录模型、skills 与 tools；策略错误或模型解析失败在模型调用前显式失败。
 
 ## 当前边界
 
