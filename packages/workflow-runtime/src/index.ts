@@ -1,11 +1,12 @@
-import type {
-  Artifact,
-  NodeDefinition,
-  RunStore,
-  Stage,
-  WorkflowDefinition,
-  UserDecisionGate,
-  WorkerExecutor,
+import {
+  validateSubmitArtifact,
+  type Artifact,
+  type NodeDefinition,
+  type RunStore,
+  type Stage,
+  type WorkflowDefinition,
+  type UserDecisionGate,
+  type WorkerExecutor,
 } from '@pi/workflow-contracts';
 
 export * from '@pi/workflow-contracts';
@@ -56,6 +57,7 @@ export class WorkflowRuntime {
   readonly definition: WorkflowDefinition;
   readonly store: RunStore;
   readonly runId: string;
+  private artifacts: Artifact[] = [];
 
   constructor(definition: WorkflowDefinition, store: RunStore, runId = 'run-1', clock = () => Date.now(), idGen = () => `${runId}-${clock()}`) {
     this.definition = definition;
@@ -65,6 +67,9 @@ export class WorkflowRuntime {
     this.clock = clock;
     this.idGen = idGen;
   }
+
+  getArtifacts(): readonly Artifact[] { return this.artifacts; }
+  restoreArtifacts(artifacts: readonly Artifact[] | undefined) { this.artifacts = artifacts ? [...artifacts] : []; }
 
   setDecisionGate(gate: UserDecisionGate) { this.gate = gate; }
 
@@ -78,6 +83,9 @@ export class WorkflowRuntime {
 
   transition(to: Stage, artifact?: Artifact) {
     this.stage = this.definition.transition(this.stage, to, artifact);
+    if (artifact && artifact.kind !== 'user_decision') {
+      this.artifacts = [...this.artifacts.filter((item) => item.kind !== artifact.kind), artifact];
+    }
     if (to === 'WAITING_FOR_USER') this.pendingDecision = `${this.runId}:${this.idGen()}`;
     this.store.saveCheckpoint({
       runId: this.runId,
@@ -88,6 +96,7 @@ export class WorkflowRuntime {
       pendingDecisionRequest: this.pendingDecision,
       decisionReference: artifact?.kind === 'user_decision' ? String(artifact.requestId) : undefined,
       artifactRefs: artifact ? [String(artifact.id ?? artifact.kind)] : undefined,
+      artifacts: this.artifacts.length ? this.artifacts : undefined,
     });
   }
 
@@ -98,6 +107,7 @@ export class WorkflowRuntime {
       throw Error('node worker required');
     }
     const artifact = await node.worker.execute(node, task, capsule);
+    validateSubmitArtifact(artifact);
     if (this.stage === 'INVESTIGATING' && artifact.kind === 'investigation') {
       if (artifact.route === 'local_fix') this.transition('IMPLEMENTING', artifact);
       else if (artifact.route === 'requirement_change' || artifact.route === 'design_change') this.transition('WAITING_FOR_USER', artifact);
@@ -128,6 +138,7 @@ export class WorkflowRuntime {
       runtime.stage = checkpoint.stage;
       runtime.problem = checkpoint.problem;
       runtime.pendingDecision = checkpoint.pendingDecisionRequest;
+      runtime.restoreArtifacts(checkpoint.artifacts);
     }
     return runtime;
   }

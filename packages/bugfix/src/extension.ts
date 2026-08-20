@@ -1,5 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
-import { WorkflowRuntime, bugFixDefinition, bugFixNodes, PiSessionRunStore, InMemoryUserDecisionGate, PiSdkWorkerExecutor, type UserDecisionArtifact, type WorkerExecutor, type WorkerProgress } from '@pi/workflow-runtime';
+import { ArtifactContractError, WorkflowRuntime, bugFixDefinition, bugFixNodes, PiSessionRunStore, InMemoryUserDecisionGate, PiSdkWorkerExecutor, WorkerArtifactSubmissionError, type UserDecisionArtifact, type WorkerExecutor, type WorkerProgress } from '@pi/workflow-runtime';
 import { loadModelPolicy, parseBugFixCommand, resolveModelRef } from './policy.ts';
 
 export default function bugFixExtension(pi: ExtensionAPI) {
@@ -16,14 +16,22 @@ export default function bugFixExtension(pi: ExtensionAPI) {
     (ctx as any).ui?.setWorkingVisible?.(false);
   };
 
+  // A workflow run has one stable public trace ID. It survives /resume and keys all audit entries.
+  let activeTraceId: string | undefined;
   const trace = (content: string, level: 'info' | 'error' = 'info') => {
-    if (typeof (pi as any).sendMessage !== 'function') return;
-    pi.sendMessage({
-      customType: 'bugFix-trace',
-      content: `[bugFix] ${content}`,
-      display: true,
-      details: { level, timestamp: Date.now() },
-    });
+    const timestamp = Date.now();
+    const traceId = activeTraceId;
+    const visible = `[bugFix${traceId ? ` traceId=${traceId}` : ''}] ${content}`;
+    if (typeof (pi as any).sendMessage === 'function') {
+      pi.sendMessage({
+        customType: 'bugFix-trace',
+        content: visible,
+        display: true,
+        details: { traceId, level, timestamp },
+      });
+    }
+    // sendMessage makes the trace visible; appendEntry makes it replayable after /resume.
+    if (traceId) pi.appendEntry('workflow-trace', { runId: traceId, traceId, content, level, timestamp });
   };
 
 
@@ -62,6 +70,18 @@ export default function bugFixExtension(pi: ExtensionAPI) {
             if (text) trace(`${nodeId} · 模型输出: ${text.slice(-1600)}`);
             return;
           }
+          if (progress.type === 'artifact_fallback') {
+            trace(`${nodeId} · Artifact accepted from strict structured-text fallback: ${summarize(progress.artifact)}`);
+            return;
+          }
+          if (progress.type === 'model_end') {
+            trace(`${nodeId} · model end: stopReason=${progress.stopReason ?? 'unknown'}${progress.errorMessage ? ` · ${progress.errorMessage}` : ''}`, progress.stopReason === 'error' || progress.stopReason === 'aborted' ? 'error' : 'info');
+            return;
+          }
+          if (progress.type === 'artifact_attempt') {
+            trace(`${nodeId} · artifact attempt ${progress.attempt}/${progress.maxAttempts} · ${progress.reason}`);
+            return;
+          }
           if (progress.type === 'tool_start') {
             const detail = `tool start: ${progress.name} ${summarize(progress.args)}`;
             setWorkflowStatus(ctx, `bugFix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);
@@ -84,18 +104,59 @@ export default function bugFixExtension(pi: ExtensionAPI) {
   const continueRun = async (ctx: ExtensionCommandContext, store: PiSessionRunStore, runId: string, problem: string, prepared: ReturnType<typeof prepareRun>, confirmationAlreadyGiven = false) => {
     for (const audit of prepared.audits) {
       const { runNode, ...data } = audit;
-      pi.appendEntry('workflow-model-policy', { runId, nodeId: runNode, ...data });
+      pi.appendEntry('workflow-model-policy', { runId, traceId: runId, nodeId: runNode, ...data });
     }
     const { workers, definitions } = prepared;
     const runtime = WorkflowRuntime.restore(bugFixDefinition, store, runId);
     let blockedInputUsed = false;
     let waitingUsed = false;
     let confirmationPending = confirmationAlreadyGiven;
-    let previousArtifact: any;
+    const artifacts: Record<string, any> = Object.fromEntries(runtime.getArtifacts().map((artifact) => [artifact.kind, artifact]));
+    let previousArtifact: any = runtime.getArtifacts().at(-1);
 
     const appendArtifact = (nodeId: string, artifact: any) => {
       previousArtifact = artifact;
-      trace(`${nodeId} · Artifact submitted: ${JSON.stringify(artifact).slice(0, 1600)}`);
+      artifacts[artifact.kind] = artifact;
+      trace(`${nodeId} · Artifact accepted: ${JSON.stringify(artifact).slice(0, 1600)}`);
+    };
+
+    const pauseRecoverableNode = (nodeId: string, stage: string, error: WorkerArtifactSubmissionError | ArtifactContractError) => {
+      const errorDetail = error.message.replace(/\s+/g, ' ').slice(0, 1200);
+      const detail = { runId, traceId: runId, nodeId, stage, code: error.code, message: errorDetail, at: Date.now() };
+      pi.appendEntry('workflow-node-failure', detail);
+      trace(`${nodeId} · ${error.code}; ${stage} paused with checkpoint retained · ${errorDetail}`, 'error');
+      clearWorkflowWorking(ctx);
+      ctx.ui.notify(`${stage} paused: ${error.code}. TraceId: ${runId}. Use Pi /resume to retry ${nodeId}.`, 'error');
+    };
+
+    const bugFixReport = () => {
+      const investigation = artifacts.investigation ?? {};
+      const implementation = artifacts.implementation?.artifact ?? {};
+      const verification = artifacts.verification ?? {};
+      const revision = implementation.candidateRevision ?? verification.candidateRevision ?? 'not created';
+      const pr = implementation.prUrl ?? 'not created';
+      return [
+        '# BugFix Report',
+        '',
+        '## 现象',
+        problem,
+        '',
+        '## 根因',
+        investigation.rootCause ?? '未提供独立根因字段；请查看调查证据。',
+        '',
+        '## 证据',
+        ...(investigation.evidence?.length ? investigation.evidence.map((item: string) => `- ${item}`) : ['- 未提供']),
+        '',
+        '## 修改',
+        implementation.summary ?? '未提供修改摘要',
+        ...(implementation.filesChanged?.length ? implementation.filesChanged.map((file: string) => `- ${file}`) : ['- 未提供修改文件列表']),
+        '',
+        '## 验证',
+        ...(verification.evidence?.length ? verification.evidence.map((item: string) => `- ${item}`) : ['- 未提供验证证据']),
+        '',
+        `Candidate revision: ${revision}`,
+        `PR: ${pr}`,
+      ].join('\n');
     };
     while (runtime.stage !== 'ACCEPTED') {
       if (runtime.stage === 'WAITING_FOR_USER') {
@@ -131,10 +192,25 @@ export default function bugFixExtension(pi: ExtensionAPI) {
         if (!extra) { ctx.ui.notify(`BLOCKED: ${runId}`); return; }
         capsule = { supplementalInformation: extra };
       }
-      const artifact = await runtime.runNode(definitions[nodeId], problem, capsule);
+      let artifact: any;
+      try {
+        artifact = await runtime.runNode(definitions[nodeId], problem, capsule);
+      } catch (firstError) {
+        if (!(firstError instanceof WorkerArtifactSubmissionError) && !(firstError instanceof ArtifactContractError)) throw firstError;
+        trace(`${nodeId} · ${firstError.code}; retrying with a new worker session`);
+        setWorkflowStatus(ctx, `bugFix ${nodeId} · ${firstError.code} · retrying`);
+        try {
+          artifact = await runtime.runNode(definitions[nodeId], problem, capsule);
+        } catch (secondError) {
+          if (!(secondError instanceof WorkerArtifactSubmissionError) && !(secondError instanceof ArtifactContractError)) throw secondError;
+          pauseRecoverableNode(nodeId, stage, secondError);
+          return;
+        }
+      }
       appendArtifact(nodeId, artifact);
     }
     clearWorkflowWorking(ctx);
+    trace(bugFixReport());
     ctx.ui.notify(`ACCEPTED: ${runId}`);
   };
 
@@ -146,15 +222,24 @@ export default function bugFixExtension(pi: ExtensionAPI) {
     try {
       setWorkflowStatus(ctx, `bugFix ${checkpoint.stage} · resuming worker`);
       const prepared = prepareRun(ctx);
-      pi.appendEntry('workflow-command', { operation: 'session-resume', runId: checkpoint.runId, time: Date.now() });
+      activeTraceId = checkpoint.runId;
+      trace(`trace started · resumed from ${checkpoint.stage}`);
+      pi.appendEntry('workflow-command', { operation: 'session-resume', runId: checkpoint.runId, traceId: checkpoint.runId, time: Date.now() });
       await continueRun(ctx, store, checkpoint.runId, checkpoint.problem, prepared, checkpoint.stage === 'WAITING_FOR_USER');
     }
     catch (error) {
       clearWorkflowWorking(ctx);
       const message = error instanceof Error ? error.message : String(error);
+      const recovery = error instanceof WorkerArtifactSubmissionError
+        ? ` ${error.code}; checkpoint retained. Use Pi /resume to retry ${error.nodeId}.`
+        : error instanceof ArtifactContractError
+          ? ` ${error.code}; checkpoint retained. Use Pi /resume to retry the current stage.`
+          : '';
       setWorkflowStatus(ctx, `bugFix failed · ${message}`, false);
-      trace(`failed · ${message}`, 'error');
-      ctx.ui.notify(`bugFix failed: ${message}`, 'error');
+      trace(`failed · ${message}${recovery}`, 'error');
+      ctx.ui.notify(`bugFix failed: ${message}${recovery}`, 'error');
+    } finally {
+      activeTraceId = undefined;
     }
   };
 
@@ -170,18 +255,26 @@ export default function bugFixExtension(pi: ExtensionAPI) {
       const runId = `bugFix-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       try {
         setWorkflowStatus(ctx, 'bugFix INVESTIGATING · preparing worker');
-        trace('starting · preparing worker');
         const prepared = prepareRun(ctx);
-        pi.appendEntry('workflow-command', { operation: 'start', runId, time: Date.now() });
+        activeTraceId = runId;
+        trace('trace started · new workflow');
+        pi.appendEntry('workflow-command', { operation: 'start', runId, traceId: runId, time: Date.now() });
         store.saveCheckpoint({ runId, stage: 'INVESTIGATING', at: Date.now(), id: `${runId}-initial`, problem: parsed.problem });
         await continueRun(ctx, store, runId, parsed.problem!, prepared);
       }
       catch (error) {
         clearWorkflowWorking(ctx);
         const message = error instanceof Error ? error.message : String(error);
+        const recovery = error instanceof WorkerArtifactSubmissionError
+          ? ` ${error.code}; checkpoint retained. Use Pi /resume to retry ${error.nodeId}.`
+          : error instanceof ArtifactContractError
+            ? ` ${error.code}; checkpoint retained. Use Pi /resume to retry the current stage.`
+            : '';
         setWorkflowStatus(ctx, `bugFix failed · ${message}`, false);
-        trace(`failed · ${message}`, 'error');
-        ctx.ui.notify(`bugFix failed: ${message}`, 'error');
+        trace(`failed · ${message}${recovery}`, 'error');
+        ctx.ui.notify(`bugFix failed: ${message}${recovery}`, 'error');
+      } finally {
+        activeTraceId = undefined;
       }
     },
   });

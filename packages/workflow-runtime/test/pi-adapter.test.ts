@@ -20,7 +20,7 @@ test('PiSdk adapter injects only the node skills into a new session', async () =
       options = request;
       return { session: { prompt: async () => {
         const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
-        await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', evidence: ['trace'] });
+        await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
       } } };
     },
   });
@@ -38,7 +38,7 @@ test('PiSdk adapter scopes a real Pi ResourceLoader before creating the session'
       options = request;
       return { session: { prompt: async () => {
         const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
-        await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', evidence: ['trace'] });
+        await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
       } } };
     },
   });
@@ -70,7 +70,7 @@ test('PiSdk adapter uses an isolated SDK session and captures submit_artifact', 
         session: {
           prompt: async () => {
             const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
-            await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', evidence: ['trace'] });
+            await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
           },
         },
       };
@@ -97,7 +97,7 @@ test('PiSdk adapter includes the node artifact contract and retries once after p
       attempts += 1;
       if (attempts === 2) {
         const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
-        await tool.execute('call-2', { kind: 'investigation', route: 'local_fix', evidence: ['trace'] });
+        await tool.execute('call-2', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
       }
     } } }) as any,
   });
@@ -110,12 +110,30 @@ test('PiSdk adapter includes the node artifact contract and retries once after p
   assert.equal(result.kind, 'investigation');
 });
 
+test('PiSdk adapter accepts only a validated structured-text artifact when the model omits the tool call', async () => {
+  let prompts = 0;
+  let fallback: any;
+  const executor = new PiSdkWorkerExecutor({
+    onProgress: (progress) => { if (progress.type === 'artifact_fallback') fallback = progress.artifact; },
+    resourceLoader: { reload: async () => {}, getSkills: () => ({ skills: [], diagnostics: [] }) } as any,
+    createSession: async () => ({
+      session: {
+        prompt: async () => { prompts += 1; },
+        messages: [{ role: 'assistant', content: [{ type: 'text', text: '```bugfix-artifact\n{"kind":"investigation","route":"local_fix","rootCause":"cause","evidence":["trace"]}\n```' }] }],
+      },
+    }) as any,
+  });
+  const result = await executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {});
+  assert.equal(prompts, 1);
+  assert.deepEqual(result, fallback);
+});
+
 test('PiSdk adapter rejects a session that does not submit an artifact after retry', async () => {
   let prompts = 0;
   const executor = new PiSdkWorkerExecutor({
     resourceLoader: { reload: async () => {}, getSkills: () => ({ skills: [], diagnostics: [] }) } as any,
     createSession: async () => ({ session: { prompt: async () => { prompts += 1; } } }) as any,
   });
-  await assert.rejects(() => executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {}), /did not submit artifact/);
+  await assert.rejects(() => executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {}), /did not produce a valid artifact/);
   assert.equal(prompts, 2);
 });
