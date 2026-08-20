@@ -16,9 +16,12 @@ test('command handler runs injected worker through all stages and checkpoints', 
   let calls = 0;
   const worker = { execute: async () => answers[calls++] } as any;
   let command: any;
+  const traces: any[] = [];
   const pi: any = {
     bugFixWorker: worker,
     registerCommand: (_name: string, value: any) => { command = value.handler; },
+    registerMessageRenderer() {},
+    sendMessage: (message: any) => traces.push(message),
     appendEntry: (_type: string, data: any) => entries.push({ customType: 'workflow-run', data }),
   };
   const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
@@ -26,6 +29,7 @@ test('command handler runs injected worker through all stages and checkpoints', 
   await command('登录后白屏', ctx);
   assert.equal(calls, 3);
   assert.equal(entries.filter((entry) => entry.data.stage).map((entry) => entry.data.stage).join(','), 'INVESTIGATING,IMPLEMENTING,VERIFYING,ACCEPTED');
+  assert.equal(traces.some((entry) => entry.content.includes('INVESTIGATING')), true);
 
   const retryEntries: any[] = [];
   const retryAnswers: Artifact[] = [

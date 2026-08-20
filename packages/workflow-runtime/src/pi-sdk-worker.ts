@@ -2,6 +2,11 @@ import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir,
 import type { Artifact, NodeDefinition, WorkerExecutor, Capsule } from '@pi/workflow-contracts';
 import { validateSubmitArtifact } from '@pi/workflow-contracts';
 
+export type WorkerProgress =
+  | { type: 'tool_start'; name: string; args: unknown }
+  | { type: 'tool_end'; name: string; result: unknown; isError: boolean }
+  | { type: 'text'; text: string };
+
 // Keep the schema dependency-free: Pi validates this JSON Schema-shaped object at
 // the SDK boundary, while validateSubmitArtifact remains the Runtime authority.
 const artifactSchema = {
@@ -37,7 +42,8 @@ function workerPrompt(node: NodeDefinition, task: unknown, capsule: Capsule, ret
   return [
     'You are executing one controlled workflow node.',
     submissionContract(node.id),
-    'A text response is not a completion. Submit the structured artifact through the tool, then stop.',
+    'Do the investigation or implementation using the enabled tools. A text response is not a completion.',
+    'Before ending, call submit_artifact exactly once with the final structured result, then stop.',
     `TASK:\n${String(task)}`,
     `CAPSULE:\n${JSON.stringify(capsule)}`,
     retryInstruction,
@@ -53,6 +59,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     cwd?: string;
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
+    onProgress?: (progress: WorkerProgress) => void;
   };
 
   constructor(options: {
@@ -62,6 +69,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     cwd?: string;
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
+    onProgress?: (progress: WorkerProgress) => void;
   } = {}) {
     this.options = options;
   }
@@ -72,6 +80,8 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       name: 'submit_artifact',
       label: 'submit_artifact',
       description: 'Submit the required structured workflow artifact. Ordinary text is not accepted as completion.',
+      promptSnippet: 'Submit the final structured workflow artifact. Ordinary text is not completion.',
+      promptGuidelines: ['Before completing this workflow node, call submit_artifact exactly once with the required artifact.'],
       parameters: artifactSchema,
       execute: async (_id, params) => {
         validateSubmitArtifact(params);
@@ -128,9 +138,45 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       ...(this.options.thinkingLevel !== undefined ? { thinkingLevel: this.options.thinkingLevel } : {}),
     } as any);
 
-    await session.prompt(workerPrompt(node, task, capsule));
-    if (!captured) await session.prompt(workerPrompt(node, task, capsule, true));
-    if (!captured) throw Error('worker did not submit artifact');
-    return captured;
+    let streamedText = '';
+    const unsubscribe = typeof (session as any).subscribe === 'function'
+      ? (session as any).subscribe((event: any) => {
+        if (event.type === 'tool_execution_start') {
+          this.options.onProgress?.({ type: 'tool_start', name: event.toolName, args: event.args });
+        }
+        if (event.type === 'tool_execution_end') {
+          this.options.onProgress?.({ type: 'tool_end', name: event.toolName, result: event.result, isError: event.isError });
+        }
+        if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') {
+          streamedText += event.assistantMessageEvent.delta;
+        }
+        if (event.type === 'message_end' && event.message?.role === 'assistant') {
+          const text = Array.isArray(event.message.content)
+            ? event.message.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('')
+            : '';
+          if (text.trim()) this.options.onProgress?.({ type: 'text', text });
+        }
+      })
+      : undefined;
+    try {
+      await session.prompt(workerPrompt(node, task, capsule));
+      if (!captured) await session.prompt(workerPrompt(node, task, capsule, true));
+      if (!captured) {
+        const messages = (session as any).messages;
+        const lastAssistant = Array.isArray(messages)
+          ? [...messages].reverse().find((message: any) => message.role === 'assistant')
+          : undefined;
+        const response = [
+          streamedText,
+          ...(Array.isArray(lastAssistant?.content)
+            ? lastAssistant.content.filter((item: any) => item.type === 'text').map((item: any) => item.text)
+            : []),
+        ].join('').trim().slice(-1200);
+        throw Error(`worker did not submit artifact${response ? `; last worker response: ${response}` : ''}`);
+      }
+      return captured;
+    } finally {
+      unsubscribe?.();
+    }
   }
 }

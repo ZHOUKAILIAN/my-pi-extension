@@ -1,9 +1,31 @@
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
-import { WorkflowRuntime, bugFixDefinition, bugFixNodes, PiSessionRunStore, InMemoryUserDecisionGate, PiSdkWorkerExecutor, type UserDecisionArtifact, type WorkerExecutor } from '@pi/workflow-runtime';
+import { WorkflowRuntime, bugFixDefinition, bugFixNodes, PiSessionRunStore, InMemoryUserDecisionGate, PiSdkWorkerExecutor, type UserDecisionArtifact, type WorkerExecutor, type WorkerProgress } from '@pi/workflow-runtime';
 import { loadModelPolicy, parseBugFixCommand, resolveModelRef } from './policy.ts';
 
 export default function bugFixExtension(pi: ExtensionAPI) {
   const injected = (pi as ExtensionAPI & { bugFixWorker?: WorkerExecutor }).bugFixWorker;
+
+  const setWorkflowStatus = (ctx: ExtensionCommandContext, text: string, working = true) => {
+    const ui = (ctx as any).ui;
+    ui?.setStatus?.('bugFix', text);
+    ui?.setWorkingMessage?.(text);
+    ui?.setWorkingVisible?.(working);
+  };
+
+  const clearWorkflowWorking = (ctx: ExtensionCommandContext) => {
+    (ctx as any).ui?.setWorkingVisible?.(false);
+  };
+
+  const trace = (content: string, level: 'info' | 'error' = 'info') => {
+    if (typeof (pi as any).sendMessage !== 'function') return;
+    pi.sendMessage({
+      customType: 'bugFix-trace',
+      content: `[bugFix] ${content}`,
+      display: true,
+      details: { level, timestamp: Date.now() },
+    });
+  };
+
 
   const prepareRun = (ctx: ExtensionCommandContext) => {
     // Older harnesses/hosts may not expose trust; retain the historical trusted default.
@@ -21,7 +43,36 @@ export default function bugFixExtension(pi: ExtensionAPI) {
       };
       const resolved = resolveModelRef(configuredRef, (ctx as any).model ?? (injected ? { provider: 'injected', id: 'bugFixWorker' } : undefined), registry);
       const model = injected ? ((ctx as any).model ?? resolved) : resolved;
-      const worker = injected ?? new PiSdkWorkerExecutor({ model, thinkingLevel: resolvedThinkingLevel, skills: policy.nodes[nodeId].skills, cwd: ctx.cwd });
+      const worker = injected ?? new PiSdkWorkerExecutor({
+        model,
+        thinkingLevel: resolvedThinkingLevel,
+        skills: policy.nodes[nodeId].skills,
+        cwd: ctx.cwd,
+        onProgress: (progress: WorkerProgress) => {
+          const summarize = (value: unknown) => {
+            try {
+              const text = JSON.stringify(value);
+              return text.length > 800 ? `${text.slice(0, 800)}...` : text;
+            } catch {
+              return String(value);
+            }
+          };
+          if (progress.type === 'text') {
+            const text = progress.text.trim();
+            if (text) trace(`${nodeId} · 模型输出: ${text.slice(-1600)}`);
+            return;
+          }
+          if (progress.type === 'tool_start') {
+            const detail = `tool start: ${progress.name} ${summarize(progress.args)}`;
+            setWorkflowStatus(ctx, `bugFix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);
+            trace(`${nodeId} · ${detail}`);
+          } else {
+            const detail = `tool end: ${progress.name}${progress.isError ? ' ERROR' : ''} ${summarize(progress.result)}`;
+            setWorkflowStatus(ctx, `bugFix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);
+            trace(`${nodeId} · ${detail}`, progress.isError ? 'error' : 'info');
+          }
+        },
+      });
       const definition = bugFixNodes(worker, { [nodeId]: policy.nodes[nodeId].skills })[nodeId];
       workers[nodeId] = worker;
       definitions[nodeId] = definition;
@@ -40,6 +91,12 @@ export default function bugFixExtension(pi: ExtensionAPI) {
     let blockedInputUsed = false;
     let waitingUsed = false;
     let confirmationPending = confirmationAlreadyGiven;
+    let previousArtifact: any;
+
+    const appendArtifact = (nodeId: string, artifact: any) => {
+      previousArtifact = artifact;
+      trace(`${nodeId} · Artifact submitted: ${JSON.stringify(artifact).slice(0, 1600)}`);
+    };
     while (runtime.stage !== 'ACCEPTED') {
       if (runtime.stage === 'WAITING_FOR_USER') {
         if (waitingUsed || !ctx.hasUI || (!confirmationPending && !(await ctx.ui.confirm('Workflow needs confirmation', 'Investigation requests a design/requirement change. Continue investigating?')))) {
@@ -55,7 +112,18 @@ export default function bugFixExtension(pi: ExtensionAPI) {
       }
       const stage = runtime.stage;
       const nodeId = stage === 'INVESTIGATING' || stage === 'BLOCKED' ? 'investigate' : stage === 'IMPLEMENTING' ? 'implement' : 'verify';
-      let capsule: Record<string, unknown> = {};
+      const audit = prepared.audits.find((entry) => entry.runNode === nodeId);
+      const skills = audit?.skills?.length ? ` · skills: ${audit.skills.join(',')}` : '';
+      const stageMessage = `${stage} · ${audit?.resolved?.provider ?? 'worker'}/${audit?.resolved?.id ?? nodeId}${skills}`;
+      setWorkflowStatus(ctx, `bugFix ${stageMessage}`);
+      trace(stageMessage);
+      let capsule: Record<string, unknown> = previousArtifact ? { previousArtifact } : {};
+      if (stage === 'IMPLEMENTING' && previousArtifact?.kind === 'investigation') {
+        trace(`implement · received investigation evidence (${previousArtifact.evidence?.length ?? 0} items)`);
+      }
+      if (stage === 'VERIFYING' && previousArtifact?.kind === 'implementation') {
+        trace('verify · received implementation Artifact');
+      }
       if (stage === 'BLOCKED') {
         if (blockedInputUsed || !ctx.hasUI) { ctx.ui.notify(`BLOCKED: ${runId}`); return; }
         blockedInputUsed = true;
@@ -63,8 +131,10 @@ export default function bugFixExtension(pi: ExtensionAPI) {
         if (!extra) { ctx.ui.notify(`BLOCKED: ${runId}`); return; }
         capsule = { supplementalInformation: extra };
       }
-      await runtime.runNode(definitions[nodeId], problem, capsule);
+      const artifact = await runtime.runNode(definitions[nodeId], problem, capsule);
+      appendArtifact(nodeId, artifact);
     }
+    clearWorkflowWorking(ctx);
     ctx.ui.notify(`ACCEPTED: ${runId}`);
   };
 
@@ -74,11 +144,18 @@ export default function bugFixExtension(pi: ExtensionAPI) {
     if (!checkpoint || !checkpoint.problem) return;
     if (!ctx.hasUI || !(await ctx.ui.confirm('恢复 bugFix 工作流', `${checkpoint.problem}\n当前阶段：${checkpoint.stage}`))) return;
     try {
+      setWorkflowStatus(ctx, `bugFix ${checkpoint.stage} · resuming worker`);
       const prepared = prepareRun(ctx);
       pi.appendEntry('workflow-command', { operation: 'session-resume', runId: checkpoint.runId, time: Date.now() });
       await continueRun(ctx, store, checkpoint.runId, checkpoint.problem, prepared, checkpoint.stage === 'WAITING_FOR_USER');
     }
-    catch (error) { ctx.ui.notify(`bugFix failed: ${error instanceof Error ? error.message : String(error)}`); }
+    catch (error) {
+      clearWorkflowWorking(ctx);
+      const message = error instanceof Error ? error.message : String(error);
+      setWorkflowStatus(ctx, `bugFix failed · ${message}`, false);
+      trace(`failed · ${message}`, 'error');
+      ctx.ui.notify(`bugFix failed: ${message}`, 'error');
+    }
   };
 
   if (typeof (pi as any).on === 'function') (pi as any).on('session_start', async (event: any, ctx: ExtensionCommandContext) => {
@@ -92,12 +169,20 @@ export default function bugFixExtension(pi: ExtensionAPI) {
       const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data as any));
       const runId = `bugFix-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       try {
+        setWorkflowStatus(ctx, 'bugFix INVESTIGATING · preparing worker');
+        trace('starting · preparing worker');
         const prepared = prepareRun(ctx);
         pi.appendEntry('workflow-command', { operation: 'start', runId, time: Date.now() });
         store.saveCheckpoint({ runId, stage: 'INVESTIGATING', at: Date.now(), id: `${runId}-initial`, problem: parsed.problem });
         await continueRun(ctx, store, runId, parsed.problem!, prepared);
       }
-      catch (error) { ctx.ui.notify(`bugFix failed: ${error instanceof Error ? error.message : String(error)}`); }
+      catch (error) {
+        clearWorkflowWorking(ctx);
+        const message = error instanceof Error ? error.message : String(error);
+        setWorkflowStatus(ctx, `bugFix failed · ${message}`, false);
+        trace(`failed · ${message}`, 'error');
+        ctx.ui.notify(`bugFix failed: ${message}`, 'error');
+      }
     },
   });
 }
