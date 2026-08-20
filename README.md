@@ -1,33 +1,54 @@
 # my-pi-extension
 
-个人工作流 Pi extension 集合。
+个人工作流 Pi extension 集合。项目通过一个 GitHub monorepo 维护，规划包含 `/build`、`/work`、`/bugFix` 三个独立顶层工作流 extension，以及共享的 Workflow Runtime 和 Contracts。
 
-这个仓库不是单个 `delegate_task` extension，而是一组独立的顶层工作流 extension。当前候选是 `/build`、`/work`、`/bugFix`：每个入口各自拥有 command、主 agent -> worker 编排、内部工作流节点和 session 级记忆交接。需求对齐、方案评审、代码 review、验证、skill 路由和 context 隔离首先属于对应顶层 extension 的内部设计，不预先拆成 Pi 子 extension。
+当前已完成 Pi SDK workflow runtime 原型、`/bugFix` command 和项目模型策略接线；尚未完成真实 provider E2E，也尚未实现 `/build` 与 `/work`。
 
-## 文档入口
+## 开始阅读
 
-从 [文档树](docs/document-tree.md) 开始，按两个问题推进：
+1. [五层文档总览](docs/README.md)
+2. [领域术语](docs/01-产品定义/领域术语.md)
+3. [当前实现地图](docs/02-产品实现/README.md)
+4. [bugFix Runtime 技术方案](docs/bugfix-runtime-technical-design.md)
+5. [仓库组织方案](docs/03-项目落地/仓库组织.md)
+6. [GitHub 维护流程](docs/04-仓库治理/GitHub维护流程.md)
 
-1. [仓库组织形式](docs/00-repository-organization/README.md)：这个仓库如何承载多个 Pi extension。
-   - [仓库组织技术方案](docs/00-repository-organization/technical-design.md)
-   - [Extension 颗粒度技术方案](docs/00-repository-organization/extension-granularity.md)
-2. [Extension 集合目录](docs/01-extension-catalog/README.md)：集合里有哪些 extension，以及每个 extension 的职责边界。
+Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
-之后进入 [extensions/](docs/extensions/) 下的单个 extension 设计文档。
+## 当前 Package
 
-## 当前候选 Extension
+| Package | 责任 | 状态 |
+| --- | --- | --- |
+| `@pi/workflow-contracts` | Workflow、阶段级 Artifact 合同、Worker 和 checkpoint 类型契约 | 已实现原型 |
+| `@pi/workflow-runtime` | 状态机、SDK Worker、有限重试、checkpoint 恢复和 trace | 已实现原型 |
+| `@pi/bugfix` | 注册并执行 `/bugFix`，提供 traceId、恢复和 BugFix 报告 | 已实现原型 |
+| `@pi/build` | 注册并执行 `/build` | 尚未实现 |
+| `@pi/work` | 注册并执行 `/work` | 尚未实现 |
 
-- `build`：新需求的完整工作流。
-- `work`：已有功能继续工作、分类和变更。
-- `bugFix`：Bug 调查、根因判断和修复。
-- `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
+## 架构关系
 
-总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）。当前已完成 Pi-native workflow runtime bootstrap、bugFix command 及运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。
+`bugFix` 是基于共享 Runtime 实现的具体业务工作流，不绕开 Runtime：
 
-## 历史资料
+```text
+@pi/bugfix
+  └── @pi/workflow-runtime
+        └── @pi/workflow-contracts
+```
 
-- [历史整体方案选型](docs/architecture-selection.md)
-- [多模型评议记录](docs/reviews/2026-08-18-gpt-5.6-sol-design-review.md)
-- [领域术语](CONTEXT.md)
+- `@pi/workflow-contracts`：定义 Stage、Artifact、Checkpoint、Worker 和阶段级合同校验。
+- `@pi/workflow-runtime`：提供通用 Controller 能力，包括 Worker Session、tools/skills scope、状态迁移、Guard、有限重试、checkpoint、`/resume` 和 trace 审计。
+- `@pi/bugfix`：定义 `/bugFix` 的调查—实现—验证 Node、业务路由、模型策略、用户确认、BugFix Report 和主 Pi UI 接线。
 
-已完成 Pi-native workflow runtime bootstrap、bugFix command 和运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。
+因此，Runtime 是可复用的工作流控制引擎，`bugFix` 是第一个基于它组装的业务 Extension；未来 `/build` 和 `/work` 也应复用 Runtime，但定义各自的 Node、Artifact、Guard 和 Acceptance Criteria。
+
+`/bugFix` 当前支持阶段级 Artifact 强校验、有限 Worker 重试、Pi 原生 `/resume` 恢复，以及带稳定 `traceId` 的主窗口和 session 审计。真实 provider E2E 仍需持续验证。
+
+## 验证
+
+```bash
+npm test
+npm run typecheck
+git diff --check
+```
+
+历史选型和评审证据保存在 [`docs/归档/`](docs/归档/README.md)，但不属于当前执行规则或正式真理源。

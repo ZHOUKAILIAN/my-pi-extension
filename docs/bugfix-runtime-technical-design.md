@@ -48,7 +48,7 @@ attempt 1: 执行当前 Node 任务
 attempt 2: completion-only 纠正指令
 ```
 
-同一 session 仍无合法交付时，Controller 最多创建一个新的独立 Worker session 重跑同一 Node。不会执行无限 prompt loop。
+对 `Connection error`、超时、连接重置、网络错误、`429`、`502/503/504` 等瞬时模型错误，第二次尝试会标记为 `transient_error`，并携带短错误摘要重新请求；认证、配置和合同错误不走瞬时重试。同一 session 仍无合法交付时，Controller 最多创建一个新的独立 Worker session 重跑同一 Node。不会执行无限 prompt loop。
 
 ## 5. 错误分类与恢复
 
