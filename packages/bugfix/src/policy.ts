@@ -20,8 +20,8 @@ export interface ModelPolicy {
 const NODES = ['investigate', 'implement', 'verify'] as const;
 const DEFAULTS: Record<NodeId, NodePolicy> = {
   investigate: { configuredRef: 'smartingredients/gpt-5.6-sol', skills: [], source: 'runtime-default' },
-  implement: { configuredRef: 'inherit', skills: [], source: 'runtime-default' },
-  verify: { configuredRef: 'inherit', skills: [], source: 'runtime-default' },
+  implement: { configuredRef: 'smartingredients/gpt-5.6-terra', skills: ['tdd'], source: 'runtime-default' },
+  verify: { configuredRef: 'smartingredients/gpt-5.6-sol', skills: [], source: 'runtime-default' },
 };
 
 function validRef(value: unknown): value is ModelRef {
