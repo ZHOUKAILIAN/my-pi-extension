@@ -20,6 +20,7 @@ flowchart LR
 
 - Controller/Runtime 拥有状态迁移、Guard、Artifact 校验、checkpoint、恢复、用户确认和最终接受权。
 - 每个 Node 使用独立 Pi SDK `AgentSession`，只拥有该 Node 的 tools 和 skills。
+- 默认 Node 路由为 investigate=`smartingredients/gpt-5.6-sol`、implement=`smartingredients/gpt-5.6-terra`（默认 Skill：`tdd`）、verify=`smartingredients/gpt-5.6-sol`；项目可信策略可以覆盖模型和 Skill，Worker 使用主 Pi Session 传入的 `thinkingLevel`。
 - Worker 不直接访问其他 Worker，也不拥有 `nextStage` 或 `ACCEPTED` 权限。
 
 ## 3. Artifact 合同
@@ -60,6 +61,8 @@ attempt 2: completion-only 纠正指令
 | `MODEL_RESPONSE_TRUNCATED` | assistant response 以 `length` 结束 | 记录模型输出受限，保留 checkpoint |
 
 失败不能直接推进阶段，也不能生成伪造 Artifact。Controller 写入 `workflow-node-failure`，主 UI 显示当前 stage、错误码、traceId 和 `/resume` 恢复动作。恢复使用 Pi 原生 `/resume`，并从最后合法 checkpoint 继续；已持久化的前序 Artifact 会重新注入 Context Capsule。
+
+> TODO：当前人工补充信息在 Worker 提交 `BLOCKED` 后，由 Controller 放入下一次 Worker Session 的 Context Capsule。后续支持在 Worker 仍运行时，经 Controller 将用户补充信息注入目标 Worker，以处理研发实现中的产品澄清、环境/权限确认或外部事实补充；提问、回答、目标 Worker、注入时间和后续 Artifact 必须进入 trace/audit，且不能由外层 Agent 绕过状态机直接推进阶段。
 
 ## 6. Trace 与审计
 
