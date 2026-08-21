@@ -1,18 +1,18 @@
-# Build Extension
+# Build 扩展
 
 - 状态：`TODO`
 - 颗粒度假设：一个完整工作入口对应一个顶层 Pi extension
-- 上游：[Extension 颗粒度](../00-repository-organization/extension-granularity.md)、[Extension 集合目录](../01-extension-catalog/README.md)
+- 上游：[仓库组织方案](../../03-项目落地/仓库组织.md)、[Extension 集合目录](../../03-项目落地/扩展目录.md)
 
 ## 当前边界
 
-`build` 是一个独立的顶层工作流 extension，注册 `/build`，负责新需求从需求对齐到实现、review 和验证的完整闭环。
+`build` 是一个独立的顶层工作流 extension，注册 `/build`，负责承载新建设目标；它可以根据任务需要组织需求、技术方案、实现、review 和验证，但这些活动不是 Build 独有的通用规则，也不预先规定为固定线性流程。
 
 待总体运行时选型确认后，`build` 必须有明确的 Workflow Controller 负责状态迁移：Worker 只返回当前节点的 Artifact，Controller 校验 Artifact、执行 Transition Guard、冻结 Acceptance Criteria，并决定是否启动下一位 Worker、回到实现或进入 `BLOCKED` / `ACCEPTED`。Controller 与 Node 最终采用普通 TypeScript 模块、同 runtime Node Extension，还是独立 runtime Node Extension，以上游选型文档为准。
 
-需求对齐、技术方案、worker 委派、代码 review 和验证目前都是本 extension 内部节点，不预先拆成独立 Pi 子 extension。
+当 Build 产生或变更正式需求方案、技术方案、架构决策或验收标准时，遵守第一层定义的跨入口多 Agent 独立交叉评审规则。具体是否需要某项活动、如何拆分节点以及使用哪些 Skill，由 Build 的 Policy 和项目语境决定。
 
-## 待对齐
+## 待对齐事项
 
 - `/build` 的完整状态机是什么？
 - 哪些节点必须多 agent？

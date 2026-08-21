@@ -6,6 +6,8 @@
 
 ## 2. 运行边界
 
+bugFix 是通用流程骨架。它不内置具体仓库、前端、后端、数据库或第三方平台的调查规则；这些规则由 Node 使用的 Skill、项目知识和项目策略提供。Runtime 只负责把它们作为当前 Run 的输入，执行通用状态控制、Artifact 交接、Acceptance Gate 和审计。
+
 ```mermaid
 flowchart LR
   command[/bugFix 问题描述/] --> controller[bugFix Controller]
@@ -19,6 +21,8 @@ flowchart LR
 ```
 
 - Controller/Runtime 拥有状态迁移、Guard、Artifact 校验、checkpoint、恢复、用户确认和最终接受权。
+- Skill 定义调查、实现或验证的方法、领域标准、影响面和证据要求；不拥有状态推进权或工具权限。
+- 项目知识/策略定义当前仓库的模块关系、调查语境、业务不变量和验证命令；不改变通用 Workflow 状态机。
 - 每个 Node 使用独立 Pi SDK `AgentSession`，只拥有该 Node 的 tools 和 skills。
 - Worker 不直接访问其他 Worker，也不拥有 `nextStage` 或 `ACCEPTED` 权限。
 
@@ -72,6 +76,8 @@ attempt 2: completion-only 纠正指令
 - `workflow-node-failure`
 
 主窗口中的 `bugFix-trace` 显示：阶段、模型、skills、工具 start/end、Artifact attempt、模型 stop reason、错误摘要和 Artifact 接受结果。持久化 trace 只保存可审计摘要，不保存隐藏 reasoning，不复制完整问题文本。
+
+审计不把 Skill 的要求等同于已完成事实。对 Skill 声明的调查范围，审计应区分：Worker 实际检查的文件/工具事实、Artifact 提交的证据、明确未验证的范围，以及 Runtime/Guard 的接受或拒绝决定。这样可以复盘“为什么进入下一阶段”，也可以识别“只查到前段、未查后段”的不完整调查。
 
 ## 7. Acceptance 边界
 

@@ -1,7 +1,7 @@
-# Workflow UI Extension
+# Workflow UI 扩展
 
 - 状态：`TODO`
-- 上游：[仓库组织形式](../00-repository-organization/README.md)、[Extension 集合目录](../01-extension-catalog/README.md)
+- 上游：[仓库组织方案](../../03-项目落地/仓库组织.md)、[Extension 集合目录](../../03-项目落地/扩展目录.md)
 
 ## 1. 目标与边界
 

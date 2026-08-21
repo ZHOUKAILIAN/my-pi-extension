@@ -1,8 +1,8 @@
-# Work Extension
+# Work 扩展
 
 - 状态：`TODO`
 - 颗粒度假设：一个完整工作入口对应一个顶层 Pi extension
-- 上游：[Extension 颗粒度](../00-repository-organization/extension-granularity.md)、[Extension 集合目录](../01-extension-catalog/README.md)
+- 上游：[仓库组织方案](../../03-项目落地/仓库组织.md)、[Extension 集合目录](../../03-项目落地/扩展目录.md)
 
 ## 当前边界
 
