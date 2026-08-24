@@ -15,26 +15,46 @@ Fix 遵循 [Core 产品定义](../领域术语.md)：Fix Extension 拥有 `/fix`
 
 ## Stage 与允许路径
 
-Fix Workflow Definition 应支持以下产品阶段语义；具体状态 ID、Transition 配置和实现属于 L2。
+Fix Workflow Definition 应支持以下产品阶段语义；具体状态 ID、Transition 配置和实现属于 L2。Stage 内的独立 Agent 工作以 Node 表示，不为每个 Review 额外创建 Stage。
 
-```text
-INTAKE → TRIAGE → INVESTIGATION → DISPOSITION
-                                      ├─ 仓库变更
-                                      │    ↓
-                                      │ IMPLEMENTATION → CHANGE_REVIEW ─┐
-                                      ├─ 无仓库变更                     │
-                                      │    └────────────────────────────┤
-                                      ↓                                 ↓
-                                 VERIFICATION → ACCEPTED
-                                      ↓
-                                   BLOCKED
+```mermaid
+flowchart TD
+  intake[INTAKE<br/>确认现象、环境、范围、紧急度]
+  investigation[INVESTIGATION<br/>建立预期 / 实际 / 根因 / 影响证据链]
+  investigationReview[INVESTIGATION_REVIEW<br/>独立 Agent 复核根因和证据链]
+  disposition[DISPOSITION<br/>决定是否以及如何处置]
+  planReview[CHANGE_PLAN_REVIEW<br/>多个 Agent 评估修改方案]
+  implementation[IMPLEMENTATION<br/>实施最小修改并形成候选版本 / PR]
+  changeReview[CHANGE_REVIEW<br/>Review 固定候选版本 / PR diff]
+  verification[VERIFICATION<br/>验证原始现象、根因切断和回归边界]
+  accepted[ACCEPTED]
+  blocked[BLOCKED]
+  wait[等待用户或外部动作]
+
+  intake --> investigation
+  investigation --> investigationReview
+  investigationReview -->|根因和证据充分| disposition
+  investigationReview -->|未查到根因或证据不足| investigation
+  disposition -->|无需仓库变更| verification
+  disposition -->|需要仓库变更| planReview
+  planReview -->|方案通过| implementation
+  planReview -->|方案不足| disposition
+  implementation --> changeReview
+  changeReview -->|通过| verification
+  changeReview -->|需要修改| implementation
+  verification -->|验证通过| accepted
+  verification -->|验证失败且需要继续修改| implementation
+  investigation -.->|证据、权限或外部依赖不足| blocked
+  disposition -.->|需要用户或外部决定| wait
+  verification -.->|缺少验证条件| blocked
 ```
+
+`TRIAGE` 不作为独立 Stage。初步紧急度和范围在 `INTAKE` 记录；可复现性、调查方向和影响面在 `INVESTIGATION` 中形成证据。
 
 | Stage | 产品目的 | 典型 Artifact |
 | --- | --- | --- |
-| `INTAKE` | 记录现象、环境、范围和最小事实 | intake record |
-| `TRIAGE` | 判断紧急度、可复现性和调查方向 | triage artifact |
-| `INVESTIGATION` | 建立预期—实际—原因—影响的证据链 | investigation artifact |
+| `INTAKE` | 记录现象、环境、范围、最小事实和初步紧急度 | intake record |
+| `INVESTIGATION` | 建立预期—实际—原因—影响的证据链，并接受独立复核 | investigation artifact、investigation review |
 | `DISPOSITION` | 决定修复、缓解、解释、外部处置或等待决策 | disposition decision |
 | `IMPLEMENTATION` | 形成绑定基准与候选版本的处置 | implementation artifact |
 | `CHANGE_REVIEW` | 对固定候选版本进行 Review | findings、dispositions |
@@ -42,20 +62,36 @@ INTAKE → TRIAGE → INVESTIGATION → DISPOSITION
 | `BLOCKED` | 缺少必要证据、权限、外部行动或用户决定 | blocker record |
 | `ACCEPTED` | 整体满足 Fix Acceptance Definition | acceptance result |
 
-明确、局部且不改变正式方案的 Fix 可以缩短 Triage 或 Review 工作量，但不能跳过 `DISPOSITION`：
+明确、局部且不改变正式方案的 Fix 可以减少调查、方案评估或 PR Review 的工作量，但不能省略对应 Review 门禁：
 
-```text
-INTAKE → INVESTIGATION → DISPOSITION
-  ├─ 代码/版本化配置变更 → IMPLEMENTATION → CHANGE_REVIEW → VERIFICATION
-  └─ 无仓库变更         → VERIFICATION
-→ ACCEPTED
+```mermaid
+flowchart LR
+  disposition[DISPOSITION] -->|代码 / 版本化配置变更| plan[CHANGE_PLAN_REVIEW]
+  plan --> implementation[IMPLEMENTATION]
+  implementation --> pr[CHANGE_REVIEW]
+  pr --> verification[VERIFICATION]
+  disposition -->|无仓库变更| verification
+  verification --> accepted[ACCEPTED]
 ```
 
-`DISPOSITION` 必须形成结构化决定，说明处置类型、最小范围、风险、验证目标，以及是否触发正式方案评审。
+`DISPOSITION` 必须形成结构化决定，说明处置类型、最小范围、风险、验证目标，以及是否触发 `CHANGE_PLAN_REVIEW`。
 
 无法复现不自动等于 `BLOCKED` 或“无需修改”：如果代码、日志、数据或运行事实足以形成可验证结论，可以继续调查；证据不足以归因时必须记录缺口并收集证据或进入 `BLOCKED`。
 
-如果 Fix 产生或改变正式需求、技术方案、架构决策或验收标准，必须在实现前插入 Proposal、Independent Review 和 Adoption Decision。该规则来自 Core 的跨入口评审，不因 Fix 入口而豁免。
+如果 Fix 产生或改变正式需求、技术方案、架构决策或验收标准，`CHANGE_PLAN_REVIEW` 必须升级为 Core 要求的正式方案流程：
+
+```mermaid
+flowchart LR
+  proposal[Proposal<br/>需求 / 技术方案 / 架构决策 / 验收标准]
+  review[Independent Review<br/>多个不同 Worker]
+  adoption[Adoption Decision<br/>采纳固定版本]
+  proposal --> review
+  review -->|Finding 已关闭| adoption
+  review -->|需要修改| proposal
+  adoption --> implementation[IMPLEMENTATION]
+```
+
+该规则来自 Core 的跨入口评审，不因 Fix 入口而豁免。
 
 ## 处置模型
 
@@ -69,7 +105,7 @@ flowchart LR
   verify --> report[最终处置报告]
 ```
 
-调查产生的 `route` 是内部分类，不是用户入口。每个分类使用相同的 Runtime 控制面（Artifact、Guard、checkpoint、恢复、trace 和审计），但处置和验收标准不同：
+调查产生的 `route` 是内部分类，不是用户入口。只有 `INVESTIGATION_REVIEW` 通过后，`route` 才能作为处置决定的输入。每个分类使用相同的 Runtime 控制面（Artifact、Guard、checkpoint、恢复、trace 和审计），但处置和验收标准不同：
 
 | 分类 | 典型处置 | 不能省略的验收 |
 | --- | --- | --- |
@@ -170,9 +206,37 @@ Controller 根据已校验 Artifact 生成最终报告；不得把 Worker 的自
 
 ## Transition Guard 与 Acceptance Definition
 
+```mermaid
+flowchart TD
+  candidate[调查 Agent：候选根因 + 证据链 + 初步影响面]
+  rootReview[调查 Review Agent：复核根因、证据链、影响面]
+  rootPass{是否查到可行动根因？}
+  gap[记录证据缺口和补查问题]
+  disposition[DISPOSITION]
+  plan[修改前方案评估：多个 Agent]
+  planPass{修改方案是否可接受？}
+  implement[IMPLEMENTATION]
+  prReview[CHANGE_REVIEW：Review PR / candidate revision]
+  verify[VERIFICATION]
+
+  candidate --> rootReview --> rootPass
+  rootPass -->|否| gap --> candidate
+  rootPass -->|是| disposition
+  disposition -->|需要仓库变更| plan --> planPass
+  planPass -->|否| disposition
+  planPass -->|是| implement --> prReview
+  prReview -->|需要修改| implement
+  prReview -->|通过| verify
+```
+
 关键 Guard 至少保证：
 
-- 调查结论带证据、范围和未验证项，证据不足时不能伪装成已确认根因；
+- `INVESTIGATION_REVIEW` 必须确认根因证据链是否闭合、是否已经到达可行动根因或明确外部边界，以及影响面是否足够支持处置；
+- 调查 Reviewer 必须是独立 Worker，不能复核自己产生的调查 Artifact；复核不通过时必须带可执行补查问题并回到 `INVESTIGATION`；
+- 进入 `DISPOSITION` 前必须存在通过的调查复核；
+- 需要仓库变更时，必须先通过 `CHANGE_PLAN_REVIEW`；方案评估至少覆盖根因对应关系、修改范围、风险、兼容性、验证和回滚；
+- 如果修改方案改变正式需求、技术方案、架构决策或验收标准，必须完成 Core 的 Proposal、Independent Review 和 Adoption Decision；
+- `CHANGE_REVIEW` 必须绑定同一个最终 candidate revision / PR diff，且 Reviewer 不能是该候选版本的实现者；
 - 所有路径都经过 `DISPOSITION`，并明确处置类型、最小范围、风险以及是否触发正式方案评审；
 - 只有实际产生仓库候选变更时，Implementation、Change Review 和 Verification 才必须绑定同一个最终候选版本；
 - 无仓库变更的解释、数据、环境或外部处置可以从 `DISPOSITION` 进入 Verification，但必须绑定基准版本、处置对象/环境版本和验证证据；
@@ -180,7 +244,7 @@ Controller 根据已校验 Artifact 生成最终报告；不得把 Worker 的自
 - 原始现象、已识别影响面和关键不变量没有验证证据时不得标记为 `已解决`；
 - 外部依赖、权限或用户决定缺失时进入等待或 `BLOCKED`，不能把阻塞当作通过。
 
-进入 `ACCEPTED` 前，Acceptance Definition 必须综合检查问题确认、最深可行动根因或明确外部边界、影响面、最终处置、适用的候选/处置对象版本、Review Finding、原始现象验证、回归/兼容性验证、未验证项、剩余风险和必要用户决定。只有实际产生候选变更时才强制 Change Review。Run 处置报告是这些已接受 Artifact 的投影，不是 Worker 自由文本的替代验收。
+进入 `ACCEPTED` 前，Acceptance Definition 必须综合检查问题确认、调查复核、最深可行动根因或明确外部边界、影响面、最终处置、适用的方案评估、候选/处置对象版本、Review Finding、原始现象验证、回归/兼容性验证、未验证项、剩余风险和必要用户决定。只有实际产生候选变更时才强制 `CHANGE_PLAN_REVIEW` 和 `CHANGE_REVIEW`。Run 处置报告是这些已接受 Artifact 的投影，不是 Worker 自由文本的替代验收。
 
 报告可以在等待或 `BLOCKED` 时生成阶段性版本，但不能称为 Acceptance Result。状态映射如下：
 

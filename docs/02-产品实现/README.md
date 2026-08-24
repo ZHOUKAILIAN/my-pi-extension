@@ -9,6 +9,7 @@
 | Workflow / Node / Run 通用对象 | `packages/workflow-contracts/src/` |
 | 状态迁移、Guard、Worker 生命周期、checkpoint 与恢复 | `packages/workflow-runtime/src/` |
 | Fix 的命令、Policy、报告和 Pi UI 接线 | `packages/fix/src/` |
+| Fix 的调查复核、Disposition、Change Plan Review、Change Review 和 Acceptance Definition | `packages/fix/src/`（目标；当前尚未完整实现） |
 | Fix 的可执行 Node/状态图与业务 Guard | `packages/workflow-runtime/src/index.ts`（待迁回 Fix package） |
 | Artifact 合同与运行行为证据 | 对应 `packages/*/test/` |
 | 当前 Fix 实现机制说明 | [Fix Runtime 技术设计](fix-runtime-technical-design.md) |
@@ -30,7 +31,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 
 - Runtime 通过 Pi SDK 创建独立 `AgentSession` 承载 Worker Session；这隔离对话历史，但不等同于进程、文件系统或 OS sandbox。
 - Controller 拥有状态迁移、Artifact 合同校验、有限重试、checkpoint 恢复和 `traceId` 审计；Worker 不能授权下一状态。
-- 当前实现使用 `investigate`、`implement`、`verify` 三类 Node 和对应 Artifact 合同。
+- 当前实现使用 `investigate`、`implement`、`verify` 三类 Node 和对应 Artifact 合同；独立的 `investigation_review` 尚未实现。
 - SDK custom tool 与严格 fenced JSON fallback 都经过同一 Artifact 校验入口。
 - 单个 Worker Session 最多两次交付尝试；失败后 Controller 最多创建一个新 Session 重跑当前 Node，仍失败则保留 checkpoint 并提示 `/resume`。
 - 项目可以按 Node 配置模型和 Skill；Skill 不扩大工具 allowlist。
@@ -42,7 +43,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 
 | L1 目标契约 | L2 当前事实 | 处理方向 |
 | --- | --- | --- |
-| Fix 支持 triage、disposition、change review、正式方案评审和整体 Acceptance | 当前主要是 investigate → implement → verify | 扩展可执行 Workflow Definition 与合同 |
+| Fix 支持调查复核、disposition、change plan review、change review、正式方案评审和整体 Acceptance | 当前主要是 investigate → implement → verify；三个独立 Review Node 均尚未实现 | 扩展可执行 Workflow Definition、Review Artifact 合同、独立 Worker 身份约束与 revision-bound Guard |
 | Fix Extension 应拥有自己的可执行 Workflow Definition | 当前 `fixDefinition`、`fixNodes` 和业务 Guard 位于共享 `workflow-runtime` | 将入口特有 Definition 迁入 `packages/fix`，Runtime 只保留通用执行机制 |
 | Artifact / Node Execution 应具有完整来源、身份和版本绑定 | 当前 contracts 尚无完整 `nodeExecutionId`、`workerId`、proposal/revision provenance | 扩充 contracts、schema 与审计字段 |
 | 恢复应校验 Workflow、Policy 与 schema 版本兼容性 | 当前恢复主要校验已知 Stage | 增加版本 digest、兼容性 Guard 与迁移测试 |
