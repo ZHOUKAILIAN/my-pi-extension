@@ -119,7 +119,7 @@ test('PiSdk adapter accepts only a validated structured-text artifact when the m
     createSession: async () => ({
       session: {
         prompt: async () => { prompts += 1; },
-        messages: [{ role: 'assistant', content: [{ type: 'text', text: '```bugfix-artifact\n{"kind":"investigation","route":"local_fix","rootCause":"cause","evidence":["trace"]}\n```' }] }],
+        messages: [{ role: 'assistant', content: [{ type: 'text', text: '```fix-artifact\n{"kind":"investigation","route":"local_fix","rootCause":"cause","evidence":["trace"]}\n```' }] }],
       },
     }) as any,
   });

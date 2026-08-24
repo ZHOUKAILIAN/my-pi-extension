@@ -1,33 +1,50 @@
 # my-pi-extension
 
-个人工作流 Pi extension 集合。
+个人工作流 Pi extension 集合。目标产品提供 `/feature` 与 `/fix` 两个独立入口，以及共享的 Workflow Runtime 和 Contracts。当前已实现 `/fix` 原型；`/feature` 尚未实现。
 
-这个仓库不是单个 `delegate_task` extension，而是一组独立的顶层工作流 extension。当前候选是 `/build`、`/work`、`/bugFix`：每个入口各自拥有 command、主 agent -> worker 编排、内部工作流节点和 session 级记忆交接。需求对齐、方案评审、代码 review、验证、skill 路由和 context 隔离首先属于对应顶层 extension 的内部设计，不预先拆成 Pi 子 extension。
+## 开始阅读
 
-## 文档入口
+1. [五层文档总览](docs/README.md)
+2. [L1 产品上下文摘要](docs/01-产品定义/产品上下文摘要.md)
+3. [L1 权威产品定义](docs/01-产品定义/领域术语.md)
+4. [Feature 产品规范](docs/01-产品定义/扩展/feature-扩展.md) / [Fix 产品规范](docs/01-产品定义/扩展/fix-扩展.md)
+5. [L2 当前实现与 drift](docs/02-产品实现/README.md)
+6. [L2 Runtime 实现架构](docs/02-产品实现/runtime-实现架构.md)
+7. [L3 仓库组织](docs/03-项目落地/仓库组织.md)
 
-从 [文档树](docs/document-tree.md) 开始，按两个问题推进：
+Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
-1. [仓库组织形式](docs/00-repository-organization/README.md)：这个仓库如何承载多个 Pi extension。
-   - [仓库组织技术方案](docs/00-repository-organization/technical-design.md)
-   - [Extension 颗粒度技术方案](docs/00-repository-organization/extension-granularity.md)
-2. [Extension 集合目录](docs/01-extension-catalog/README.md)：集合里有哪些 extension，以及每个 extension 的职责边界。
+## 产品目标与当前实现
 
-之后进入 [extensions/](docs/extensions/) 下的单个 extension 设计文档。
+| 范围 | 产品目标（L1） | 当前事实（L2/L3） |
+| --- | --- | --- |
+| Feature | `/feature`，独立 `@pi/feature` package | 尚未实现 |
+| Fix | `/fix` | `/fix`、`@pi/fix`、`packages/fix` 已实现原型 |
+| Runtime | 执行可审计的 Policy、Artifact、Guard 与 Acceptance | Pi SDK Runtime 原型已实现，完整治理合同尚未完成 |
+| Provider 验证 | 真实环境可验证 | 真实 provider E2E 尚未完成 |
 
-## 当前候选 Extension
+完整功能差异见 [L2 已知 L1/L2 Drift](docs/02-产品实现/README.md#已知-l1--l2-drift)。目标契约不能被当作已实现行为。
 
-- `build`：新需求的完整工作流。
-- `work`：已有功能继续工作、分类和变更。
-- `bugFix`：Bug 调查、根因判断和修复。
-- `workflow-ui`：可选的状态、artifact、finding 和阻塞展示。
+## 当前 Package
 
-总体架构已确定为：每个顶层工作流 extension 一个 Pi package（P2）。当前已完成 Pi-native workflow runtime bootstrap、bugFix command 及运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。
+```text
+@pi/fix
+  └── @pi/workflow-runtime
+        └── @pi/workflow-contracts
+```
 
-## 历史资料
+- `@pi/workflow-contracts`：当前 Stage、Artifact、Checkpoint、Worker 和提交接口。
+- `@pi/workflow-runtime`：当前状态机、Fix Definition、Worker Session、Guard、有限重试、checkpoint 和恢复。
+- `@pi/fix`：当前 `/fix` 的策略、报告、trace 和主 Pi UI 接线。
 
-- [历史整体方案选型](docs/architecture-selection.md)
-- [多模型评议记录](docs/reviews/2026-08-18-gpt-5.6-sol-design-review.md)
-- [领域术语](CONTEXT.md)
+产品目标上，Feature/Fix package 各自拥有自己的可执行 Workflow Definition；共享 Runtime 不拥有入口特有流程。
 
-已完成 Pi-native workflow runtime bootstrap、bugFix command 和运行模型策略接线；尚未接入真实 provider E2E 与 build/work 业务流程。
+## 验证
+
+```bash
+npm test
+npm run typecheck
+git diff --check
+```
+
+历史选型和评审证据保存在 [docs/归档](docs/归档/README.md)，但不属于当前执行规则或正式真理源。

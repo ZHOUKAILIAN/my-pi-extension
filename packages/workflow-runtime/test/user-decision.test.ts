@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { WorkflowRuntime, bugFixDefinition, InMemoryUserDecisionGate } from '../src/index.ts';
+import { WorkflowRuntime, fixDefinition, InMemoryUserDecisionGate } from '../src/index.ts';
 
 test('requirement/design investigation waits, checkpoints, and resumes only with decision', async () => {
   const checkpoints: any[] = []; const gate = new InMemoryUserDecisionGate();
-  const r = new WorkflowRuntime(bugFixDefinition, { saveCheckpoint: c => checkpoints.push(c), loadLast: () => checkpoints.at(-1) }, 'r', () => 1, () => 'c');
+  const r = new WorkflowRuntime(fixDefinition, { saveCheckpoint: c => checkpoints.push(c), loadLast: () => checkpoints.at(-1) }, 'r', () => 1, () => 'c');
   r.setDecisionGate(gate);
   await r.runNode({ id: 'investigate', worker: { execute: async () => ({ kind: 'investigation', route: 'design_change', rootCause: 'cause', evidence: ['x'] }) } }, {});
   assert.equal(r.stage, 'WAITING_FOR_USER'); assert.equal(checkpoints.at(-1).stage, 'WAITING_FOR_USER');
