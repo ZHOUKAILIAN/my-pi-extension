@@ -83,9 +83,9 @@ export function loadModelPolicy(path: string): ModelPolicy {
   return { version: 1, defaultRef, nodes, path };
 }
 
-export function parseBugFixCommand(args: string): { valid: boolean; problem?: string; usage?: string } {
+export function parseFixCommand(args: string): { valid: boolean; problem?: string; usage?: string } {
   const text = args.trim();
-  const usage = 'usage: /bugFix <问题描述>';
+  const usage = 'usage: /fix <问题描述>';
   if (!text || /^(?:start|resume|decision)(?:\s|$)/.test(text)) return { valid: false, usage };
   return { valid: true, problem: text };
 }

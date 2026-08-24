@@ -66,7 +66,7 @@ function isTransientModelError(error: unknown): boolean {
 }
 
 function extractStructuredArtifact(text: string): unknown | undefined {
-  const matches = [...text.matchAll(/```bugfix-artifact\s*\n([\s\S]*?)\n```/g)];
+  const matches = [...text.matchAll(/```fix-artifact\s*\n([\s\S]*?)\n```/g)];
   if (matches.length !== 1) return undefined;
   try {
     return JSON.parse(matches[0][1]);
@@ -84,7 +84,7 @@ function workerPrompt(node: NodeDefinition, task: unknown, capsule: Capsule, ret
     submissionContract(node.id),
     'Do the investigation or implementation using the enabled tools. A text response is not a completion.',
     'Before ending, call submit_artifact exactly once with the final structured result, then stop.',
-    'If submit_artifact is unavailable, the only accepted text fallback is exactly one fenced block: ```bugfix-artifact followed by one JSON object satisfying the same contract, then ```.',
+    'If submit_artifact is unavailable, the only accepted text fallback is exactly one fenced block: ```fix-artifact followed by one JSON object satisfying the same contract, then ```.',
     `TASK:\n${String(task)}`,
     `CAPSULE:\n${JSON.stringify(capsule)}`,
     retryInstruction,
@@ -261,7 +261,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           ? undefined
           : rejection
             ? `Your submitted artifact was rejected: ${rejection.code}: ${rejection.message}. Submit a corrected artifact that satisfies the contract.`
-            : 'Your previous response did not call submit_artifact or provide the exact bugfix-artifact JSON fallback.';
+            : 'Your previous response did not call submit_artifact or provide the exact fix-artifact JSON fallback.';
         try {
           await session.prompt(workerPrompt(node, task, capsule, transientError
             ? `The previous model request failed transiently (${transientError}). Retry the same task now and submit the required artifact.`

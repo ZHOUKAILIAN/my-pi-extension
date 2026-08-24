@@ -13,12 +13,12 @@ function commandHarness(options: { answers?: any[]; cwd?: string; model?: any; r
   let inputCalls = 0;
   const answers = options.answers ?? [];
   const pi: any = {
-    bugFixWorker: { execute: async () => answers[calls++] },
+    fixWorker: { execute: async () => answers[calls++] },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
     registerCommand: (_name: string, value: any) => { command = value.handler; },
   };
   const ctx: any = {
-    cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')),
+    cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'fix-test-cwd-')),
     model: options.model,
     modelRegistry: options.registry,
     thinkingLevel: 'high',
@@ -50,7 +50,7 @@ test('each identical problem starts a distinct run', async () => {
 });
 
 test('a policy failure writes no command, checkpoint, audit, or worker output', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'bugfix-command-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'fix-command-'));
   mkdirSync(join(cwd, '.pi'));
   writeFileSync(join(cwd, '.pi', 'workflow-models.json'), '{');
   const h = commandHarness({ cwd, answers: acceptedAnswers() });
@@ -60,7 +60,7 @@ test('a policy failure writes no command, checkpoint, audit, or worker output', 
 });
 
 test('a missing configured model writes no command, checkpoint, audit, or worker output', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'bugfix-command-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'fix-command-'));
   mkdirSync(join(cwd, '.pi'));
   writeFileSync(join(cwd, '.pi', 'workflow-models.json'), JSON.stringify({ version: 1, default: 'missing/model' }));
   const h = commandHarness({ cwd, answers: acceptedAnswers(), registry: { find: () => undefined } });

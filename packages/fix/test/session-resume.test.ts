@@ -16,16 +16,16 @@ function harness(entries: any[], confirm = true, options: { cwd?: string; truste
   ];
   const pi: any = {
     on: (_event: string, handler: any) => { onStart = handler; },
-    bugFixWorker: { execute: async () => results[calls++] },
+    fixWorker: { execute: async () => results[calls++] },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
     registerCommand: () => {},
   };
-  const ctx: any = { cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), hasUI: true, thinkingLevel: 'high', isProjectTrusted: () => options.trusted ?? true,
+  const ctx: any = { cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'fix-test-cwd-')), hasUI: true, thinkingLevel: 'high', isProjectTrusted: () => options.trusted ?? true,
     sessionManager: { getEntries: () => entries }, ui: { confirm: async () => { confirmCalls += 1; return confirm; }, notify: () => {} } };
   extension(pi);
   return { start: (reason: string) => onStart({ reason }, ctx), calls: () => calls, confirmCalls: () => confirmCalls };
 }
-const cp = (stage: any, runId = 'bugFix-r', problem = '登录后白屏') => ({ customType: 'workflow-run', data: { runId, stage, problem, id: stage, at: 1 } });
+const cp = (stage: any, runId = 'fix-r', problem = '登录后白屏') => ({ customType: 'workflow-run', data: { runId, stage, problem, id: stage, at: 1 } });
 
 test('only Pi session resume can continue an unfinished workflow', async () => {
   const h = harness([cp('BLOCKED')]);
@@ -62,7 +62,7 @@ test('resuming a waiting workflow uses the session confirmation as its decision'
 });
 
 test('untrusted project ignores its model policy during session resume', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'bugfix-untrusted-'));
+  const cwd = mkdtempSync(join(tmpdir(), 'fix-untrusted-'));
   mkdirSync(join(cwd, '.pi'));
   writeFileSync(join(cwd, '.pi', 'workflow-models.json'), JSON.stringify({ version: 1, default: 'inherit' }));
   const entries = [cp('INVESTIGATING')];

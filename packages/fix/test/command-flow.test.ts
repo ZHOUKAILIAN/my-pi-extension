@@ -18,13 +18,13 @@ test('command handler runs injected worker through all stages and checkpoints', 
   let command: any;
   const traces: any[] = [];
   const pi: any = {
-    bugFixWorker: worker,
+    fixWorker: worker,
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     registerMessageRenderer() {},
     sendMessage: (message: any) => traces.push(message),
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
   };
-  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
+  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'fix-test-cwd-')), sessionManager: { getEntries: () => entries }, ui: { notify() {} } };
   extension(pi);
   await command('登录后白屏', ctx);
   assert.equal(calls, 3);
@@ -42,11 +42,11 @@ test('command handler runs injected worker through all stages and checkpoints', 
   ];
   let retryCalls = 0;
   const retryPi: any = {
-    bugFixWorker: { execute: async () => retryAnswers[retryCalls++] },
+    fixWorker: { execute: async () => retryAnswers[retryCalls++] },
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     appendEntry: (customType: string, data: any) => retryEntries.push({ customType, data }),
   };
-  const retryCtx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => retryEntries }, ui: { notify() {} } };
+  const retryCtx: any = { cwd: mkdtempSync(join(tmpdir(), 'fix-test-cwd-')), sessionManager: { getEntries: () => retryEntries }, ui: { notify() {} } };
   extension(retryPi);
   await command('登录后白屏', retryCtx);
   assert.equal(retryCalls, 5);

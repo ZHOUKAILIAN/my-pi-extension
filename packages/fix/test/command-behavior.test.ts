@@ -13,11 +13,11 @@ function harness(answers: Artifact[], initial: any[] = [], input?: string) {
   const capsules: any[] = [];
   const notifications: string[] = [];
   const pi: any = {
-    bugFixWorker: { execute: async (_node: any, _task: any, capsule: any) => { capsules.push(capsule); return answers[calls++]; } },
+    fixWorker: { execute: async (_node: any, _task: any, capsule: any) => { capsules.push(capsule); return answers[calls++]; } },
     registerCommand: (_name: string, value: any) => { command = value.handler; },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
   };
-  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'bugfix-test-cwd-')), sessionManager: { getEntries: () => entries }, hasUI: true,
+  const ctx: any = { cwd: mkdtempSync(join(tmpdir(), 'fix-test-cwd-')), sessionManager: { getEntries: () => entries }, hasUI: true,
     ui: { notify: (v: string) => notifications.push(v), input: async () => input } };
   extension(pi);
   return { command, ctx, entries, notifications, capsules, calls: () => calls };

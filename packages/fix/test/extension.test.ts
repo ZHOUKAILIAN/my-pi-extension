@@ -18,10 +18,10 @@ test('registers and executes through the Pi extension loader', async () => {
   const { loadExtensions, createExtensionRuntime } = await import(loaderUrl.href);
   const runtime = createExtensionRuntime();
   const loaded = await loadExtensions([resolve(dirname(fileURLToPath(import.meta.url)), '../src/extension.ts')], process.cwd(), undefined, runtime);
-  const command = loaded.extensions[0].commands.get('bugFix');
-  assert.equal(command?.name, 'bugFix');
+  const command = loaded.extensions[0].commands.get('fix');
+  assert.equal(command?.name, 'fix');
   assert.equal(typeof command?.handler, 'function');
   // The loader supplies the real ExtensionAPI object; its unbound action stub is
   // intentionally not used here. CLI smoke below binds it to a real session.
-  assert.equal(typeof loaded.extensions[0].commands.get('bugFix')?.handler, 'function');
+  assert.equal(typeof loaded.extensions[0].commands.get('fix')?.handler, 'function');
 });

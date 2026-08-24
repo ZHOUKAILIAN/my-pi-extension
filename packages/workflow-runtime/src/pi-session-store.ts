@@ -16,11 +16,11 @@ export class PiSessionRunStore implements RunStore {
   loadLast(runId: string) {
     return this.sessionManager.getEntries().map(e => this.parseCheckpoint(e)).filter((c): c is Checkpoint => !!c && c.runId === runId).at(-1);
   }
-  latestUncompleted(prefix = 'bugFix-') {
+  latestUncompleted(prefixes: readonly string[] = ['fix-', 'bugFix-']) {
     const lastByRun = new Map<string, { checkpoint: Checkpoint; position: number }>();
     this.sessionManager.getEntries().forEach((entry, position) => {
       const c = this.parseCheckpoint(entry);
-      if (c?.runId.startsWith(prefix)) lastByRun.set(c.runId, { checkpoint: c, position });
+      if (c && prefixes.some((prefix) => c.runId.startsWith(prefix))) lastByRun.set(c.runId, { checkpoint: c, position });
     });
     return [...lastByRun.values()].filter(x => x.checkpoint.stage !== 'ACCEPTED').sort((a, b) => a.position - b.position).at(-1)?.checkpoint;
   }

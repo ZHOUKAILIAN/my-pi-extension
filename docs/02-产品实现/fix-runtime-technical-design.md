@@ -1,16 +1,22 @@
-# bugFix Runtime 技术方案
+# Fix Runtime 技术设计（当前 L2 实现）
+
+- 层级：第二层（L2）
+- 状态：当前实现说明
+- 上游：[Fix Extension 产品规范](../01-产品定义/扩展/fix-扩展.md)
+
+> 本文记录现有 `@pi/fix` / `/fix` 原型怎样运行，不定义目标产品语义。尚未实现的完整 Fix 治理要求见[第二层实现地图](README.md#已知-l1--l2-drift)。
 
 ## 1. 目的
 
-为 `/bugFix <问题描述>` 提供可恢复、可审计、由 Runtime 控制的调查—实现—验证流程。模型只负责当前 Node 的工作，不能通过自然语言、自报完成或指定下一状态绕过 Controller。
+为 `/fix <问题描述>` 提供可恢复、可审计、由 Runtime 控制的调查—实现—验证流程。模型只负责当前 Node 的工作，不能通过自然语言、自报完成或指定下一状态绕过 Controller。
 
 ## 2. 运行边界
 
-bugFix 是通用流程骨架。它不内置具体仓库、前端、后端、数据库或第三方平台的调查规则；这些规则由 Node 使用的 Skill、项目知识和项目策略提供。Runtime 只负责把它们作为当前 Run 的输入，执行通用状态控制、Artifact 交接、Acceptance Gate 和审计。
+当前 `fix` package 与共享 Runtime 共同实现调查—实现—验证的流程原型。它不内置具体仓库、前端、后端、数据库或第三方平台的调查规则；这些规则由 Node 使用的 Skill、Project Knowledge 和项目策略提供。Runtime 负责执行当前状态控制、Artifact 交接、Acceptance Gate 和审计。
 
 ```mermaid
 flowchart LR
-  command[/bugFix 问题描述/] --> controller[bugFix Controller]
+  command[/fix 问题描述/] --> controller[fix Controller]
   controller --> investigate[Investigate Worker]
   investigate -->|validated investigation Artifact| implement[Implement Worker]
   implement -->|validated implementation Artifact| verify[Verify Worker]
@@ -41,7 +47,7 @@ flowchart LR
 Pi SDK 当前没有向 `createAgentSession()` 暴露强制 `tool_choice` 接口，因此不能把模型是否选择 `submit_artifact` 当成可靠控制边界。交付协议采用两条受控路径：
 
 1. 优先调用 `submit_artifact`；
-2. 没有工具调用时，仅接受唯一的 `bugfix-artifact` fenced JSON，并使用同一份合同校验。
+2. 没有工具调用时，仅接受唯一的 `fix-artifact` fenced JSON，并使用同一份合同校验。
 
 自然语言、普通 Markdown、多个 JSON block、非法 JSON 或缺字段 JSON 都不能推进状态。
 
@@ -75,7 +81,7 @@ attempt 2: completion-only 纠正指令
 - `workflow-trace`
 - `workflow-node-failure`
 
-主窗口中的 `bugFix-trace` 显示：阶段、模型、skills、工具 start/end、Artifact attempt、模型 stop reason、错误摘要和 Artifact 接受结果。持久化 trace 只保存可审计摘要，不保存隐藏 reasoning，不复制完整问题文本。
+主窗口中的 `fix-trace` 显示：阶段、模型、skills、工具 start/end、Artifact attempt、模型 stop reason、错误摘要和 Artifact 接受结果。持久化 trace 只保存可审计摘要，不保存隐藏 reasoning，不复制完整问题文本。
 
 审计不把 Skill 的要求等同于已完成事实。对 Skill 声明的调查范围，审计应区分：Worker 实际检查的文件/工具事实、Artifact 提交的证据、明确未验证的范围，以及 Runtime/Guard 的接受或拒绝决定。这样可以复盘“为什么进入下一阶段”，也可以识别“只查到前段、未查后段”的不完整调查。
 

@@ -29,27 +29,33 @@ function runCheckpoint(runId: string, stage: string, position: number) {
 }
 
 test('latestUncompleted excludes a run whose final checkpoint is ACCEPTED', () => {
-  const entries = [runCheckpoint('bugFix-a', 'INVESTIGATING', 1), runCheckpoint('bugFix-a', 'ACCEPTED', 2)];
+  const entries = [runCheckpoint('fix-a', 'INVESTIGATING', 1), runCheckpoint('fix-a', 'ACCEPTED', 2)];
   const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
   assert.equal(store.latestUncompleted(), undefined);
 });
 
+test('latestUncompleted can resume a legacy run after the Fix rename', () => {
+  const entries = [runCheckpoint('bugFix-legacy', 'IMPLEMENTING', 1)];
+  const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
+  assert.equal(store.latestUncompleted()?.runId, 'bugFix-legacy');
+});
+
 test('latestUncompleted selects the unfinished run by final checkpoint position', () => {
   const entries = [
-    runCheckpoint('bugFix-a', 'BLOCKED', 1),
-    runCheckpoint('bugFix-b', 'ACCEPTED', 2),
-    runCheckpoint('bugFix-a', 'VERIFYING', 3),
+    runCheckpoint('fix-a', 'BLOCKED', 1),
+    runCheckpoint('fix-b', 'ACCEPTED', 2),
+    runCheckpoint('fix-a', 'VERIFYING', 3),
   ];
   const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
-  assert.equal(store.latestUncompleted()?.runId, 'bugFix-a');
+  assert.equal(store.latestUncompleted()?.runId, 'fix-a');
 });
 
 test('latestUncompleted selects the later unfinished run when entries are interleaved', () => {
   const entries = [
-    runCheckpoint('bugFix-a', 'BLOCKED', 1),
-    runCheckpoint('bugFix-b', 'IMPLEMENTING', 2),
-    runCheckpoint('bugFix-a', 'INVESTIGATING', 3),
+    runCheckpoint('fix-a', 'BLOCKED', 1),
+    runCheckpoint('fix-b', 'IMPLEMENTING', 2),
+    runCheckpoint('fix-a', 'INVESTIGATING', 3),
   ];
   const store = new PiSessionRunStore({ getEntries: () => entries }, () => {});
-  assert.equal(store.latestUncompleted()?.runId, 'bugFix-a');
+  assert.equal(store.latestUncompleted()?.runId, 'fix-a');
 });

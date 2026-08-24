@@ -13,15 +13,15 @@ export * from '@pi/workflow-contracts';
 export * from './pi-session-store.ts';
 export * from './pi-sdk-worker.ts';
 
-export const bugFixNodes = (worker: WorkerExecutor, skills: Partial<Record<'investigate' | 'implement' | 'verify', string[]>> = {}): Record<string, NodeDefinition> => ({
+export const fixNodes = (worker: WorkerExecutor, skills: Partial<Record<'investigate' | 'implement' | 'verify', string[]>> = {}): Record<string, NodeDefinition> => ({
   investigate: { id: 'investigate', worker, profile: { tools: ['read', 'submit_artifact'], skills: skills.investigate ?? [] } },
   implement: { id: 'implement', worker, profile: { tools: ['read', 'edit', 'write', 'submit_artifact'], skills: skills.implement ?? [] } },
   verify: { id: 'verify', worker, profile: { tools: ['read', 'submit_artifact'], skills: skills.verify ?? [] } },
 });
 
-export const bugFixDefinition: WorkflowDefinition = {
+export const fixDefinition: WorkflowDefinition = {
   nodes: {},
-  id: 'bugFix',
+  id: 'fix',
   initialStage: 'INVESTIGATING',
   guard(from, to, artifact) {
     const allowed: Record<Stage, Stage[]> = {

@@ -3,14 +3,14 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parseBugFixCommand, loadModelPolicy, resolveModelRef } from '../src/policy.ts';
+import { parseFixCommand, loadModelPolicy, resolveModelRef } from '../src/policy.ts';
 
-const usage = 'usage: /bugFix <问题描述>';
+const usage = 'usage: /fix <问题描述>';
 
 test('public parser exposes only a problem description', () => {
-  assert.deepEqual(parseBugFixCommand('登录后白屏'), { valid: true, problem: '登录后白屏' });
+  assert.deepEqual(parseFixCommand('登录后白屏'), { valid: true, problem: '登录后白屏' });
   for (const command of ['start 登录后白屏', 'resume', 'decision runId=x'])
-    assert.deepEqual(parseBugFixCommand(command), { valid: false, usage });
+    assert.deepEqual(parseFixCommand(command), { valid: false, usage });
 });
 
 test('policy defaults use the high-capability Sol/Terra/Sol model split', () => {
@@ -41,7 +41,7 @@ test('fixed node defaults resolve without ctx.model, while inherit does not', ()
 });
 
 test('policy keeps legacy string node references compatible', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'bugfix-policy-'));
+  const dir = mkdtempSync(join(tmpdir(), 'fix-policy-'));
   const path = join(dir, 'models.json');
   writeFileSync(path, JSON.stringify({ version: 1, nodes: { investigate: 'p/legacy' } }));
   const policy = loadModelPolicy(path);
@@ -50,7 +50,7 @@ test('policy keeps legacy string node references compatible', () => {
 });
 
 test('policy accepts object node overrides with node-scoped skills', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'bugfix-policy-'));
+  const dir = mkdtempSync(join(tmpdir(), 'fix-policy-'));
   const path = join(dir, 'models.json');
   writeFileSync(path, JSON.stringify({
     version: 1,
@@ -66,7 +66,7 @@ test('policy accepts object node overrides with node-scoped skills', () => {
 });
 
 test('policy rejects bad JSON, schema, and model refs', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'bugfix-policy-'));
+  const dir = mkdtempSync(join(tmpdir(), 'fix-policy-'));
   const check = (value: string, message: string) => {
     const path = join(dir, `${Math.random()}.json`); writeFileSync(path, value);
     assert.throws(() => loadModelPolicy(path), new RegExp(message));
@@ -83,4 +83,4 @@ test('policy rejects bad JSON, schema, and model refs', () => {
 });
 
 // Keep the public parser contract explicit for callers that previously used operation fields.
-assert.equal(typeof parseBugFixCommand, 'function');
+assert.equal(typeof parseFixCommand, 'function');
