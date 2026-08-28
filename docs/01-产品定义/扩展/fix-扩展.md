@@ -27,9 +27,10 @@ flowchart TD
   implementation[IMPLEMENTATION<br/>实施最小修改并形成候选版本 / PR]
   changeReview[CHANGE_REVIEW<br/>Review 固定候选版本 / PR diff]
   verification[VERIFICATION<br/>验证原始现象、根因切断和回归边界]
+  human[WAITING_FOR_USER<br/>人工最终验收]
   accepted[ACCEPTED]
   blocked[BLOCKED]
-  wait[等待用户或外部动作]
+  wait[WAITING_FOR_USER<br/>用户决定或外部动作]
 
   intake --> investigation
   investigation --> investigationReview
@@ -42,8 +43,10 @@ flowchart TD
   implementation --> changeReview
   changeReview -->|通过| verification
   changeReview -->|需要修改| implementation
-  verification -->|验证通过| accepted
-  verification -->|验证失败且需要继续修改| implementation
+  verification -->|自动验证通过| human
+  human -->|approve| accepted
+  human -->|request-changes| implementation
+  human -->|reject| blocked
   investigation -.->|证据、权限或外部依赖不足| blocked
   disposition -.->|需要用户或外部决定| wait
   verification -.->|缺少验证条件| blocked
@@ -59,6 +62,7 @@ flowchart TD
 | `IMPLEMENTATION` | 形成绑定基准与候选版本的处置 | implementation artifact |
 | `CHANGE_REVIEW` | 对固定候选版本进行 Review | findings、dispositions |
 | `VERIFICATION` | 验证原始现象、根因切断和回归边界 | verification artifact |
+| `WAITING_FOR_USER` | 请求用户作最终接受、退回修改或拒绝决定 | user decision、pending decision request |
 | `BLOCKED` | 缺少必要证据、权限、外部行动或用户决定 | blocker record |
 | `ACCEPTED` | 整体满足 Fix Acceptance Definition | acceptance result |
 
@@ -71,10 +75,12 @@ flowchart LR
   implementation --> pr[CHANGE_REVIEW]
   pr --> verification[VERIFICATION]
   disposition -->|无仓库变更| verification
-  verification --> accepted[ACCEPTED]
+  verification --> human[WAITING_FOR_USER：人工最终验收]
+  human -->|approve| accepted[ACCEPTED]
+  human -->|request-changes| implementation
 ```
 
-`DISPOSITION` 必须形成结构化决定，说明处置类型、最小范围、风险、验证目标，以及是否触发 `CHANGE_PLAN_REVIEW`。
+`DISPOSITION` 必须形成结构化决定，说明处置类型、最小范围、风险、验证目标，以及是否触发 `CHANGE_PLAN_REVIEW`。项目需要的合并、部署、配置生效或外部处置由项目 Skill / Project Knowledge 提供检查方法；所有 Fix 在最终 `ACCEPTED` 前都必须经过人工最终验收。
 
 无法复现不自动等于 `BLOCKED` 或“无需修改”：如果代码、日志、数据或运行事实足以形成可验证结论，可以继续调查；证据不足以归因时必须记录缺口并收集证据或进入 `BLOCKED`。
 
@@ -217,7 +223,7 @@ flowchart TD
   planPass{修改方案是否可接受？}
   implement[IMPLEMENTATION]
   prReview[CHANGE_REVIEW：Review PR / candidate revision]
-  verify[VERIFICATION]
+  verify[VERIFICATION：验证当前版本]
 
   candidate --> rootReview --> rootPass
   rootPass -->|否| gap --> candidate
@@ -227,6 +233,10 @@ flowchart TD
   planPass -->|是| implement --> prReview
   prReview -->|需要修改| implement
   prReview -->|通过| verify
+  verify -->|自动验证通过| human[WAITING_FOR_USER]
+  human -->|approve| accepted[ACCEPTED]
+  human -->|request-changes| implement
+  human -->|reject| blocked[BLOCKED]
 ```
 
 关键 Guard 至少保证：
@@ -239,20 +249,181 @@ flowchart TD
 - `CHANGE_REVIEW` 必须绑定同一个最终 candidate revision / PR diff，且 Reviewer 不能是该候选版本的实现者；
 - 所有路径都经过 `DISPOSITION`，并明确处置类型、最小范围、风险以及是否触发正式方案评审；
 - 只有实际产生仓库候选变更时，Implementation、Change Review 和 Verification 才必须绑定同一个最终候选版本；
-- 无仓库变更的解释、数据、环境或外部处置可以从 `DISPOSITION` 进入 Verification，但必须绑定基准版本、处置对象/环境版本和验证证据；
+- 无仓库变更的解释、数据、环境或外部处置必须记录对应的验证证据；项目特有的合并、部署、配置生效或外部处置检查由 Project Knowledge / Skill 提供；
 - 必需 Finding 未正式关闭时不得接受；
 - 原始现象、已识别影响面和关键不变量没有验证证据时不得标记为 `已解决`；
-- 外部依赖、权限或用户决定缺失时进入等待或 `BLOCKED`，不能把阻塞当作通过。
+- 外部依赖、权限或用户决定缺失时进入等待或 `BLOCKED`，不能把阻塞当作通过；
+- `VERIFICATION` 自动通过后必须进入 `WAITING_FOR_USER`，由用户对当前验证结果作出明确 `approve`、`request-changes` 或 `reject` 决定；没有绑定当前版本的 User Decision Artifact 不能进入 `ACCEPTED`；
+- 人工要求修改或项目外部动作产生新 candidate revision、配置版本、部署版本或处置对象版本时，旧版本绑定的 Review、Verification 和人工决定自动失效，必须重新检查并重新验证当前版本。
 
-进入 `ACCEPTED` 前，Acceptance Definition 必须综合检查问题确认、调查复核、最深可行动根因或明确外部边界、影响面、最终处置、适用的方案评估、候选/处置对象版本、Review Finding、原始现象验证、回归/兼容性验证、未验证项、剩余风险和必要用户决定。只有实际产生候选变更时才强制 `CHANGE_PLAN_REVIEW` 和 `CHANGE_REVIEW`。Run 处置报告是这些已接受 Artifact 的投影，不是 Worker 自由文本的替代验收。
+进入 `ACCEPTED` 前，Acceptance Definition 必须综合检查问题确认、调查复核、最深可行动根因或明确外部边界、影响面、最终处置、适用的方案评估、候选/处置对象版本、Review Finding、原始现象验证、回归/兼容性验证、未验证项、剩余风险和绑定当前版本的 User Decision Artifact。只有实际产生候选变更时才强制 `CHANGE_PLAN_REVIEW` 和 `CHANGE_REVIEW`。项目特有的合并、部署、配置生效或外部处置证据由 Project Knowledge / Skill 提供，并作为人工最终验收的输入；Run 处置报告是这些已接受 Artifact 的投影，不是 Worker 自由文本的替代验收。
 
 报告可以在等待或 `BLOCKED` 时生成阶段性版本，但不能称为 Acceptance Result。状态映射如下：
 
 | Run 状态 | 报告可用结论 |
 | --- | --- |
 | `ACCEPTED` | 已解决、已缓解、无需修改，或经明确接受决定的有限未解决结果 |
-| 等待用户/外部动作 | 等待确认 |
+| `WAITING_FOR_USER` | 等待用户最终验收、继续修改或拒绝；没有明确决定不能通过 |
 | `BLOCKED` | 已阻塞或未解决；报告可交付，但不代表通过 |
+
+## 人工验收与自动化演进指标
+
+Fix Extension 初始采用**全量人工 Review 和人工最终验收**。AI 可以执行调查、方案、实现、Review 和验证，但 AI 产出的 Review 或 Verification 只能作为结构化证据和建议；没有人工对当前版本作出明确 `approve`，Run 不得进入 `ACCEPTED`。
+
+这不是一次性从“人工”切换到“自动化”的设计，而是通过 Trace / Audit 建立质量基线，再按 Bug 类型和风险等级逐步减少人工介入。AI Review 与人工 Review 长期是两层职责：AI 负责可重复的检查，人工负责最终业务判断、异常接管和策略审计。
+
+### 三类指标漏斗
+
+指标分为流程漏斗、质量漏斗和自动化准入漏斗。三类指标必须使用结构化 Audit 事件计算，不能从模型自由文本或面向用户的 Trace 摘要中推断。
+
+#### 流程漏斗
+
+流程漏斗回答“Run 在哪一步完成、退回、阻塞或流失”：
+
+```text
+run_started
+  ↓
+investigation_completed
+  ↓
+investigation_review_passed
+  ↓
+disposition_completed
+  ↓
+implementation_completed       （仅产生仓库候选变更时）
+  ↓
+change_review_passed           （仅产生仓库候选变更时）
+  ↓
+verification_passed
+  ↓
+human_review_completed
+  ↓
+human_approved
+  ↓
+post_acceptance_stable
+```
+
+每一层至少统计进入数、通过数、退回数、阻塞数、拒绝数、转换率、流失率和处理时长。一个 Run 在同一统计窗口内只按稳定 `runId` 去重；重试和返工作为该 Run 的事件和次数统计，不重复制造 Run 分母。
+
+流程转换率的通用口径为：
+
+```text
+某阶段通过率 = 该阶段通过的去重 Run 数 / 进入该阶段的去重 Run 数
+```
+
+#### 质量漏斗
+
+质量漏斗回答“AI 认为可接受的结果，经过人工和后验观察后是否仍然正确”：
+
+```text
+artifact_contract_passed
+  ↓
+ai_review_passed
+  ↓
+automated_verification_passed
+  ↓
+human_approved
+  ↓
+post_acceptance_stable
+```
+
+核心指标及口径如下：
+
+| 指标 | 计算口径 | 用途 |
+| --- | --- | --- |
+| Artifact 合同首次通过率 | 首次提交即通过合同校验的 Artifact 数 / Artifact 总提交数 | 衡量输出结构、证据和 provenance 是否稳定 |
+| AI—人工一致率 | AI 结论与人工最终决定一致的去重 Run 数 / 已完成人工决定的去重 Run 数 | 衡量 AI 判断与人工判断的一致程度 |
+| AI 错误放行率 | AI 判定通过但人工 `request-changes` 或 `reject` 的去重 Run 数 / AI 判定通过的去重 Run 数 | 重点控制错误接受风险 |
+| 人工返工率 | 人工 `request-changes` 的去重 Run 数 / 已完成人工决定的去重 Run 数 | 识别根因、修复、验证或报告质量问题 |
+| 验收后问题逃逸率 | `ACCEPTED` 后在规定观察窗口内重新打开、回滚或确认仍有问题的去重 Run 数 / 已完成观察窗口的 `ACCEPTED` 去重 Run 数 | 衡量最终真实质量 |
+| 一次通过率 | 未发生人工返工且首次到达人工验收并通过的去重 Run 数 / 已完成 Run 数 | 衡量效率，不单独作为质量结论 |
+| 版本一致率 | 实现、Change Review、Verification 和人工决定均绑定同一最终 candidate revision 的 Run 数 / 产生候选变更的 Run 数 | 版本不一致时不得接受，目标为 100% |
+
+人工返工和验收后逃逸必须记录结构化原因，至少区分：根因错误、修复不完整、引入回归、验证证据不足、影响面遗漏、报告与实际不一致、版本绑定错误和外部条件变化。
+
+#### 自动化准入漏斗
+
+自动化准入漏斗回答“某类任务是否已经具备减少人工介入的条件”：
+
+```text
+样本量和观察窗口足够
+  ↓
+Audit 数据完整且可计算
+  ↓
+AI—人工结论稳定一致
+  ↓
+AI 错误放行率达到门槛
+  ↓
+验收后问题逃逸率达到门槛
+  ↓
+无严重错误放行且具备回退机制
+  ↓
+该 Bug 类型进入降级人工策略
+```
+
+自动化准入必须按 Bug 类型、风险等级、项目、运行环境、处置类型和是否产生仓库变更分别计算，不得用全局平均值掩盖高风险类别的失败。自动化策略必须可回退；指标恶化、出现严重错误或后验反馈异常时，恢复该类别的全量人工验收。
+
+### 第一阶段的 OK 条件
+
+由于 Extension 初建、暂无足够历史样本，第一阶段的目标是建立可信基线，不是立即放开自动接受。第一阶段满足以下条件才算“可运行”：
+
+- 100% 的 `ACCEPTED` Run 有人工 Review 记录和绑定当前版本的 `approve`；
+- 100% 的产生候选变更的 Run 满足实现、Review、Verification 和人工决定的版本一致性；
+- provenance 校验、required Finding 校验和 Acceptance Guard 的严重错误接受数为 0；
+- 每个 Run 都能关联原始输入、AI Artifact、人工决定、当前 candidate revision、验证证据和最终结果；
+- 人工 `request-changes`、`reject`、重新打开、回滚和后验问题都有结构化原因；
+- 指标可以按明确的分子、分母、去重键、统计窗口、快照时间和数据来源重算。
+
+以上是第一阶段的硬门槛。AI—人工一致率、错误放行率、返工率和验收后逃逸率在样本不足时只建立基线，不据此放开自动化。
+
+### 后续减少人工的建议门槛
+
+某个低风险 Bug 类型可以尝试从“逐单人工验收”进入“AI 检查为主、人工抽样”前，至少需要同时满足：
+
+- 至少 100 个已完成 Run，并覆盖连续至少 30 天；
+- 该类别 Audit 数据完整率不低于 99%；
+- AI—人工一致率不低于 95%；
+- AI 错误放行率不高于 1%，且其 95% 置信上界不高于 2%；
+- 规定观察窗口内没有严重错误放行；
+- 验收后问题逃逸率不高于 1%；
+- 版本一致率保持 100%；
+- 保留人工抽样、异常接管和恢复全量人工的机制。
+
+这些数值是后续运营的初始讨论门槛，不是当前已验证的产品事实。最终阈值需要基于真实 Trace 数据、风险等级和样本量重新评审。涉及权限、数据一致性、支付计费、安全、生产变更、大范围迁移或正式产品契约的高风险任务，即使指标达标，也可以永久保留人工最终验收。
+
+### 人工发现错误后的回流
+
+人工 Review 发现结果不正确时，不能只记录一个笼统的 `reject`：
+
+| 错误性质 | 回流目标 | 必须记录 |
+| --- | --- | --- |
+| 根因或影响面判断错误 | `INVESTIGATION` | 人工指出的错误事实、缺失证据和补查问题 |
+| 修复不完整或引入回归 | `IMPLEMENTATION` | 关联的 Finding、失败场景和目标版本 |
+| 需求、分类或处置方式错误 | `DISPOSITION` | 决策分歧、影响范围和需要重新确认的依据 |
+| 缺少权限、外部动作或环境条件 | `BLOCKED` | 阻塞原因、责任方和解除条件 |
+
+人工的 `request-changes` 或 `reject` 必须形成可追溯的 User Decision / Rejection Artifact。回流产生新的 candidate revision、配置版本、部署版本或处置对象版本时，旧版本绑定的 Review、Verification 和人工决定全部失效，必须重新执行适用的检查和验收。
+
+### 结构化事件要求
+
+为支持上述指标，Audit 至少应记录以下事件：
+
+| 事件名 | 中文含义 | 触发时机 |
+| --- | --- | --- |
+| `run_started` | Run 已启动 | 用户发起一次 Fix，Runtime 创建新的 `runId` 后记录 |
+| `artifact_submitted` | Artifact 已提交 | Worker 或 Controller 提交一个 Artifact，Runtime 开始或完成合同校验时记录提交尝试 |
+| `artifact_rejected` | Artifact 被拒绝 | Artifact 因结构、证据、provenance、身份或业务规则不满足而被拒绝时记录 |
+| `investigation_review_completed` | 调查 Review 已完成 | 调查 Reviewer 完成对根因、证据链和影响面的复核，并记录通过或退回结论 |
+| `disposition_completed` | 处置决策已完成 | Controller 接收到结构化处置决定，明确是否修改以及后续验证目标 |
+| `implementation_created` | 候选实现已产生 | Implementer 形成候选版本、diff 或其他可验证的处置对象版本时记录 |
+| `change_review_completed` | 变更 Review 已完成 | Reviewer 完成对固定 candidate revision / PR diff 的审查，并记录 Finding 和结论 |
+| `verification_completed` | 验证已完成 | Verifier 完成原始问题、根因切断、影响面和回归验证，并记录验证结论 |
+| `human_review_decided` | 人工 Review 已作出决定 | 用户查看当前结果后明确执行 `approve`、`request-changes` 或 `reject` 时记录 |
+| `run_accepted` | Run 已接受 | Acceptance Definition 全部满足，Controller 正式将 Run 标记为 `ACCEPTED` 时记录 |
+| `run_reopened` | 已完成 Run 被重新打开 | `ACCEPTED` 后发现问题，需要重新调查、修改或验证时记录 |
+| `run_rolled_back` | 处置被回滚 | 候选变更、配置、部署或其他处置对象被回滚时记录 |
+| `post_acceptance_issue_confirmed` | 验收后确认仍存在问题 | 通过用户反馈、监控、后续审计或复现，确认已接受结果仍有问题时记录 |
+
+每个可计量事件至少关联 `runId`、`eventId`、`eventType`、时间戳、Stage、Node、`nodeExecutionId`、`workerId`、Role、`sourceVersion`、Artifact 引用、决定、原因码、Bug 类型和风险等级。Trace 可以展示摘要，但指标计算和审计必须使用原始结构化事件。
 
 ## 非目标与 L2 交接
 
