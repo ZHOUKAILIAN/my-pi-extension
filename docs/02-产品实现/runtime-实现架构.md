@@ -120,6 +120,118 @@ Artifact 校验至少覆盖：类型/schema、`runId`、`nodeExecutionId`、`wor
 
 Audit 记录实际事件，不推断未发生的工作：Skill 声明的“应检查”不能替代工具事件或 Artifact 中的检查证据。Worker 不可任意改写 Artifact、Guard Record、Acceptance Result 或历史 Audit。
 
-## 8. 当前实现选择
+## 8. 人友好交互实现
+
+以下为所有 Workflow Extension 共用的 L2 交互约束；它们实现 L1 Core 的人友好化原则，不改变 Extension 自己的业务流程或 Acceptance Definition。
+
+### 8.1 交互适配层
+
+```text
+Extension 产生业务结果 / 待用户决定
+        ↓
+Workflow UI Adapter
+        ├── Summary View：业务摘要
+        ├── Detail View：证据、版本、事件和风险
+        ├── Action View：少量业务语言选项
+        └── Decision Adapter：交给 Controller
+```
+
+- Extension 只提供结构化 View Model 和业务语言，不直接拼接 Stage、Transition 或内部状态；
+- Workflow UI Adapter 负责把 Run、Artifact、Finding、Guard、Acceptance 和指标 Snapshot 转换为用户可理解的摘要；
+- Decision Adapter 只提交结构化意图，Controller 重新校验当前 Run、版本、权限和 Guard 后才改变状态；
+- `runId`、`nodeExecutionId`、candidate revision、错误码和事件 ID 默认不作为用户输入，作为详情、复制引用或调试信息保留；
+- UI 不复制 Run 状态、不修改 Artifact/Audit，不在本地形成第二套决定状态。
+
+### 8.2 Pi TUI Review Panel
+
+Pi TUI 适配器使用原生 `ctx.ui.custom()` 和现有组件 `Markdown`、`SelectList`、`Container`、`DynamicBorder`。默认 Review Panel 只展示当前决定所需信息：
+
+```text
+Fix / Workflow 结果待确认
+
+发生了什么：<现象和影响>
+当前结果：<处置和结论>
+验证情况：<已验证内容>
+需要注意：<未验证项和剩余风险>
+
+> 接受并完成
+  继续处理
+  暂不接受
+```
+
+实现约束：
+
+- 默认视图静态、紧凑、宽度自适应；详情通过展开或后续查看动作渐进式呈现；
+- 使用 Pi TUI 的换行、截断、主题和焦点机制；每行不超过当前终端宽度；
+- 不手写 ANSI，不实现动画、自动轮播、自定义 spinner 或持续定时刷新；
+- 选择项使用业务语言，内部 Stage 和 Transition 由 Controller 根据结构化原因映射；
+- “继续处理”和“暂不接受”先选择原因，再按需输入补充说明；取消、关闭和超时不产生同意；
+- TUI 只负责展示和收集选择。决定提交后，Controller 重新校验 `WAITING_FOR_USER`、pending request、当前版本、有效 Artifact 和 Acceptance 条件。
+
+Review Panel 的通用动作模型为：
+
+```ts
+type UserAction =
+  | { kind: "approve" }
+  | { kind: "request_changes"; reasonCode: string; note?: string }
+  | { kind: "reject"; reasonCode: string; note?: string };
+```
+
+`UserAction` 不是 Run 状态，也不是 User Decision Artifact；它是 UI 到 Controller 的一次请求。只有 Controller 接受并持久化后，才生成 User Decision Artifact 和 Transition Record。
+
+### 8.3 非交互模式
+
+RPC、JSON、print、CI 和无 TUI 环境必须提供同等语义的结构化输出：
+
+```json
+{
+  "runId": "run-001",
+  "status": "waiting_for_user",
+  "summary": "登录白屏修复已完成自动验证，等待人工确认",
+  "availableActions": ["approve", "request_changes", "reject"],
+  "currentVersion": "git:abc123",
+  "detailsRef": "audit://run-001/acceptance"
+}
+```
+
+非交互接口可以使用技术字段和机器可读决定值，但不能因为没有 TUI 而绕过 Controller、版本绑定或人工验收策略。普通用户路径不要求记忆这些字段。
+
+### 8.4 指标 HTML 看板
+
+指标看板是只读展示层，不是新的控制平面。它读取版本化 Metric Snapshot 或由固定 Audit Event 计算出的 Snapshot，按 Extension 展示统一漏斗和质量指标：
+
+```text
+选择 Extension
+  ↓
+选择时间范围 / Bug 类型 / 风险等级
+  ↓
+查看流程漏斗、质量漏斗、自动化准入状态
+  ↓
+展开指标口径、样本量、分子、分母、数据状态和异常原因
+```
+
+实现边界：
+
+- 每个 Extension 提供自己的 Metric Definition 和漏斗节点；通用看板负责筛选、布局、口径解释和状态展示；
+- HTML 页面默认显示业务名称、通过数、总数、转换率、趋势和异常原因；`runId`、事件 ID 和原始字段只在详情中展示；
+- 每个指标都显示 `calculable`、`insufficient_history`、`needs_confirmation` 或 `blocked` 状态，不能把缺失数据渲染为 0%；
+- 页面展示“为什么这个数字是这样”的分子、分母、去重规则、统计窗口、观察窗口、快照时间和数据来源；
+- 页面只读，不直接 approve、回退、修改 Run 或写 Audit。用户决定仍回到原 Workflow UI / Controller；
+- 首版优先生成可本地打开的静态 HTML，数据通过内嵌版本化 JSON 或同源只读接口提供；不要求动画和实时刷新；
+- 看板渲染失败不影响 Runtime、Run 状态、人工决定或审计写入。
+
+### 8.5 交互验证
+
+L2 测试除验证数据和状态正确外，还应验证：
+
+- 普通用户无需输入内部 Run/Stage/版本字段即可打开并提交 Review Panel 决定；
+- UI 取消、关闭、超时不会生成 approve；
+- 过期版本、过期 pending request 和重复决定会被 Controller 拒绝；
+- 窄终端、宽终端、长中文文本和长证据不会发生截断、重叠或布局跳动；
+- 非交互结构化输出与 TUI 展示具有相同的决定语义；
+- HTML 看板的指标数值可由同一组 Audit Event 重算，缺失数据能显示正确状态；
+- UI 无法绕过 Guard、Acceptance Definition 或版本绑定。
+
+## 9. 当前实现选择
 
 当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。
