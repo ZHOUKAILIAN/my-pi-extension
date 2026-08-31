@@ -19,6 +19,7 @@ import {
   type InvestigationArtifact,
   type InvestigationReviewArtifact,
   type NodeDefinition,
+  type PendingDecisionKind,
   type ReviewPolicy,
   type ReviewCycleRecord,
   type RunStore,
@@ -263,7 +264,7 @@ const isDecisionRecord = (value: unknown): value is NonNullable<import('@pi/work
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
   return typeof record.recordId === 'string' && record.recordId.length > 0
-    && ['approve', 'continue_verification', 'request_changes', 'reject'].includes(String(record.decision))
+    && ['approve', 'continue_verification', 'continue_disposition', 'request_changes', 'reject'].includes(String(record.decision))
     && typeof record.requestId === 'string' && record.requestId.length > 0
     && record.producerKind === 'user_decision'
     && record.producer === 'user'
@@ -293,6 +294,10 @@ export class WorkflowRuntime {
   private readonly idGen: () => string;
   private gate?: UserDecisionGate;
   private pendingDecision?: string;
+  /** WAITING_FOR_USER 的等待种类（Extension 进入等待前显式声明，Runtime 只负责持久化/恢复与
+   *  decide 路由；业务无关，不自行从 Artifact 推导）。无字段的 legacy checkpoint 恢复为 undefined，
+   *  沿用既有 Verification 推导语义（isPendingConfigurationWait）。 */
+  private pendingDecisionKind?: PendingDecisionKind;
   private problem?: string;
   readonly definition: WorkflowDefinition;
   readonly store: RunStore;
@@ -772,6 +777,14 @@ export class WorkflowRuntime {
       // 恢复后也不能对同一 runId 再次发出启动事件）。无值不写，legacy checkpoint 形状不变。
       ...(this.ranAnyNode ? { started: true } : {}),
     };
+    // 等待种类：进入 WAITING_FOR_USER 时把 Extension 声明的 pendingDecisionKind 随 checkpoint 落盘
+    //（只写有值，无声明 / legacy 形状不写）；离开 WAITING_FOR_USER（继续 / 打回 / 拒绝等一切转出）
+    // 立即清除，防止旧等待种类残留到下一个等待点误导 continue_disposition 路由校验。
+    if (to === 'WAITING_FOR_USER') {
+      if (this.pendingDecisionKind !== undefined) checkpoint.pendingDecisionKind = this.pendingDecisionKind;
+    } else {
+      this.pendingDecisionKind = undefined;
+    }
     // 用户决策的版本/原因至少进入 checkpoint：approve 的版本绑定可审计，request_changes 的原因可追溯。
     // 决策种类（decisionKind）也一并持久化：ACCEPTED 恢复时必须以 decisionKind==='approve' 作为
     // 可验证的人工 approve 事实，防止仅凭 decisionReference + 若干业务 Artifact 伪造验收态。
@@ -792,6 +805,11 @@ export class WorkflowRuntime {
           decision: decision.decision,
           requestId: decision.requestId,
           ...(decision.candidateRevision !== undefined ? { candidateRevision: decision.candidateRevision } : {}),
+          // 用户决定内容进入决策记录（trace 事实）：打回原因码 / continue_disposition 的处置决定
+          // 说明等。ACCEPTED 受控终局只认 approve（decisionRecord.decision==='approve'），note/…
+          // reasonCode 不参与验收判定，仅作审计与后续 worker 输入的回读来源。
+          ...(decision.reasonCode !== undefined ? { reasonCode: decision.reasonCode } : {}),
+          ...(decision.note !== undefined ? { note: decision.note } : {}),
           producerKind: 'user_decision',
           producer: 'user',
           producerName: '用户',
@@ -1162,6 +1180,17 @@ export class WorkflowRuntime {
     return this.stage === 'WAITING_FOR_USER' && verification?.accepted === false && verification.failure?.kind === 'configuration';
   }
 
+  // WAITING_FOR_USER 的等待种类控制：Extension 在进入等待前先 setPendingDecisionKind，
+  // applyTransition 把它随 checkpoint 持久化（进入等待时），离开等待即清除；restore 从 checkpoint 回读。
+  setPendingDecisionKind(kind: PendingDecisionKind): void {
+    this.pendingDecisionKind = kind;
+  }
+
+  /** 当前等待种类；非等待阶段或 legacy checkpoint（无字段）时为 undefined。 */
+  getPendingDecisionKind(): PendingDecisionKind | undefined {
+    return this.pendingDecisionKind;
+  }
+
   /** 由 disposition artifact 推导 acceptance 是否需要仓库变更标记组（与 Controller 求值一致）。
    *  取“当前有效（最新）disposition”，旧处置不覆盖新处置。 */
   dispositionRequiresRepositoryChange(): boolean {
@@ -1325,6 +1354,27 @@ export class WorkflowRuntime {
       this.recordEvent('run_reopened', { reasonCode: 'configuration_revoked', toStage: 'VERIFYING' }, { reasonCode: 'configuration_revoked', candidateRevision: this.candidateRevision });
       this.pendingDecision = undefined;
       return { outcome: 'reopened', toStage: 'VERIFYING' };
+    }
+    if (decision.decision === 'continue_disposition') {
+      // D3：处置决定等待（disposition_decision）/ 外部动作完成等待（external_action_completion）
+      // 的用户决定出口，只能在该等待种类下消费（fail-closed）。
+      //   disposition_decision → 回 DISPOSITION：用户已给出处置决定，重新执行处置（以决定作为
+      //     补充输入），由新一轮 disposition 决定后续路线（repo-change 走 change_plan_review 等）；
+      //   external_action_completion → 外部动作已完成、已补完成证据：无仓库变更回 VERIFYING 按
+      //     处置的验证目标验证既有现场；声明仓库变更的处置回 DISPOSITION 走常规 repo-change 流程。
+      if (this.pendingDecisionKind !== 'disposition_decision' && this.pendingDecisionKind !== 'external_action_completion') {
+        throw new WorkflowRuntimeError('CONTINUE_DISPOSITION_NOT_AVAILABLE', 'continue_disposition is only allowed while waiting on a disposition decision or an external action completion');
+      }
+      const toStage: Stage = this.pendingDecisionKind === 'disposition_decision'
+        ? 'DISPOSITION'
+        : this.dispositionRequiresRepositoryChange()
+          ? 'DISPOSITION'
+          : 'VERIFYING';
+      this.transition(toStage, decision);
+      this.recordEvent('human_review_decided', { decision: 'continue_disposition', requestId: decision.requestId, toStage }, { decision: 'continue_disposition' });
+      this.recordEvent('run_reopened', { reasonCode: 'disposition_resolved', toStage }, { reasonCode: 'disposition_resolved', candidateRevision: this.candidateRevision });
+      this.pendingDecision = undefined;
+      return { outcome: 'reopened', toStage };
     }
     if (decision.decision === 'request_changes') {
       const toStage = opts.reasonToStage?.(decision.reasonCode) ?? 'IMPLEMENTING';
@@ -1758,6 +1808,14 @@ export class WorkflowRuntime {
       runtime.stage = checkpoint.stage;
       runtime.problem = checkpoint.problem;
       runtime.pendingDecision = checkpoint.pendingDecisionRequest;
+      // 等待种类随 checkpoint 恢复：只接受合法值（未知种类 fail-closed，防伪造等待种类导流）；
+      // 缺字段（legacy checkpoint）保持 undefined，沿用既有 Verification 推导语义。
+      if (checkpoint.pendingDecisionKind !== undefined) {
+        if (!['final_acceptance', 'configuration_wait', 'disposition_decision', 'external_action_completion'].includes(checkpoint.pendingDecisionKind)) {
+          throw new CheckpointRestoreError('CHECKPOINT_STATE_INCONSISTENT', `unknown pendingDecisionKind on checkpoint: ${String(checkpoint.pendingDecisionKind)}`);
+        }
+        runtime.pendingDecisionKind = checkpoint.pendingDecisionKind;
+      }
       if (checkpoint.incomplete === true) runtime.checkpointIncomplete = true;
       if (checkpoint.schemaVersion !== 1 || checkpoint.workflowVersion === undefined || checkpoint.policyDigest === undefined) runtime.checkpointIncomplete = true;
       runtime.restoreArtifacts(checkpoint.artifacts);
@@ -1808,10 +1866,31 @@ export class WorkflowRuntime {
         const waitsOnValidVerification = restoredVerification !== undefined
           && (restoredVerification.accepted === true
             || (restoredVerification.accepted === false && restoredVerification.failure?.kind === 'configuration'));
-        if (!waitsOnValidVerification || typeof checkpoint.pendingDecisionRequest !== 'string' || !checkpoint.pendingDecisionRequest) {
+        // D3：处置决定等待 / 外部动作完成等待没有验证现场，等待事实由“最新的 disposition 声明
+        // wait_decision / external_action”支撑；同样必须是 Runtime 创建的 pendingDecisionRequest。
+        const restoredDisposition = ([...(checkpoint.artifacts ?? [])].reverse().find((artifact) => artifact.kind === 'disposition') as DispositionArtifact | undefined);
+        // F2：等待种类与等待事实交叉校验——只有最新 disposition 声明的等待类型能产生对应的
+        // pendingDecisionKind（wait_decision→disposition_decision，external_action→
+        // external_action_completion）。声明了处置等待种类但现场不是处置等待（或种类与处置类型
+        // 不配对）的 checkpoint 视为状态不一致 fail-closed，避免 resume 后按错误等待种类渲染
+        //（如把 external_action 等待渲染成“等待处置决定”）。legacy checkpoint（缺字段）保持
+        // undefined，沿用既有 Verification 推导回退，不接受也不要求该字段。
+        const dispositionKindFor = (dispositionType: DispositionArtifact['dispositionType'] | undefined): PendingDecisionKind | undefined =>
+          dispositionType === 'wait_decision' ? 'disposition_decision'
+            : dispositionType === 'external_action' ? 'external_action_completion'
+              : undefined;
+        const waitsOnDispositionDecision = dispositionKindFor(restoredDisposition?.dispositionType) !== undefined;
+        const pendingKind = checkpoint.pendingDecisionKind;
+        const pendingKindMismatch = pendingKind !== undefined && (
+          (waitsOnDispositionDecision && pendingKind !== dispositionKindFor(restoredDisposition?.dispositionType))
+          || (!waitsOnDispositionDecision && (pendingKind === 'disposition_decision' || pendingKind === 'external_action_completion'))
+        );
+        if (!(waitsOnValidVerification || waitsOnDispositionDecision)
+          || pendingKindMismatch
+          || typeof checkpoint.pendingDecisionRequest !== 'string' || !checkpoint.pendingDecisionRequest) {
           throw new CheckpointRestoreError(
             'CHECKPOINT_STATE_INCONSISTENT',
-            'WAITING_FOR_USER checkpoint must be backed by an accepted (or configuration-failed) verification and a Runtime-created pending decision request',
+            'WAITING_FOR_USER checkpoint must be backed by an accepted (or configuration-failed) verification, or a wait_decision/external_action disposition awaiting a user decision with a matching pendingDecisionKind, and a Runtime-created pending decision request',
           );
         }
       }

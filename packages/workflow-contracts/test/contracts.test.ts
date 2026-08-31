@@ -42,6 +42,10 @@ test('user decision supports approve, request_changes, reject, continue_verifica
   assert.doesNotThrow(() => validateSubmitArtifact({ kind: 'user_decision', decision: 'continue_investigating', requestId: 'req-1' }));
   // F：配置类验证失败后的继续验证动作，契约为合法决策值。
   assert.doesNotThrow(() => validateSubmitArtifact({ kind: 'user_decision', decision: 'continue_verification', requestId: 'req-1' }));
+  // D3：处置等待（wait_decision / external_action）的人工继续动作，契约为合法决策值；
+  // F1：continue_disposition 携带用户处置决定内容（note/reasonCode）是合法决策形状。
+  assert.doesNotThrow(() => validateSubmitArtifact({ kind: 'user_decision', decision: 'continue_disposition', requestId: 'req-1' }));
+  assert.doesNotThrow(() => validateSubmitArtifact({ kind: 'user_decision', decision: 'continue_disposition', requestId: 'req-1', note: '用户决定按 mitigation 处置', reasonCode: 'mitigation' }));
   // 决策值域与 Stage/Guard 一一对应，枚举外的值一律拒绝。
   assert.throws(
     () => validateSubmitArtifact({ kind: 'user_decision', decision: 'approve_now', requestId: 'req-1' }),

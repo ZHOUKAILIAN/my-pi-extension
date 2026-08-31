@@ -385,3 +385,72 @@ test('/fix review continue-verification 依据当前有效验证（accepted 时�
   );
   assert.equal(workflowRuns(h).at(-1).data.stage, 'WAITING_FOR_USER', '被拒绝的继续验证不得推进阶段');
 });
+// ============================================================
+// D3：/fix review 处置等待（wait_decision / external_action）——continue-disposition 动作与
+// approve 在无验证现场时的 fail-closed。
+// ============================================================
+
+const dispositionWaitCheckpoint = (dispositionType: 'wait_decision' | 'external_action'): { customType: string; data: Record<string, unknown> } => {
+  const done = reviewWaitCheckpoint({
+    candidateRevision: undefined,
+    reviewCycles: [],
+    pendingDecisionKind: dispositionType === 'wait_decision' ? 'disposition_decision' : 'external_action_completion',
+    artifacts: [
+      { ...intakeShape, conclusion: { status: 'accepted', summary: 'stamped' }, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.intake.1', workerId: 'w:intake:1', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { ...investigationShape, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.investigate.2', workerId: 'w:investigate:2', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { ...ireviewShape('accepted'), schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.investigation_review.3', workerId: 'w:investigation_review:3', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { kind: 'disposition', dispositionType, requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: dispositionType === 'wait_decision' ? '用户确认' : '外部动作完成后复测', conclusion: { status: 'accepted', summary: 'waiting' }, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.disposition.4', workerId: 'w:disposition:4', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+    ],
+  });
+  done.data.candidateRevision = undefined;
+  return done;
+};
+
+test('/fix review continue-disposition（disposition_decision）→ 回到 DISPOSITION 重新落地处置', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('wait_decision'));
+  // F1：CLI 路径的 continue-disposition 必须携带用户处置决定内容（reasonCode 承载，单 token）。
+  await h.run('review fix-r continue-disposition 用户决定按mitigation处置');
+  assert.equal(h.calls(), 0, 'review 命令不得触发任何 worker 调用');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'DISPOSITION', 'wait_decision 继续后回到 DISPOSITION 重落地处置');
+  // 决定内容进入决策记录（trace 事实），供后续 resume 的 DISPOSITION 重跑读回。
+  const record = h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1)!.data.decisionRecord;
+  assert.equal(record.decision, 'continue_disposition');
+  assert.equal(record.reasonCode, '用户决定按mitigation处置');
+  const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
+  assert.equal(report, undefined, '继续处置不是验收，不得产出最终处置报告');
+});
+
+test('/fix review continue-disposition 不带处置决定内容 → usage 拒绝且不推进阶段', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('wait_decision'));
+  await h.run('review fix-r continue-disposition');
+  assert.equal(h.calls(), 0);
+  assert.ok(
+    h.notifications.some((text) => text.includes('usage') && text.includes('continue-disposition')),
+    `notifications: ${h.notifications.join(' | ')}`,
+  );
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'WAITING_FOR_USER', '缺内容时不得推进阶段');
+});
+
+test('/fix review continue-disposition（external_action_completion）→ 无仓库变更回 VERIFYING', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('external_action'));
+  await h.run('review fix-r continue-disposition 外部动作已完成权限开通');
+  assert.equal(h.calls(), 0, 'review 命令不得触发任何 worker 调用');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'VERIFYING', 'external_action 继续后无仓库变更回 VERIFYING 复测');
+});
+
+test('/fix review approve 在处置等待上被拒（无验证现场，验收未满足）且保持待评审', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('wait_decision'));
+  await h.run('review fix-r approve');
+  assert.equal(h.calls(), 0, 'review 命令不得触发任何 worker 调用');
+  assert.ok(
+    h.notifications.some((text) => text.includes('验收条件未满足') && text.includes('verification_accepted')),
+    `notifications: ${h.notifications.join(' | ')}`,
+  );
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'WAITING_FOR_USER', '处置等待上 approve 被拒不得推进阶段');
+  const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
+  assert.equal(report, undefined, '被拒的 approve 不得产出最终处置报告');
+});

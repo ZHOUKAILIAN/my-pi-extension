@@ -17,11 +17,15 @@ import type { FixReasonCode } from './definition.ts';
 // 由 collectDecision 在构造 Artifact 时完成映射。
 // '继续验证（配置已修改）' 仅用于配置类验证失败后的 WAITING_FOR_USER：只回 VERIFYING，
 // 不能代替 approve 或回流 IMPLEMENTING。
-export const FIX_REVIEW_ACTIONS: Record<string, 'approve' | 'request-changes' | 'reject' | 'continue-verification'> = {
+export const FIX_REVIEW_ACTIONS: Record<string, 'approve' | 'request-changes' | 'reject' | 'continue-verification' | 'continue-disposition'> = {
   '通过并接受': 'approve',
   '打回（选择原因）': 'request-changes',
   '拒绝': 'reject',
   '继续验证（配置已修改）': 'continue-verification',
+  // D3：处置自动等待（wait_decision / external_action）的继续出口，同一 'continue-disposition'
+  // 动作值（Artifact decision 为 continue_disposition），由 Runtime 按等待种类路由回 DISPOSITION 或 VERIFYING。
+  '继续（已作出处置决定）': 'continue-disposition',
+  '继续（外部动作已完成）': 'continue-disposition',
 };
 
 // 打回原因选项：UI 文案 → 结构化原因码（与 definition.ts 的 FixReasonCode 对齐）。
@@ -39,6 +43,8 @@ export interface ReviewContextUI {
   hasUI: boolean;
   notify(msg: string, type?: 'info' | 'warning' | 'error'): void;
   select(title: string, options: string[]): Promise<string | undefined>;
+  /** 可选自由文本收集（如 continue_disposition 的处置决定内容）；宿主无 input 能力时缺省跳过。 */
+  input?(prompt: string, placeholder?: string): Promise<string | undefined>;
 }
 
 export interface CollectDecisionPayload {
@@ -59,8 +65,9 @@ export async function collectDecision(ctx: ReviewContextUI, payload: CollectDeci
   const action = await ctx.select('最终验收决定', actionOptions);
   if (action === undefined) return undefined;
   const actionDecision = FIX_REVIEW_ACTIONS[action];
-  let decision: 'approve' | 'request_changes' | 'reject' | 'continue_verification';
+  let decision: 'approve' | 'request_changes' | 'reject' | 'continue_verification' | 'continue_disposition';
   let reasonCode: string | undefined;
+  let noteValue: string | undefined;
   if (actionDecision === 'request-changes') {
     decision = 'request_changes';
     const reasonLabel = await ctx.select('打回原因', Object.keys(FIX_REVIEW_REASONS));
@@ -68,6 +75,16 @@ export async function collectDecision(ctx: ReviewContextUI, payload: CollectDeci
     reasonCode = FIX_REVIEW_REASONS[reasonLabel];
   } else if (actionDecision === 'continue-verification') {
     decision = 'continue_verification';
+  } else if (actionDecision === 'continue-disposition') {
+    decision = 'continue_disposition';
+    // F1：继续处置必须携带用户处置决定内容（note）。有输入能力时收集，空/取消视为整体放弃
+    //（保持 WAITING_FOR_USER，避免无内容继续造成 wait_decision 反复循环）；无输入能力的宿主
+    //（如纯 CLI 构造路径）不强制，由调用方保证通过 reasonCode 等字段携带内容。
+    if (ctx.input) {
+      const note = (await ctx.input('处置决定内容（将传给处置 worker）', ''))?.trim();
+      if (!note) return undefined;
+      noteValue = note;
+    }
   } else {
     decision = actionDecision;
   }
@@ -76,6 +93,7 @@ export async function collectDecision(ctx: ReviewContextUI, payload: CollectDeci
     decision,
     requestId: payload.requestId,
     reasonCode,
+    ...(noteValue !== undefined ? { note: noteValue } : {}),
     candidateRevision: payload.candidateRevision,
   } as UserDecisionArtifact;
 }

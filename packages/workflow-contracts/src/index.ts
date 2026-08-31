@@ -44,7 +44,13 @@ export interface ImplementationArtifact { kind:'implementation'; artifact:Implem
 export type VerificationFailureKind = 'implementation'|'configuration'|'external_condition';
 export interface VerificationFailure { kind:VerificationFailureKind; reason:string; responsibility?:string; resolution?:string }
 export interface VerificationArtifact { kind:'verification'; accepted:boolean; evidence:EvidenceItem[]; candidateRevision?:string; unverified?:string[]; remainingRisk?:string[]; checks?:Record<string, boolean|string>; failure?:VerificationFailure; id?:string; [key:string]:unknown }
-export interface UserDecisionArtifact { kind:'user_decision'; decision:'approve'|'request_changes'|'reject'|'continue_investigating'|'continue_verification'; requestId:string; reasonCode?:string; candidateRevision?:string; note?:string; producerKind?:'user_decision'; schemaVersion?:1; runId?:string; sourceVersion?:string; evidence?:EvidenceItem[]; unverified?:string[]; conclusion?:ArtifactConclusion; [key:string]:unknown }
+export interface UserDecisionArtifact { kind:'user_decision'; decision:'approve'|'request_changes'|'reject'|'continue_investigating'|'continue_verification'|'continue_disposition'; requestId:string; reasonCode?:string; candidateRevision?:string; note?:string; producerKind?:'user_decision'; schemaVersion?:1; runId?:string; sourceVersion?:string; evidence?:EvidenceItem[]; unverified?:string[]; conclusion?:ArtifactConclusion; [key:string]:unknown }
+
+// WAITING_FOR_USER 的等待种类：区分三类人工/外部等待（D3：处置决定 / 外部动作完成；最终验收），
+// 加上显式的配置类验证失败等待（configuration_wait，与既有 continue_verification 出口对应）。
+// 由 Extension 在进入 WAITING_FOR_USER 前显式声明（Runtime 保持业务无关：只持久化/恢复，不推导）；
+// legacy checkpoint 无该字段时以既有 Verification 推导语义（isPendingConfigurationWait）兼容。
+export type PendingDecisionKind = 'final_acceptance' | 'configuration_wait' | 'disposition_decision' | 'external_action_completion';
 export interface GuardRejectionArtifact { kind:'guard_rejection'; error:string; [key:string]:unknown }
 
 // Intake 正式用户可读字段：summary（一句话问题摘要）+ overview（两三句话场景/影响/已知上下文）。
@@ -117,6 +123,11 @@ export interface Checkpoint { schemaVersion?:1; runId:string; stage:Stage; at:nu
   其他评审 kind（investigation_review / change_review）也记录，保持跨 session 恢复的评审事实连续。 */ reviewCycles?:ReviewCycleRecord[]; /** BLOCKED 解除后回到的目标阶段：记录产生 BLOCKED 时的现场，跨 session 恢复时按此回放，不允许默认回滚到 INVESTIGATING。 */ blockedReturnStage?:Stage; incomplete?:boolean; // 用户决策的审计事实：决策种类（approve 等）、绑定版本与原因进入 checkpoint，避免依赖易丢的决策 Artifact；
   // ACCEPTED 恢复以此为可验证的人工 approve 事实（decisionKind==='approve' + decisionReference + 版本绑定）。
   decisionKind?:UserDecisionArtifact['decision']; decisionCandidateRevision?:string; decisionReasonCode?:string;
+  // WAITING_FOR_USER 的等待种类（Extension 进入等待前声明，Runtime 持久化/恢复；无值不写，
+  // legacy checkpoint 形状保持不变）。restore 的 WAITING 一致性校验与 continue_disposition 路由
+  // 都以它为事实基础：disposition_decision / external_action_completion 由 disposition 等待产生，
+  // final_acceptance / configuration_wait 由验证产生。
+  pendingDecisionKind?:PendingDecisionKind;
   // 显式的 Runtime 决策记录（与业务字段平铺的 decisionKind/decisionReference 并存，但受控终局恢复只认
   // 本记录：由 Runtime.decide 路径产生的唯一记录，包含 producer/source 来源事实，不允许任意字符串相等
   // 作为唯一证明）。只有 decide() 委托路径由 Runtime 盖章写入；legacy resume()/gate 决策不附加本记录
@@ -134,6 +145,11 @@ export interface DecisionRecord {
   requestId: string;
   /** approve 决策绑定的候选版本（run 已产生候选版本时必须一致）。 */
   candidateRevision?: string;
+  /** 用户决定内容（打回原因码 / continue_disposition 的处置决定内容等），与平铺 decisionReasonCode
+   *  并存，作为 trace 事实；不是受控终局验收的必要字段（approve 不要求）。 */
+  reasonCode?: string;
+  /** 用户决定内容的自由文本（continue_disposition 的处置决定说明 / 打回补充等），trace 事实。 */
+  note?: string;
   /** 决策产生者（Runtime 依据决策 Artifact 种类盖章）：人工用户决策为 'user_decision'。 */
   producerKind: string;
   producer: string;
@@ -363,9 +379,11 @@ export function validateSubmitArtifact(value:unknown, context?: ArtifactExecutio
     return;
   }
   if (artifact.kind === 'user_decision') {
-    // 决策值域与 Stage/Guard 一一对应；continue_verification 是配置类验证失败后的继续验证动作（只能回 VERIFYING）。
-    if (!['approve', 'request_changes', 'reject', 'continue_investigating', 'continue_verification'].includes(String(artifact.decision))) {
-      throw new ArtifactContractError('INVALID_USER_DECISION', `user_decision.decision must be one of approve, request_changes, reject, continue_investigating, continue_verification; got ${String(artifact.decision)}`);
+    // 决策值域与 Stage/Guard 一一对应；continue_verification 是配置类验证失败后的继续验证动作（只能回 VERIFYING）；
+    // continue_disposition 是处置决定等待（disposition_decision）与外部动作完成等待（external_action_completion）
+    // 的继续动作（由 Runtime decide 按等待种类路由回 DISPOSITION 或 VERIFYING）。
+    if (!['approve', 'request_changes', 'reject', 'continue_investigating', 'continue_verification', 'continue_disposition'].includes(String(artifact.decision))) {
+      throw new ArtifactContractError('INVALID_USER_DECISION', `user_decision.decision must be one of approve, request_changes, reject, continue_investigating, continue_verification, continue_disposition; got ${String(artifact.decision)}`);
     }
     if (!nonEmptyString(artifact.requestId)) throw new ArtifactContractError('MISSING_USER_DECISION_REQUEST_ID', 'user_decision.requestId is required');
     if (artifact.producerKind !== undefined && artifact.producerKind !== 'user_decision') throw new ArtifactContractError('INVALID_USER_DECISION_PRODUCER_KIND', 'user_decision.producerKind must be user_decision');

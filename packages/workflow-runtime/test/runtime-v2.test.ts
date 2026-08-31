@@ -484,6 +484,136 @@ test('decide refuses continue_verification outside a configuration-wait run', as
   throwsCode(() => runtime.decide({ kind: 'user_decision', decision: 'continue_verification', requestId }), 'CONTINUE_VERIFICATION_NOT_AVAILABLE');
   assert.equal(runtime.stage, 'WAITING_FOR_USER');
 });
+// 9c. D3：continue_disposition 只消费处置等待（wait_decision → disposition_decision），路由回 DISPOSITION
+//（重新执行处置，把用户决定作为补充输入）。
+test('decide continue_disposition reopens a disposition_decision wait back to DISPOSITION', async () => {
+  const events: FixAuditEvent[] = [];
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9d', () => 9, () => 'gen', { auditSink: sink(events) });
+  await runtime.executeNode({ id: 'intake', worker: bareWorker(() => ({ kind: 'intake', summary: '白屏', overview: '登录后白屏' })) }, {});
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: '等待用户处置决定' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('disposition_decision');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  assert.equal(runtime.stage, 'WAITING_FOR_USER');
+  const requestId = pendingRequest(entries);
+  const result = runtime.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId });
+  assert.equal(result.outcome, 'reopened');
+  assert.equal(result.toStage, 'DISPOSITION');
+  assert.equal(runtime.stage, 'DISPOSITION');
+  const types = events.map((event) => event.eventType);
+  assert.ok(types.includes('human_review_decided'));
+  assert.ok(types.includes('run_reopened'));
+  assert.ok(!types.includes('run_accepted'));
+});
+
+// D3：external_action_completion 的继续路由——无仓库变更回 VERIFYING（外部动作已完成、已补证据，
+// 复测既有现场）；声明仓库变更的处置回 DISPOSITION（走常规 repo-change 流程）。
+test('decide continue_disposition routes external_action_completion to VERIFYING when no repo change is required', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9e', () => 9, () => 'gen');
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'external_action', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '外部动作完成后复测', conclusion: { status: 'accepted', summary: '等待外部动作完成' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('external_action_completion');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  const requestId = pendingRequest(entries);
+  const result = runtime.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId });
+  assert.equal(result.outcome, 'reopened');
+  assert.equal(result.toStage, 'VERIFYING');
+  assert.equal(runtime.stage, 'VERIFYING');
+});
+
+test('decide continue_disposition routes external_action_completion to DISPOSITION when a repo change is required', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9f', () => 9, () => 'gen');
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'external_action', requiresRepositoryChange: true, minimalScope: 'a.ts', risks: [], verificationTarget: '外部动作完成后复测', conclusion: { status: 'accepted', summary: '等待外部动作完成' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('external_action_completion');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  const requestId = pendingRequest(entries);
+  const result = runtime.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId });
+  assert.equal(result.outcome, 'reopened');
+  assert.equal(result.toStage, 'DISPOSITION');
+  assert.equal(runtime.stage, 'DISPOSITION');
+});
+
+// D3：continue_disposition 不能用于最终验收等待（verification accepted）：无处置等待事实即 fail-closed。
+test('decide refuses continue_disposition outside a disposition wait', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9g', () => 9, () => 'gen');
+  const verify = await runtime.executeNode(
+    { id: 'verify', worker: bareWorker(() => ({ kind: 'verification', accepted: true, evidence: ['test:passed'], candidateRevision: 'rev-1' })) },
+    {},
+  );
+  runtime.transition('WAITING_FOR_USER', verify.artifact);
+  const requestId = pendingRequest(entries);
+  throwsCode(() => runtime.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId }), 'CONTINUE_DISPOSITION_NOT_AVAILABLE');
+  assert.equal(runtime.stage, 'WAITING_FOR_USER');
+});
+
+// D3：pendingDecisionKind 随 checkpoint 落盘并随非等待转移清除（不残留到下一次等待），restore 恢复。
+test('pendingDecisionKind persists on the WAITING checkpoint, clears on non-waiting transitions, and restores', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9h', () => 9, () => 'gen');
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: '等待用户处置决定' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('disposition_decision');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  assert.equal(entries.at(-1)!.data.pendingDecisionKind, 'disposition_decision', 'checkpoint must persist pendingDecisionKind');
+  // 恢复：阶段与等待种类都要可用（/resume 依赖）。
+  const restored = WorkflowRuntime.restore(makeDefinition(), store, 'run-9h');
+  assert.equal(restored.stage, 'WAITING_FOR_USER');
+  assert.equal(restored.getPendingDecisionKind(), 'disposition_decision');
+  // 继续后转出 WAITING：等待种类清除，不残留到后续 checkpoint。
+  const requestId = pendingRequest(entries);
+  restored.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId });
+  assert.equal(restored.getPendingDecisionKind(), undefined);
+  assert.equal(entries.at(-1)!.data.pendingDecisionKind, undefined, 'non-waiting checkpoint must not carry a stale kind');
+});
+
+// D3：restore 对未知 pendingDecisionKind fail-closed（不静默按其它语义续跑）。
+test('restore fails closed on an unknown pendingDecisionKind', async () => {
+  const { entries, store } = makeStore();
+  entries.push({ customType: 'workflow-run', data: {
+    runId: 'run-9i', schemaVersion: 1, stage: 'WAITING_FOR_USER', at: 1, id: 'c-9i', workflowVersion: 'v1', policyDigest: 'd1',
+    pendingDecisionRequest: 'req-9i', pendingDecisionKind: 'bogus_kind',
+    artifacts: [
+      { kind: 'verification', accepted: true, evidence: ['test:passed'], candidateRevision: 'rev-1', unverified: [], schemaVersion: 1, runId: 'run-9i', producerKind: 'worker', sourceVersion: 'def-src-v1', nodeExecutionId: 'run-9i.verify.1', workerId: 'w' },
+    ],
+  } });
+  throwsCode(() => WorkflowRuntime.restore(makeDefinition(), store, 'run-9i'), 'CHECKPOINT_STATE_INCONSISTENT');
+});
+
+// D3：restore 接受 disposition 支撑的 WAITING 现场（无验证 artifact，wait_decision 处置 + 决策请求），
+// /resume 可以继续消费处置等待；这与“无验证现场不得伪造 approve 等待”的 fail-closed 相互独立。
+test('restore accepts a disposition-backed WAITING_FOR_USER checkpoint (wait_decision)', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9j', () => 9, () => 'gen');
+  await runtime.executeNode({ id: 'intake', worker: bareWorker(() => ({ kind: 'intake', summary: '白屏', overview: '登录后白屏' })) }, {});
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: '等待用户处置决定' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('disposition_decision');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  const restored = WorkflowRuntime.restore(makeDefinition(), store, 'run-9j');
+  assert.equal(restored.stage, 'WAITING_FOR_USER');
+  assert.equal(restored.getPendingDecisionKind(), 'disposition_decision');
+  // 恢复后的 continue_disposition 仍可正常消费（requestId 绑定校验在 decide 内）。
+  const requestId = pendingRequest(entries);
+  const result = restored.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId });
+  assert.equal(result.outcome, 'reopened');
+  assert.equal(result.toStage, 'DISPOSITION');
+});
+
 test('decide guards against non-waiting stage and mismatched requestId', async () => {
   const { entries, store } = makeStore();
   const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-10', () => 10, () => 'gen');
@@ -2140,6 +2270,151 @@ test('restore rejects a forged WAITING_FOR_USER checkpoint without a verificatio
   } });
   // 验证被拒（implementation 类失败）不构成合法人工等待 → fail-closed。
   throwsCode(() => WorkflowRuntime.restore(makeDefinition(), store, 'run-wf'), 'CHECKPOINT_STATE_INCONSISTENT');
+});
+
+// 24b. F2：restore 交叉校验 pendingDecisionKind 与 disposition 等待事实——最新 disposition 声明
+// wait_decision/external_action 时，pendingDecisionKind 必须对应 disposition_decision/
+// external_action_completion（精确配对），否则 fail-closed；缺字段（legacy）沿用推导回退。
+// 防止 resume 后按错误等待种类渲染（如把 external_action 等待渲染成“等待处置决定”）。
+const dispositionWaitRestoreCheckpoint = (opts: {
+  dispositionType: 'wait_decision' | 'external_action';
+  pendingDecisionKind?: string;
+  extraArtifacts?: Record<string, unknown>[];
+}) => ({
+  customType: 'workflow-run',
+  data: {
+    runId: 'run-f2', schemaVersion: 1, stage: 'WAITING_FOR_USER', at: 1, id: 'c-f2', workflowVersion: 'v1', policyDigest: 'd1',
+    pendingDecisionRequest: 'req-f2',
+    ...(opts.pendingDecisionKind !== undefined ? { pendingDecisionKind: opts.pendingDecisionKind } : {}),
+    artifacts: [
+      { kind: 'disposition', dispositionType: opts.dispositionType, requiresRepositoryChange: false, minimalScope: 'config', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: 'waiting' }, unverified: [], schemaVersion: 1, runId: 'run-f2', producerKind: 'worker', sourceVersion: 'def-src-v1', nodeExecutionId: 'run-f2.disposition.1', workerId: 'w' },
+      ...(opts.extraArtifacts ?? []),
+    ],
+  },
+});
+
+// F2-1：处置等待 + 不配对的 pendingDecisionKind（final_acceptance / 另一处置种类）→ fail-closed。
+test('restore rejects a disposition wait whose pendingDecisionKind does not pair with the disposition type', () => {
+  for (const [dispositionType, badKind] of [
+    ['wait_decision', 'final_acceptance'],
+    ['wait_decision', 'external_action_completion'],
+    ['external_action', 'disposition_decision'],
+    ['external_action', 'configuration_wait'],
+  ] as const) {
+    const { entries, store } = makeStore();
+    entries.push(dispositionWaitRestoreCheckpoint({ dispositionType, pendingDecisionKind: badKind }));
+    throwsCode(
+      () => WorkflowRuntime.restore(makeDefinition(), store, 'run-f2'),
+      'CHECKPOINT_STATE_INCONSISTENT',
+      `${dispositionType} + ${badKind} 应 fail-closed`,
+    );
+  }
+});
+
+// F2-2：处置等待 + 历史验证 Artifact 并存时，等待事实以最新 disposition 为准（配对种类即接受）——
+// 防止旧验证现场掩盖 disposition 等待的配对校验。
+test('restore accepts a disposition wait paired with the right kind even with a stale verification artifact', () => {
+  const { entries, store } = makeStore();
+  entries.push(dispositionWaitRestoreCheckpoint({
+    dispositionType: 'wait_decision',
+    pendingDecisionKind: 'disposition_decision',
+    extraArtifacts: [
+      { kind: 'verification', accepted: true, evidence: ['test:passed'], unverified: [], schemaVersion: 1, runId: 'run-f2', producerKind: 'worker', sourceVersion: 'def-src-v1', nodeExecutionId: 'run-f2.verify.2', workerId: 'w', conclusion: { status: 'accepted', summary: 'ok' } },
+    ],
+  }));
+  // 最新 disposition 是 wait_decision（处置等待现场仍存在），kind 配对正确 → 接受；
+  // 反向场景（无处置等待 + disposition_decision 种类）在 F2-3 覆盖。
+  assert.equal(WorkflowRuntime.restore(makeDefinition(), store, 'run-f2').stage, 'WAITING_FOR_USER');
+});
+
+// F2-3：种类声明了处置等待但现场无任何处置等待（纯验证等待）→ fail-closed（resume 会按错误种类渲染）。
+test('restore rejects a disposition kind declared on a pure verification wait', () => {
+  const { entries, store } = makeStore();
+  entries.push({ customType: 'workflow-run', data: {
+    runId: 'run-f2v', schemaVersion: 1, stage: 'WAITING_FOR_USER', at: 1, id: 'c-f2v', workflowVersion: 'v1', policyDigest: 'd1',
+    pendingDecisionRequest: 'req-f2v', pendingDecisionKind: 'disposition_decision',
+    artifacts: [
+      { kind: 'verification', accepted: true, evidence: ['test:passed'], unverified: [], schemaVersion: 1, runId: 'run-f2v', producerKind: 'worker', sourceVersion: 'def-src-v1', nodeExecutionId: 'run-f2v.verify.1', workerId: 'w', conclusion: { status: 'accepted', summary: 'ok' } },
+    ],
+  } });
+  throwsCode(() => WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v'), 'CHECKPOINT_STATE_INCONSISTENT');
+});
+
+// F2-4：legacy checkpoint（处置等待但缺 pendingDecisionKind）沿用推导回退——接受恢复、kind 保持
+// undefined，不被误拒（“缺字段 legacy 回退”不回归）。
+test('restore accepts a legacy disposition wait without pendingDecisionKind (kind stays undefined)', () => {
+  const { entries, store } = makeStore();
+  entries.push(dispositionWaitRestoreCheckpoint({ dispositionType: 'wait_decision' }));
+  const restored = WorkflowRuntime.restore(makeDefinition(), store, 'run-f2');
+  assert.equal(restored.stage, 'WAITING_FOR_USER');
+  assert.equal(restored.getPendingDecisionKind(), undefined, 'legacy 缺字段回退推导，不虚构等待种类');
+});
+
+// F2-5：合法处置等待（配对种类）不误拒——wait_decision/external_action 各配对应种类均恢复。
+test('restore accepts a disposition wait with the matching pendingDecisionKind', () => {
+  for (const [dispositionType, kind] of [
+    ['wait_decision', 'disposition_decision'],
+    ['external_action', 'external_action_completion'],
+  ] as const) {
+    const { entries, store } = makeStore();
+    entries.push(dispositionWaitRestoreCheckpoint({ dispositionType, pendingDecisionKind: kind }));
+    const restored = WorkflowRuntime.restore(makeDefinition(), store, 'run-f2');
+    assert.equal(restored.stage, 'WAITING_FOR_USER', `${dispositionType} + ${kind} 不得被误拒`);
+    assert.equal(restored.getPendingDecisionKind(), kind);
+  }
+});
+
+// F1：continue_disposition 决策记录（decisionRecord）必须保存用户决定内容（note/reasonCode），
+// 作为 trace 事实（完整 UserDecision Artifact 持久化仍为延后专项）。
+test('decide continue_disposition persists note/reasonCode in the decisionRecord', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-f1rec', () => 21, () => 'gen', { definitionVersion: 'v1', policyDigest: 'd1' });
+  const disposition = await runtime.executeNode(
+    { id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: '等待用户处置决定' } })) },
+    {},
+  );
+  runtime.setPendingDecisionKind('disposition_decision');
+  runtime.transition('WAITING_FOR_USER', disposition.artifact);
+  const requestId = pendingRequest(entries);
+  const result = runtime.decide({ kind: 'user_decision', decision: 'continue_disposition', requestId, note: '用户决定按 mitigation 处置', reasonCode: 'mitigation' });
+  assert.equal(result.outcome, 'reopened');
+  assert.equal(result.toStage, 'DISPOSITION');
+  const written = entries.at(-1)!.data;
+  assert.equal(written.decisionRecord.decision, 'continue_disposition');
+  assert.equal(written.decisionRecord.note, '用户决定按 mitigation 处置', 'decisionRecord 必须保存 note（trace 事实）');
+  assert.equal(written.decisionRecord.reasonCode, 'mitigation', 'decisionRecord 必须保存 reasonCode（trace 事实）');
+  assert.equal(written.decisionReasonCode, 'mitigation', '平铺 decisionReasonCode 同步保存');
+});
+
+// S3/F1：isDecisionRecord 值域与 DecisionRecord 类型同步（含 continue_disposition）后，ACCEPTED
+// 恢复仍只认 approve 决策记录——continue_disposition 记录即使形状合法也不构成验收（approve 门禁
+// 不被新值域削弱）；带 note/reasonCode 的合法 approve 记录不因新字段被拒。
+test('ACCEPTED restore still requires an approve decision record (continue_disposition never passes)', async () => {
+  const { entries, store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-s3', () => 21, () => 'gen', { definitionVersion: 'v1', policyDigest: 'd1' });
+  await runtime.executeNode({ id: 'intake', worker: bareWorker(() => ({ kind: 'intake', summary: '白屏', overview: '登录后白屏' })) }, {});
+  runtime.transition('INVESTIGATING');
+  const disposition = (await runtime.executeNode({ id: 'disposition', worker: bareWorker(() => ({ kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: 'config', risks: [], verificationTarget: 'tests', conclusion: { status: 'accepted', summary: 'no repo change' } })) }, {})).artifact;
+  runtime.transition('DISPOSITION', disposition);
+  const verification = (await runtime.executeNode({ id: 'verify', worker: bareWorker(() => ({ kind: 'verification', accepted: true, evidence: ['test:passed'] })) }, {})).artifact;
+  runtime.transition('WAITING_FOR_USER', verification);
+  const requestId = pendingRequest(entries);
+  runtime.decide({ kind: 'user_decision', decision: 'approve', requestId, note: '批准备注', reasonCode: 'accept' });
+  assert.equal(runtime.stage, 'ACCEPTED');
+  const written = entries.at(-1)!.data;
+  // 合法 approve 记录携带 note/reasonCode 不破坏 ACCEPTED 恢复。
+  assert.equal(written.decisionRecord.note, '批准备注');
+  assert.equal(written.decisionRecord.reasonCode, 'accept');
+  assert.equal(WorkflowRuntime.restore(makeDefinition(), store, 'run-s3', { expectedWorkflowVersion: 'v1', expectedPolicyDigest: 'd1' }).stage, 'ACCEPTED');
+  // 把决策记录换成 continue_disposition（形状合法、含决定内容）→ 仍不是可验证的 approve 验收事实。
+  const tamperedStore = new PiSessionRunStore(
+    { getEntries: () => [{ customType: 'workflow-run', data: { ...written, decisionRecord: { ...written.decisionRecord, decision: 'continue_disposition', note: '用户决定继续', reasonCode: undefined } } }] },
+    () => {},
+  );
+  throwsCode(
+    () => WorkflowRuntime.restore(makeDefinition(), tamperedStore, 'run-s3', { expectedWorkflowVersion: 'v1', expectedPolicyDigest: 'd1' }),
+    'ACCEPTED_CHECKPOINT_INCOMPLETE',
+  );
 });
 
 // 25. P2-2：决策 Artifact 声明了与 decisionRecord/平铺字段不同的候选版本 → ACCEPTED 验收不成立。

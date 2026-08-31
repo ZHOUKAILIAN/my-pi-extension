@@ -71,6 +71,7 @@ const verificationShape = (opts: { accepted?: boolean; rev?: string; failure?: {
 function commandHarness(opts: { answers?: any[]; input?: string; selects?: string[] } = {}) {
   const entries: any[] = [];
   const notifications: string[] = [];
+  const workerCalls: { task: unknown; capsule: Record<string, unknown> }[] = [];
   let handler: any;
   let calls = 0;
   let inputAnswer = opts.input ?? '';
@@ -78,7 +79,7 @@ function commandHarness(opts: { answers?: any[]; input?: string; selects?: strin
   const answers = opts.answers ?? [];
   const pi: any = {
     on: () => {},
-    fixWorker: { execute: async () => answers[calls++] },
+    fixWorker: { execute: async (_node: unknown, _task: unknown, capsule: Record<string, unknown>) => { workerCalls.push({ task: _task, capsule }); return answers[calls++]; } },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
     sendMessage: () => {},
     registerCommand: (_name: string, def: any) => { handler = def.handler; },
@@ -103,6 +104,7 @@ function commandHarness(opts: { answers?: any[]; input?: string; selects?: strin
     entries,
     notifications,
     ctx,
+    workerCalls,
     setInput: (value: string) => { inputAnswer = value; },
   };
 }
@@ -316,4 +318,149 @@ test('change_review 通过但未绑定当前 implementation 版本（rev 不匹�
   assert.ok(h.notifications.some((text) => text.includes('CHANGE_REVIEW_NOT_BOUND')), `notifications: ${h.notifications.join(' | ')}`);
   const pending = h.entries.find((entry) => entry.customType === 'workflow-decision-pending');
   assert.equal(pending, undefined, '未绑定评审不得进入人工验收等待');
+});
+// ---- D3/D5：处置等待（wait_decision / external_action）与正式方案评审安全门 ----
+
+const dispositionWaitShape = (dispositionType: 'wait_decision' | 'external_action', requiresFormalPlanReview?: boolean) => ({
+  kind: 'disposition',
+  dispositionType,
+  requiresRepositoryChange: false,
+  minimalScope: '无',
+  risks: [],
+  verificationTarget: dispositionType === 'wait_decision' ? '用户确认处置方向' : '外部动作完成后复测',
+  ...(requiresFormalPlanReview !== undefined ? { requiresFormalPlanReview } : {}),
+  conclusion: {
+    status: 'accepted',
+    summary: dispositionType === 'wait_decision' ? '等待用户处置决定' : '等待外部动作完成',
+  },
+});
+
+const waitingCheckpoints = (h: ReturnType<typeof commandHarness>) =>
+  h.entries
+    .filter((entry) => entry.customType === 'workflow-run' && entry.data.stage === 'WAITING_FOR_USER')
+    .map((entry) => entry.data.pendingDecisionKind);
+
+test('D3 wait_decision：处置先停 WAITING_FOR_USER（disposition_decision），继续后回 DISPOSITION 重落地再到 ACCEPTED', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('wait_decision'),
+      dispositionShape(false),
+      verificationShape(),
+    ],
+    selects: ['继续（已作出处置决定）', '通过并接受'],
+    // F1：continue_disposition 必须携带用户处置决定内容（UI input 收集为 note）。
+    input: '用户确认按 remediation 处置，无需仓库变更',
+  });
+  await h.run();
+  assert.equal(h.calls(), 6);
+  assert.deepEqual(waitingCheckpoints(h), ['disposition_decision', 'final_acceptance'], '首个等待应为 disposition_decision，终验等待应为 final_acceptance');
+  assert.equal(lastStage(h), 'ACCEPTED');
+  const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
+  assert.ok(report, 'workflow-fix-report missing');
+});
+
+// F1：continue_disposition 携带的处置决定内容必须被重跑的 disposition worker 读到（瞬态 capsule
+// 传递），否则 wait_decision 继续后仍只带原始 problem，处置方向无法落地。
+test('F1 wait_decision：continue_disposition 的决定内容传给重跑的 disposition worker（capsule.userDecision）', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('wait_decision'),
+      dispositionShape(false),
+      verificationShape(),
+    ],
+    selects: ['继续（已作出处置决定）', '通过并接受'],
+    input: '用户决定按 mitigation 处置：仅文档说明，不做仓库变更',
+  });
+  await h.run();
+  assert.equal(lastStage(h), 'ACCEPTED');
+  // disposition worker 执行两次：首次产出 wait_decision（无内容），继续后重跑（携带用户决定）。
+  const dispositionCalls = h.workerCalls
+    .map((call, index) => ({ index, ...call }))
+    .filter((call) => (call.capsule as { nodeExecutionId?: string })?.nodeExecutionId?.includes('.disposition.'));
+  assert.equal(dispositionCalls.length, 2, 'disposition worker 应执行两次（等待 + 继续后重跑）');
+  const rerun = dispositionCalls.at(-1)!;
+  assert.deepEqual(
+    (rerun.capsule as { userDecision?: unknown }).userDecision,
+    { decision: 'continue_disposition', note: '用户决定按 mitigation 处置：仅文档说明，不做仓库变更' },
+    '重跑的 disposition worker 必须读到用户 continue_disposition 的决定内容',
+  );
+  // 决策记录（decisionRecord）作为 trace 事实保存决定内容。
+  const decisionRecord = h.entries
+    .filter((entry) => entry.customType === 'workflow-run' && entry.data.decisionRecord?.decision === 'continue_disposition')
+    .at(-1)?.data.decisionRecord;
+  assert.ok(decisionRecord, 'decisionRecord（continue_disposition）应随 checkpoint 落盘');
+  assert.equal(decisionRecord.note, '用户决定按 mitigation 处置：仅文档说明，不做仓库变更');
+});
+
+// F1：UI 无输入能力（input 缺省）时不强制 note，继续处置仍可完成（由调用方保证携带内容）。
+test('F1 wait_decision：input 不可用时 continue_disposition 不强制 note 仍可继续', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('wait_decision'),
+      dispositionShape(false),
+      verificationShape(),
+    ],
+    selects: ['继续（已作出处置决定）', '通过并接受'],
+  });
+  // 模拟宿主无 input 能力：替换 ctx.ui.input 为 undefined，collectDecision 跳过 note 收集。
+  h.ctx.ui.input = undefined;
+  await h.run();
+  assert.equal(lastStage(h), 'ACCEPTED');
+  // 无 note：重跑的 disposition worker 拿到空 userDecision（decision 标记 + 无内容），不退化为错误输入。
+  const rerunCapsule = h.workerCalls
+    .map((call) => call.capsule)
+    .filter((capsule) => (capsule as { nodeExecutionId?: string })?.nodeExecutionId?.includes('.disposition.'))
+    .at(-1) as Record<string, unknown>;
+  assert.deepEqual(
+    (rerunCapsule as { userDecision?: unknown }).userDecision,
+    { decision: 'continue_disposition' },
+    'input 不可用时重跑的 disposition worker 仍应收到 continue_disposition 标记（无 note）',
+  );
+});
+
+test('D3 external_action：处置先停 WAITING_FOR_USER（external_action_completion），继续后无仓库变更回 VERIFYING 复测再到 ACCEPTED', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('external_action'),
+      verificationShape(),
+    ],
+    selects: ['继续（外部动作已完成）', '通过并接受'],
+    input: '外部动作已完成：权限已由管理员开通',
+  });
+  await h.run();
+  // 不回流 IMPLEMENTING：实现 worker 不得被调用（calls=5）。
+  assert.equal(h.calls(), 5);
+  assert.deepEqual(waitingCheckpoints(h), ['external_action_completion', 'final_acceptance'], '首个等待应为 external_action_completion，终验等待应为 final_acceptance');
+  assert.equal(lastStage(h), 'ACCEPTED');
+});
+
+test('D5 requiresFormalPlanReview=true：处置后 BLOCKED 并写 blocker，不直进 IMPLEMENTING/VERIFYING', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('wait_decision', true),
+    ],
+  });
+  await h.run();
+  // 只执行 intake/investigate/investigation_review/disposition：不得再调用任何实现或验证 worker。
+  assert.equal(h.calls(), 4);
+  assert.equal(lastStage(h), 'BLOCKED');
+  const blocker = h.entries.find((entry) => entry.customType === 'workflow-blocker');
+  assert.ok(blocker, 'workflow-blocker missing');
+  assert.ok(blocker.data.reason.includes('正式方案采纳'), `blocker reason: ${blocker.data.reason}`);
+  assert.ok(h.notifications.some((text) => text.includes('BLOCKED')), `notifications: ${h.notifications.join(' | ')}`);
 });

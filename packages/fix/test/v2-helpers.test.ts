@@ -15,14 +15,21 @@ import {
 // ---- 测试夹具 -------------------------------------------------------------
 
 // 可编程 UI：queue 依次作为 select 的返回值，notices 记录 notify 消息。
+// opts.input 提供时才会暴露 input 能力（否则视为宿主无输入能力，continue_disposition 不强制 note）。
 class FakeUI implements ReviewContextUI {
   hasUI: boolean;
   notices: string[] = [];
   private queue: (string | undefined)[];
+  private inputQueue?: (string | undefined)[];
+  input?: (prompt: string, placeholder?: string) => Promise<string | undefined>;
 
-  constructor(queue: (string | undefined)[] = [], hasUI = true) {
+  constructor(queue: (string | undefined)[] = [], opts: { hasUI?: boolean; input?: (string | undefined)[] } = {}) {
     this.queue = queue;
-    this.hasUI = hasUI;
+    this.hasUI = opts.hasUI ?? true;
+    if (opts.input !== undefined) {
+      this.inputQueue = opts.input;
+      this.input = async (_prompt: string, _placeholder?: string) => this.inputQueue?.shift();
+    }
   }
 
   notify(msg: string, _type?: 'info' | 'warning' | 'error'): void {
@@ -71,6 +78,8 @@ test('FIX_REVIEW_ACTIONS 与 FIX_REVIEW_REASONS 常量符合语义映射', () =>
     '打回（选择原因）': 'request-changes',
     '拒绝': 'reject',
     '继续验证（配置已修改）': 'continue-verification',
+    '继续（已作出处置决定）': 'continue-disposition',
+    '继续（外部动作已完成）': 'continue-disposition',
   });
   assert.deepEqual(FIX_REVIEW_REASONS, {
     '根因或影响面判断错误': 'root_cause_or_impact',
@@ -103,6 +112,35 @@ test('collectDecision 选择拒绝 → reject', async () => {
   const result = await collectDecision(ui, { requestId: 'req-1' });
   assert.equal(result?.decision, 'reject');
   assert.equal(result?.reasonCode, undefined);
+});
+
+test('collectDecision 处置继续动作 → continue_disposition（两种文案同一决策值）', async () => {
+  for (const label of ['继续（已作出处置决定）', '继续（外部动作已完成）']) {
+    const ui = new FakeUI([label]);
+    const result = await collectDecision(ui, { requestId: 'req-1' });
+    assert.equal(result?.decision, 'continue_disposition', `${label} 应映射为 continue_disposition`);
+    assert.equal(result?.reasonCode, undefined);
+    // FakeUI 无 input 能力：continue_disposition 不强制 note（由调用方保证携带内容）。
+    assert.equal(result?.note, undefined);
+  }
+});
+
+// F1：有输入能力时 continue-disposition 必须携带用户处置决定内容（note）——决定内容将被瞬态传给
+// 重跑的 disposition worker；空输入视为整体放弃（保持 WAITING_FOR_USER，不无内容继续）。
+test('collectDecision 处置继续动作 + input 提供决定内容 → continue_disposition 携带 note', async () => {
+  const ui = new FakeUI(['继续（已作出处置决定）'], { input: ['用户决定按 mitigation 处置'] });
+  const result = await collectDecision(ui, { requestId: 'req-1' });
+  assert.equal(result?.decision, 'continue_disposition');
+  assert.equal(result?.note, '用户决定按 mitigation 处置');
+});
+
+test('collectDecision 处置继续动作 + input 空/取消 → 整体放弃（保持等待）', async () => {
+  // input 返回 undefined（取消）→ 放弃
+  const cancelInput = new FakeUI(['继续（已作出处置决定）'], { input: [undefined] });
+  assert.equal(await collectDecision(cancelInput, { requestId: 'req-1' }), undefined);
+  // input 返回空白串 → 放弃
+  const blankInput = new FakeUI(['继续（已作出处置决定）'], { input: ['   '] });
+  assert.equal(await collectDecision(blankInput, { requestId: 'req-1' }), undefined);
 });
 
 test('collectDecision 打回 + 各原因文案 → request_changes 且映射正确 reasonCode', async () => {

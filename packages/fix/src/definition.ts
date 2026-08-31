@@ -243,11 +243,29 @@ export const fixDefinitionV2: WorkflowDefinition = {
       case 'DISPOSITION->IMPLEMENTING': {
         const disposition = requireArtifactKind(artifact, 'disposition', () => failTransition(from, to, 'REPOSITORY_CHANGE_NOT_DECLARED'));
         if (disposition.requiresRepositoryChange !== true) failTransition(from, to, 'REPOSITORY_CHANGE_NOT_DECLARED');
+        // D3/D5 防御纵深：需用户决定或外部动作的处置不得直进 IMPLEMENTING（必须先停
+        // WAITING_FOR_USER）；声明需要正式方案评审的处置必须先走 Core 正式方案采纳流程（未实现时
+        // 一律 BLOCKED，见 extension-v2 DISPOSITION 分支），不得静默进实现。
+        if (disposition.dispositionType === 'wait_decision' || disposition.dispositionType === 'external_action') failTransition(from, to, 'DISPOSITION_WAITING_REQUIRED');
+        if (disposition.requiresFormalPlanReview === true) failTransition(from, to, 'FORMAL_PLAN_REVIEW_REQUIRED');
         break;
       }
       case 'DISPOSITION->VERIFYING': {
         const disposition = requireArtifactKind(artifact, 'disposition', () => failTransition(from, to, 'REPOSITORY_CHANGE_STATE_MISMATCH'));
         if (disposition.requiresRepositoryChange !== false) failTransition(from, to, 'REPOSITORY_CHANGE_STATE_MISMATCH');
+        // D3/D5 防御纵深（同上）：wait_decision / external_action 处置必须先停 WAITING_FOR_USER
+        //（无用户决定/外部完成证据不得进 VERIFYING）；requiresFormalPlanReview 处置不得静默进验证。
+        if (disposition.dispositionType === 'wait_decision' || disposition.dispositionType === 'external_action') failTransition(from, to, 'DISPOSITION_WAITING_REQUIRED');
+        if (disposition.requiresFormalPlanReview === true) failTransition(from, to, 'FORMAL_PLAN_REVIEW_REQUIRED');
+        break;
+      }
+      case 'DISPOSITION->WAITING_FOR_USER': {
+        // D3：处置需要用户决定（wait_decision）或外部动作完成（external_action）时，先进入
+        // WAITING_FOR_USER 等待（pendingDecisionKind = disposition_decision / external_action_completion）；
+        // 声明需要正式方案评审的处置不得走该等待边（B5：先 BLOCKED，正式方案流程未实现）。
+        const disposition = requireArtifactKind(artifact, 'disposition', () => failTransition(from, to, 'NOT_DISPOSITION_WAITING'));
+        if (disposition.dispositionType !== 'wait_decision' && disposition.dispositionType !== 'external_action') failTransition(from, to, 'NOT_DISPOSITION_WAITING');
+        if (disposition.requiresFormalPlanReview === true) failTransition(from, to, 'FORMAL_PLAN_REVIEW_REQUIRED');
         break;
       }
       case 'DISPOSITION->BLOCKED':
@@ -295,13 +313,19 @@ export const fixDefinitionV2: WorkflowDefinition = {
       }
       case 'WAITING_FOR_USER->DISPOSITION': {
         const decision = requireArtifactKind(artifact, 'user_decision', () => failTransition(from, to, 'REASON_NOT_DISPOSITION_ERROR'));
-        if (decision.decision !== 'request_changes' || decision.reasonCode !== 'requirement_disposition_error') failTransition(from, to, 'REASON_NOT_DISPOSITION_ERROR');
+        // 两种合法出口：打回（需求/处置方式错误）→ DISPOSITION 重做处置；
+        // continue_disposition（用户已给出处置决定 / 外部动作已完成）→ DISPOSITION 落地新处置。
+        if (decision.decision !== 'continue_disposition'
+          && (decision.decision !== 'request_changes' || decision.reasonCode !== 'requirement_disposition_error')) {
+          failTransition(from, to, 'REASON_NOT_DISPOSITION_ERROR');
+        }
         break;
       }
       case 'WAITING_FOR_USER->VERIFYING': {
         const decision = requireArtifactKind(artifact, 'user_decision', () => failTransition(from, to, 'NOT_CONTINUE_VERIFICATION'));
-        // 配置类验证失败后的继续验证动作：只能回 VERIFYING，不能代替 approve，也不能回流 IMPLEMENTING。
-        if (decision.decision !== 'continue_verification') failTransition(from, to, 'NOT_CONTINUE_VERIFICATION');
+        // 配置类验证失败后的继续验证动作（只能回 VERIFYING），或外部动作完成等待的继续
+        //（外部动作已补完成证据，回 VERIFYING 按处置验证目标验证既有现场）。
+        if (decision.decision !== 'continue_verification' && decision.decision !== 'continue_disposition') failTransition(from, to, 'NOT_CONTINUE_VERIFICATION');
         break;
       }
       case 'WAITING_FOR_USER->BLOCKED': {

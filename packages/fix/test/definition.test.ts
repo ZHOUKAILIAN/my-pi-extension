@@ -180,6 +180,64 @@ test('VERIFYING->BLOCKED 仍需 guard_rejection 证据', () => {
   );
 });
 
+// D3：处置自动等待的状态机边界（需要用户决定 / 外部动作完成的处置先停 WAITING_FOR_USER）。
+test('DISPOSITION->WAITING_FOR_USER 只允许 wait_decision / external_action 处置', () => {
+  const waitDecision: Artifact = {
+    kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认处置方向', conclusion: { status: 'accepted', summary: '等待用户处置决定' },
+  };
+  const externalAction: Artifact = {
+    kind: 'disposition', dispositionType: 'external_action', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '外部动作完成后复测', conclusion: { status: 'accepted', summary: '等待外部动作完成' },
+  };
+  const remediation: Artifact = {
+    kind: 'disposition', dispositionType: 'remediation', requiresRepositoryChange: false, minimalScope: 'a.ts', risks: [], verificationTarget: 'tests', conclusion: { status: 'accepted', summary: '常规修复' },
+  };
+  fixDefinitionV2.guard('DISPOSITION', 'WAITING_FOR_USER', waitDecision);
+  fixDefinitionV2.guard('DISPOSITION', 'WAITING_FOR_USER', externalAction);
+  assert.throws(() => fixDefinitionV2.guard('DISPOSITION', 'WAITING_FOR_USER', remediation), /NOT_DISPOSITION_WAITING/);
+  // B5：声明正式方案评审的处置不得走等待边（先 BLOCKED）。
+  assert.throws(
+    () => fixDefinitionV2.guard('DISPOSITION', 'WAITING_FOR_USER', { ...waitDecision, requiresFormalPlanReview: true }),
+    /FORMAL_PLAN_REVIEW_REQUIRED/,
+  );
+});
+
+// D3/D5 防御纵深：wait_decision / external_action 与 requiresFormalPlanReview 不得直进 IMPLEMENTING/VERIFYING。
+test('DISPOSITION->IMPLEMENTING / ->VERIFYING 拒绝需等待的处置与正式方案评审声明', () => {
+  const waitDecision: Artifact = {
+    kind: 'disposition', dispositionType: 'wait_decision', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '用户确认', conclusion: { status: 'accepted', summary: '等待用户' },
+  };
+  const externalAction: Artifact = {
+    kind: 'disposition', dispositionType: 'external_action', requiresRepositoryChange: false, minimalScope: '无', risks: [], verificationTarget: '外部完成后复测', conclusion: { status: 'accepted', summary: '等待外部' },
+  };
+  assert.throws(() => fixDefinitionV2.guard('DISPOSITION', 'VERIFYING', waitDecision), /DISPOSITION_WAITING_REQUIRED/);
+  assert.throws(() => fixDefinitionV2.guard('DISPOSITION', 'VERIFYING', externalAction), /DISPOSITION_WAITING_REQUIRED/);
+  assert.throws(() => fixDefinitionV2.guard('DISPOSITION', 'IMPLEMENTING', { ...dispositionChange, requiresFormalPlanReview: true }), /FORMAL_PLAN_REVIEW_REQUIRED/);
+  assert.throws(() => fixDefinitionV2.guard('DISPOSITION', 'VERIFYING', { ...dispositionChange, requiresRepositoryChange: false, requiresFormalPlanReview: true }), /FORMAL_PLAN_REVIEW_REQUIRED/);
+  // 常规处置不受影响（与既有语义一致）。
+  fixDefinitionV2.guard('DISPOSITION', 'IMPLEMENTING', dispositionChange);
+  fixDefinitionV2.guard('DISPOSITION', 'VERIFYING', { ...dispositionChange, requiresRepositoryChange: false });
+});
+
+// D3：continue_disposition 是处置等待的继续出口（回 DISPOSITION 重落地处置）。
+test('WAITING_FOR_USER->DISPOSITION 允许 continue_disposition 与需求/处置错误打回', () => {
+  const continueDecision: Artifact = { kind: 'user_decision', decision: 'continue_disposition', requestId: 'req-1' };
+  const dispositionError: Artifact = { kind: 'user_decision', decision: 'request_changes', requestId: 'req-1', reasonCode: 'requirement_disposition_error' };
+  const wrongDecision: Artifact = { kind: 'user_decision', decision: 'request_changes', requestId: 'req-1', reasonCode: 'fix_incomplete_or_regression' };
+  fixDefinitionV2.guard('WAITING_FOR_USER', 'DISPOSITION', continueDecision);
+  fixDefinitionV2.guard('WAITING_FOR_USER', 'DISPOSITION', dispositionError);
+  assert.throws(() => fixDefinitionV2.guard('WAITING_FOR_USER', 'DISPOSITION', wrongDecision), /REASON_NOT_DISPOSITION_ERROR/);
+});
+
+// D3：外部动作完成等待的继续出口（无仓库变更回 VERIFYING 验证既有现场）。
+test('WAITING_FOR_USER->VERIFYING 允许 continue_disposition 与 continue_verification，拒绝 approve', () => {
+  const continueDecision: Artifact = { kind: 'user_decision', decision: 'continue_disposition', requestId: 'req-1' };
+  const continueVerification: Artifact = { kind: 'user_decision', decision: 'continue_verification', requestId: 'req-1' };
+  const approve: Artifact = { kind: 'user_decision', decision: 'approve', requestId: 'req-1' };
+  fixDefinitionV2.guard('WAITING_FOR_USER', 'VERIFYING', continueDecision);
+  fixDefinitionV2.guard('WAITING_FOR_USER', 'VERIFYING', continueVerification);
+  assert.throws(() => fixDefinitionV2.guard('WAITING_FOR_USER', 'VERIFYING', approve), /NOT_CONTINUE_VERIFICATION/);
+});
+
 test('fixDefinitionV2.transition 不公开接受 WAITING_FOR_USER->ACCEPTED', () => {
   // 即使带合法 approve 决策（含候选版本）也不能通过 Definition 公开接口进入 ACCEPTED。
   assert.throws(
