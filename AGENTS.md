@@ -73,7 +73,6 @@
 - **所有 coding 修改必须经过 `implementer` → `code_reviewer` 流程**：只要任务需要产生源码、测试、脚本、构建/运行配置或 UI 的代码 diff，不论入口名称、规模、技术栈或是否为简单修复，都必须先由 `implementer` subagent 执行代码改动，再启动独立的 `code_reviewer` agent 进行代码评审；不因改动规模小、测试已通过或实现者自检通过而跳过。纯文档、纯调查、只读评审或未修改代码的任务不适用本条。
 - `implementer` 负责所有 coding 改动及自检，不能替代 `code_reviewer`；`code_reviewer` 负责独立检查需求符合度、仓库规范、状态/合同/版本/恢复/审计风险和测试覆盖。
 - `code_reviewer` 发现 P0/P1 或需要修复的 P2 后，必须由实现者修复，并对修复后的代码再次执行 `code_reviewer`；未完成复审不得将代码实现标记为完成。
-- 复审必须增量进行：只 review 本轮实现者改动的文件与上一轮 findings 的修复，不重新全量 review 整个工作树；实现者在每轮评审通过后本地 commit（不 push）作为下一轮评审的固定点。
 - 评审收敛边界：P2 坏味道类 finding 允许接受不修并记入 backlog/drift，不强制触发新一轮复审；同一变更最多复审 3 轮，超出后剩余 finding 记入 drift 表并交人工决策，不再自动循环。
 - 合并前至少运行：
 
