@@ -1,0 +1,14 @@
+{
+  "name": "@pi/fix-metrics-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Fix Metrics server slice (production-shaped, synthetic-data-only PoC): allowlisted event ingest with idempotency/quarantine, D1-backed store, latest snapshot + funnel API. NOT wired to real /fix telemetry.",
+  "main": "src/worker.ts",
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
