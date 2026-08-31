@@ -41,7 +41,7 @@ workflow-contracts
 
 顶层 Extension 拥有业务 Workflow Definition；共享 Runtime 不应内置 Feature/Fix 的具体状态图或验收标准。
 
-当前原型仍将 `fixDefinition` 放在 `workflow-runtime` 中，这是待拆分的 L1/L2 owner drift，见[实现地图](README.md#已知-l1--l2-drift)。
+当前原型仍将 Fix 业务执行门禁（review kind 映射、check satisfier、change_plan_review gate）与 legacy `fixNodes` 三节点构造器放在 `workflow-runtime` 中；`fixDefinition` 已移出产品源码（仅存 `test/fixtures/legacy-fix-definition.ts`），这是待拆分的 L1/L2 owner drift，见[实现地图](README.md#已知-l1--l2-drift)。
 
 ## 3. 目标可执行 Definition 边界
 

@@ -26,7 +26,7 @@ export class WorkerArtifactSubmissionError extends Error {
 const artifactSchema = {
   type: 'object',
   properties: {
-    kind: { type: 'string', enum: ['investigation', 'implementation', 'verification'] },
+    kind: { type: 'string', enum: ['investigation', 'implementation', 'verification', 'intake', 'investigation_review', 'disposition', 'change_plan_review', 'change_review', 'user_decision'] },
     route: { type: 'string', enum: ['local_fix', 'requirement_change', 'design_change', 'needs_more_evidence', 'blocked'] },
     rootCause: { type: 'string' },
     accepted: { type: 'boolean' },
@@ -40,8 +40,56 @@ const artifactSchema = {
         prUrl: { type: 'string' },
       },
     },
-    candidateRevision: { type: 'string' },
-    prUrl: { type: 'string' },
+    unverified: { type: 'array', items: { type: 'string' } },
+    checks: { type: 'object' },
+    remainingRisk: { type: 'array', items: { type: 'string' } },
+    conclusion: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['accepted', 'rejected', 'blocked', 'inconclusive', 'needs_more_evidence'] },
+        summary: { type: 'string' },
+      },
+    },
+    // 新 kind 的常用字段；均为宽松提示，严格校验在 validateSubmitArtifact。
+    summary: { type: 'string' },
+    overview: { type: 'string' },
+    environment: { type: 'string' },
+    scope: { type: 'string' },
+    urgency: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
+    failure: {
+      type: 'object',
+      properties: {
+        kind: { type: 'string', enum: ['implementation', 'configuration', 'external_condition'] },
+        reason: { type: 'string' },
+        responsibility: { type: 'string' },
+        resolution: { type: 'string' },
+      },
+    },
+    rootCauseConclusion: { type: 'string' },
+    evidenceSufficiency: { type: 'string', enum: ['sufficient', 'insufficient'] },
+    gaps: { type: 'array', items: { type: 'string' } },
+    dispositionType: { type: 'string', enum: ['remediation', 'mitigation', 'explanation', 'external_action', 'wait_decision', 'change_request', 'insufficient_evidence'] },
+    requiresRepositoryChange: { type: 'boolean' },
+    minimalScope: { type: 'string' },
+    risks: { type: 'array', items: { type: 'string' } },
+    verificationTarget: { type: 'string' },
+    changedScope: { type: 'string' },
+    compatibility: { type: 'array', items: { type: 'string' } },
+    rollback: { type: 'array', items: { type: 'string' } },
+    reviewedRevision: { type: 'string' },
+    findingDisposition: { type: 'string', enum: ['all_closed', 'open'] },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          summary: { type: 'string' },
+          severity: { type: 'string', enum: ['info', 'warning', 'blocker'] },
+          disposition: { type: 'string', enum: ['open', 'closed', 'accepted_with_note'] },
+        },
+      },
+    },
   },
   required: ['kind'],
   additionalProperties: true,
@@ -54,7 +102,15 @@ function submissionContract(nodeId: string): string {
     case 'implement':
       return "Call submit_artifact exactly once with {kind:'implementation', artifact:{summary:string, filesChanged:string[], candidateRevision:string, prUrl?:string}}. candidateRevision is mandatory and must identify the exact revision/diff you changed. Do not claim a commit or PR unless you actually created it.";
     case 'verify':
-      return "Call submit_artifact exactly once with {kind:'verification', accepted:boolean, evidence:string[], candidateRevision:string}. candidateRevision is mandatory and must identify the exact revision verified. Evidence must state what was verified.";
+      return "Call submit_artifact exactly once with {kind:'verification', accepted:boolean, evidence:string[], candidateRevision?:string, failure?:{kind:'implementation'|'configuration'|'external_condition', reason:string, responsibility?:string, resolution?:string}, conclusion:{status:'accepted'|'rejected'|'blocked'|'inconclusive'|'needs_more_evidence', summary:string}}. conclusion is mandatory for v2 workflows when CAPS.requiresArtifactConclusion is true. candidateRevision is mandatory on a repository-change path (CAPS.requiresRepositoryChange is true) and must equal the implementation candidateRevision; on a no-repository-change path it is optional — include the verified baseline/current state version only when it is identifiable (there is no implementation artifact to bind). Evidence must state what was verified. When accepted is false, failure is mandatory: kind 'implementation' means a code/repository change would fix the failure; 'configuration' means the failure is caused by configuration that only the user can change (not a repo change); 'external_condition' means missing permission/environment/external dependency, then include responsibility and resolution for unblocking.";
+    case 'intake':
+      return "Call submit_artifact exactly once with {kind:'intake', summary:string, overview:string, environment?:string, scope?:string, urgency?:'low'|'medium'|'high'|'critical'}. summary must be a one-sentence user-readable problem summary; overview a 2-3 sentence scene, impact and known context. Do not echo the raw problem text verbatim.";
+    case 'investigation_review':
+      return "Call submit_artifact exactly once with {kind:'investigation_review', rootCauseConclusion:string, evidenceSufficiency:'sufficient'|'insufficient', gaps:string[], conclusion:{status:'accepted'|'rejected'|'blocked'|'inconclusive'|'needs_more_evidence', summary:string}}. conclusion must summarize the review verdict.";
+    case 'change_plan_review':
+      return "Call submit_artifact exactly once with {kind:'change_plan_review', rootCauseAlignment:boolean, changedScope:string, risks:string[], compatibility:string[], verification:string[], rollback:string[], findings:{id:string, summary:string, severity?:'info'|'warning'|'blocker', disposition?:'open'|'closed'|'accepted_with_note'}[], conclusion:{status, summary}}. findings must list each review check.";
+    case 'change_review':
+      return "Call submit_artifact exactly once with {kind:'change_review', reviewedRevision?:string, prRef?:string, findings:{id:string, summary:string, severity?:'info'|'warning'|'blocker', disposition?:'open'|'closed'|'accepted_with_note'}[], findingDisposition:'all_closed'|'open', conclusion:{status, summary}}. findingDisposition must reflect whether all findings are closed.";
     default:
       return 'Call submit_artifact exactly once with the valid structured artifact for this workflow node.';
   }
@@ -76,6 +132,9 @@ function extractStructuredArtifact(text: string): unknown | undefined {
 }
 
 function workerPrompt(node: NodeDefinition, task: unknown, capsule: Capsule, retryMessage?: string): string {
+  const candidateRevisionRequired = capsule.requiresRepositoryChange === true
+    ? 'candidateRevision is mandatory and must equal the implementation candidateRevision (the exact revision verified).'
+    : 'candidateRevision is optional on this no-repository-change path; include the verified baseline/current state version only when it is identifiable.';
   const retryInstruction = retryMessage
     ? `\n${retryMessage}\nDo not answer with ordinary text. Call submit_artifact now.`
     : '';
@@ -83,10 +142,14 @@ function workerPrompt(node: NodeDefinition, task: unknown, capsule: Capsule, ret
     'You are executing one controlled workflow node.',
     submissionContract(node.id),
     'Do the investigation or implementation using the enabled tools. A text response is not a completion.',
+    capsule.requiresArtifactConclusion === true
+      ? 'This is a v2 workflow: conclusion.status and conclusion.summary are mandatory and must be your real business conclusion; the Runtime will not invent them.'
+      : 'This legacy-compatible workflow may omit conclusion; the Runtime will not invent a missing conclusion.',
     'Before ending, call submit_artifact exactly once with the final structured result, then stop.',
     'If submit_artifact is unavailable, the only accepted text fallback is exactly one fenced block: ```fix-artifact followed by one JSON object satisfying the same contract, then ```.',
     `TASK:\n${String(task)}`,
     `CAPSULE:\n${JSON.stringify(capsule)}`,
+    node.id === 'verify' ? candidateRevisionRequired : '',
     retryInstruction,
   ].join('\n');
 }
@@ -94,6 +157,7 @@ function workerPrompt(node: NodeDefinition, task: unknown, capsule: Capsule, ret
 /** 真实 SDK adapter；model/factory 显式注入，避免无模型时误调用 prompt。 */
 export class PiSdkWorkerExecutor implements WorkerExecutor {
   private readonly options: {
+    workerId?: string;
     model?: unknown;
     thinkingLevel?: unknown;
     skills?: string[];
@@ -104,6 +168,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
   };
 
   constructor(options: {
+    workerId?: string;
     model?: unknown;
     thinkingLevel?: unknown;
     skills?: string[];
@@ -114,6 +179,9 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
   } = {}) {
     this.options = options;
   }
+
+  // WorkerExecutor 接口 getter：execute 内不依赖它，仅暴露可审计的身份。
+  get workerId(): string | undefined { return this.options.workerId; }
 
   async execute(node: NodeDefinition, task: unknown, capsule: Capsule): Promise<Artifact> {
     let captured: Artifact | undefined;
