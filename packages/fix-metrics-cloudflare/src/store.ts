@@ -31,8 +31,20 @@ export interface Statement {
   all<T extends SqlRow>(...params: SqlValue[]): Promise<T[]>;
 }
 
+/** One statement of an atomic multi-statement write. */
+export interface BatchStatement {
+  sql: string;
+  params: SqlValue[];
+}
+
 export interface SqlDatabase {
   prepare(sql: string): Statement;
+  // Execute every statement as ONE atomic unit (D1 batch semantics: sequential execution inside
+  // an implicit transaction; a failing statement rolls the whole unit back). Returns the
+  // `changes` count of each statement in order. The publication pointer + published-revision
+  // history writes depend on this guarantee (review P1.1): a partial failure must never leave a
+  // pointer without its history row (or a history row without its pointer).
+  transaction(statements: BatchStatement[]): Promise<number[]>;
 }
 
 export type InsertOutcome =
@@ -324,6 +336,21 @@ export class MetricStore {
     return row ? rowToAcceptedEvent(row) : undefined;
   }
 
+  // Acceptance-evidence gate for run_accepted (review P1.5): a run_accepted fact is only coherent
+  // when the Acceptance facts this slice models — an accepted verification_passed for the SAME
+  // run — are already stored (the human decision record is a later slice; verification_passed is
+  // the modeled evidence here). Fail closed: a bare valid-shape run_accepted without prior
+  // Acceptance evidence for its run is rejected at ingest, never silently accepted.
+  async hasAcceptedVerificationPassed(runId: string): Promise<boolean> {
+    const row = await this.db
+      .prepare(
+        `SELECT 1 AS hit FROM fix_metric_events
+         WHERE event_type = 'verification_passed' AND run_id = ? LIMIT 1`,
+      )
+      .first(runId);
+    return Boolean(row);
+  }
+
   // -------------------------------------------------------------------------
   // Snapshots
   // -------------------------------------------------------------------------
@@ -452,11 +479,14 @@ export class MetricStore {
   // the pointer may still only move forward in as-of time, never to an earlier point.
   //
   // Published-revision history (P1.5): every revision that wins the pointer write is also
-  // recorded in fix_metric_snapshot_publication_history. The history is what keeps an EARLIER
-  // published revision readable by its snapshotId after the pointer moves on, while a same-window
-  // row that was stored but NEVER published stays invisible. `publishedAt` is the validated
-  // server-controlled clock: invalid/NaN/non-ISO values fail closed (invalid_server_now), never
-  // silently pass the future-publication gate.
+  // recorded in fix_metric_snapshot_publication_history. Pointer update and history insert run as
+  // ONE atomic transaction on the adapter's batch/transaction API (review P1.1): a partial
+  // failure rolls BOTH back, so a pointer can never exist without its history row (and a history
+  // row can never exist for a revision the pointer does not (or no longer) carries). The history
+  // statement is made conditional INSIDE the same transaction: it only inserts when the pointer
+  // row now points at this revision, so a lost CAS race inserts no history either.
+  // `publishedAt` is the validated server-controlled clock: invalid/NaN/non-ISO values fail closed
+  // (invalid_server_now), never silently pass the future-publication gate.
   async publishRevision(
     windowStart: string,
     windowEnd: string,
@@ -484,19 +514,19 @@ export class MetricStore {
       return false;
     }
 
-    const casUpdate = async (expectedGeneration: number): Promise<boolean> => {
-      const updated = await this.db
-        .prepare(
-          `UPDATE fix_metric_snapshot_publication
-           SET published_snapshot_id = ?, snapshot_at = ?, publication_generation = publication_generation + 1, updated_at = ?, published_at = ?
-           WHERE window_start = ? AND window_end = ? AND snapshot_at <= ? AND definition_version = ? AND publication_generation = ?`,
-        )
-        .run(
-          snapshotId, snapshotAt, publishedAt, publishedAt, windowStart, windowEnd, snapshotAt, definitionVersion,
-          expectedGeneration,
-        );
-      return updated.changes > 0;
-    };
+    // The history insert is conditional on the pointer write having landed for THIS revision: the
+    // WHERE EXISTS sees the pointer state left by the first statement of the SAME transaction.
+    const historyInsert = `INSERT OR IGNORE INTO fix_metric_snapshot_publication_history (
+       window_start, window_end, definition_version, snapshot_id, snapshot_at, published_at
+     ) SELECT ?, ?, ?, ?, ?, ?
+       WHERE EXISTS (
+         SELECT 1 FROM fix_metric_snapshot_publication
+         WHERE window_start = ? AND window_end = ? AND definition_version = ? AND published_snapshot_id = ?
+       )`;
+    const historyParams = (targetSnapshotId: string): SqlValue[] => [
+      windowStart, windowEnd, definitionVersion, targetSnapshotId, snapshotAt, publishedAt,
+      windowStart, windowEnd, definitionVersion, targetSnapshotId,
+    ];
 
     const existing = await this.getPublication(windowStart, windowEnd);
     if (existing) {
@@ -520,24 +550,38 @@ export class MetricStore {
       // The pointer may only advance in as-of time (equal is a rebuild replacement); the
       // generation predicate in the CAS makes a concurrent loser fail closed.
       if (existingTarget.snapshotAt > snapshotAt) return false;
-      const moved = await casUpdate(existing.publicationGeneration);
-      if (moved) await this.recordPublicationHistory(windowStart, windowEnd, definitionVersion, snapshotId, snapshotAt, publishedAt);
-      return moved;
+      // The history row is written in the SAME atomic transaction, conditioned on the pointer now
+      // carrying this revision — a lost CAS race rolls the whole unit back and inserts no history.
+      const [casChanges] = await this.db.transaction([
+        {
+          sql: `UPDATE fix_metric_snapshot_publication
+                SET published_snapshot_id = ?, snapshot_at = ?, publication_generation = publication_generation + 1, updated_at = ?, published_at = ?
+                WHERE window_start = ? AND window_end = ? AND snapshot_at <= ? AND definition_version = ? AND publication_generation = ?`,
+          params: [
+            snapshotId, snapshotAt, publishedAt, publishedAt, windowStart, windowEnd, snapshotAt, definitionVersion,
+            existing.publicationGeneration,
+          ],
+        },
+        { sql: historyInsert, params: historyParams(snapshotId) },
+      ]);
+      return casChanges > 0;
     }
 
     try {
-      const inserted = await this.db
-        .prepare(
-          `INSERT INTO fix_metric_snapshot_publication (
-             window_start, window_end, snapshot_at, definition_version, published_snapshot_id, publication_generation, published_at, updated_at
-           ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
-        )
-        .run(windowStart, windowEnd, snapshotAt, definitionVersion, snapshotId, publishedAt, publishedAt);
-      if (inserted.changes > 0) {
-        await this.recordPublicationHistory(windowStart, windowEnd, definitionVersion, snapshotId, snapshotAt, publishedAt);
-        return true;
-      }
-      return false;
+      // First publication for this window: pointer insert + conditional history insert in one
+      // atomic transaction. A unique-window insert race has exactly one winner; the loser's whole
+      // transaction (including any history write) rolls back and it must not treat its revision
+      // as the published one.
+      const [insertChanges] = await this.db.transaction([
+        {
+          sql: `INSERT INTO fix_metric_snapshot_publication (
+                   window_start, window_end, snapshot_at, definition_version, published_snapshot_id, publication_generation, published_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)`,
+          params: [windowStart, windowEnd, snapshotAt, definitionVersion, snapshotId, publishedAt, publishedAt],
+        },
+        { sql: historyInsert, params: historyParams(snapshotId) },
+      ]);
+      return insertChanges > 0;
     } catch {
       // A unique-window insert race has a winner. Never update that winner from the losing
       // first-insert call; only an idempotent retry for exactly the same target may return true.
@@ -572,28 +616,6 @@ export class MetricStore {
       )
       .first(windowStart, windowEnd, definitionVersion, snapshotId);
     return Boolean(byHistory);
-  }
-
-  // Append-only published-revision history. Best-effort behind the pointer write: the pointer is
-  // always written FIRST so a history-write failure can never create a pointer for a revision
-  // that is not durably recorded as published. (PoC limitation: pointer + history are two
-  // statements, not one transaction; a crash exactly between them loses retained readability of
-  // that one revision — it never exposes an unpublished row.)
-  private async recordPublicationHistory(
-    windowStart: string,
-    windowEnd: string,
-    definitionVersion: string,
-    snapshotId: string,
-    snapshotAt: string,
-    publishedAt: string,
-  ): Promise<void> {
-    await this.db
-      .prepare(
-        `INSERT OR IGNORE INTO fix_metric_snapshot_publication_history (
-           window_start, window_end, definition_version, snapshot_id, snapshot_at, published_at
-         ) VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(windowStart, windowEnd, definitionVersion, snapshotId, snapshotAt, publishedAt);
   }
 }
 

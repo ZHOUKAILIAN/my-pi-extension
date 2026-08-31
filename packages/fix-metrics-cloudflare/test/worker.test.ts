@@ -497,8 +497,9 @@ describe('worker — ingest and aggregation semantics', () => {
     for (const seed of ['f1', 'f2', 'f3', 'f4', 'f5']) {
       await post(w, '/api/v1/events', syntheticRunEvents({ seed, reached: 5 }));
     }
-    // five future-skewed invalid runs with safe runIds: retained internally for deduplicated
-    // sample units (invalidEventRuns=5), but no run identity may ever appear in the public body
+    // five future-skewed invalid runs with safe runIds OUTSIDE the accepted cohort: their run
+    // identities are retained internally but cross-cohort records never create sample units
+    // (invalidEventRuns=0), and no run identity may ever appear in the public body
     for (const seed of ['q1', 'q2', 'q3', 'q4', 'q5']) {
       await post(w, '/api/v1/events', syntheticRunEvents({ seed, reached: 1, overrides: { occurredAt: new Date(FIXED_NOW.getTime() + 10 * 60 * 1000).toISOString() } }));
     }
@@ -516,8 +517,8 @@ describe('worker — ingest and aggregation semantics', () => {
     assert.ok(!body.includes('evt-q'));
     assert.ok(!body.includes('runId'));
     const funnel = funnelRes.bodyJson as { dataQuality: { invalidEvents: number; invalidEventRuns: number } };
-    assert.equal(funnel.dataQuality.invalidEvents, 5);
-    assert.equal(funnel.dataQuality.invalidEventRuns, 5);
+    assert.equal(funnel.dataQuality.invalidEvents, 5); // row diagnostic keeps all window records
+    assert.equal(funnel.dataQuality.invalidEventRuns, 0); // cross-cohort runs create no sample units (review P2)
   });
 
   it('verification_passed must bind to the actual resolution of its cycle (review P1.2)', async () => {
@@ -543,6 +544,118 @@ describe('worker — ingest and aggregation semantics', () => {
     // nothing of the rejected events was durably accepted
     const count = w.raw.prepare("SELECT COUNT(*) AS n FROM fix_metric_events WHERE fact_id LIKE 'fact-bind-evil%'").get() as { n: number };
     assert.equal(Number(count.n), 0);
+  });
+
+  it('a future-dated pointer target is rejected on ALL public read paths (review P1.3)', async () => {
+    const w = makeWorker();
+    // five September-cohort runs (ingested when fresh in September)
+    w.clock.value = new Date('2026-09-05T12:00:00.000Z');
+    for (const seed of ['s1', 's2', 's3', 's4', 's5']) {
+      const mapped = syntheticRunEvents({ seed, reached: 5 }).map((e) => ({ ...e, occurredAt: e.occurredAt.replace('2026-08-01', '2026-09-05') }));
+      const res = await post(w, '/api/v1/events', mapped);
+      assert.deepEqual((res.bodyJson as AckBody).items.map((a) => a.status), ['accepted', 'accepted', 'accepted', 'accepted', 'accepted']);
+    }
+    // publish in November: the September pointer advances to the November fixed point
+    w.clock.value = new Date('2026-11-02T12:00:00.000Z');
+    await publish(w);
+    const latest = (await get(w, '/api/v1/snapshots/latest')).bodyJson as { status: string; snapshotId: string; snapshotAt: string };
+    assert.equal(latest.status, 'calculable');
+    assert.equal(latest.snapshotAt, '2026-11-01T00:00:00.000Z');
+
+    // rewind the server clock BEFORE the pointer target's as-of point: the pointer target is now
+    // future data and must fail closed on EVERY public read path (pointer target and latest
+    // included — not only retained revisions)
+    w.clock.value = new Date('2026-10-15T12:00:00.000Z');
+    const latestRewound = await get(w, '/api/v1/snapshots/latest');
+    assert.equal(latestRewound.status, 404);
+    assert.equal((latestRewound.bodyJson as { error: { code: string } }).error.code, 'future_snapshot');
+    const funnel = await get(w, `/api/v1/funnel?snapshotId=${latest.snapshotId}`);
+    assert.equal(funnel.status, 404);
+    assert.equal((funnel.bodyJson as { error: { code: string } }).error.code, 'future_snapshot');
+    // the pointer row itself is untouched (fail closed serving, not corruption handling)
+    w.clock.value = new Date('2026-11-02T12:00:00.000Z');
+    const recovered = (await get(w, '/api/v1/snapshots/latest')).bodyJson as { status: string; snapshotId: string };
+    assert.equal(recovered.status, 'calculable');
+    assert.equal(recovered.snapshotId, latest.snapshotId);
+  });
+
+  it('run_accepted requires prior accepted Acceptance evidence for the same run (review P1.5)', async () => {
+    const w = makeWorker();
+    const events = syntheticRunEvents({ seed: 'acc' });
+    // a bare valid-shape run_accepted (no verification_passed for this run yet) is permanent
+    const bare = await post(w, '/api/v1/events', events[4]);
+    assert.deepEqual((bare.bodyJson as AckBody).items[0], {
+      eventId: 'evt-acc-5',
+      status: 'permanent_error',
+      retryable: false,
+      errorCode: 'run_accepted_without_verification',
+    });
+    // another run's verification evidence does NOT unlock this run
+    await post(w, '/api/v1/events', syntheticRunEvents({ seed: 'accother', reached: 4 }));
+    const crossRun = await post(w, '/api/v1/events', { ...events[4], eventId: 'evt-acc-5b', factId: 'fact-acc-5b' });
+    assert.equal((crossRun.bodyJson as AckBody).items[0].errorCode, 'run_accepted_without_verification');
+    // nothing of the rejected facts was durably accepted
+    const count = w.raw.prepare("SELECT COUNT(*) AS n FROM fix_metric_events WHERE event_type = 'run_accepted'").get() as { n: number };
+    assert.equal(Number(count.n), 0);
+    // once the run's OWN resolution + verification are accepted, run_accepted is accepted
+    const full = await post(w, '/api/v1/events', events);
+    assert.deepEqual((full.bodyJson as AckBody).items.map((a) => a.status), ['accepted', 'accepted', 'accepted', 'accepted', 'accepted']);
+    // a replay of the same run_accepted stays a duplicate (the evidence is in the store)
+    const replay = await post(w, '/api/v1/events', [events[4]]);
+    assert.deepEqual((replay.bodyJson as AckBody).items[0].status, 'duplicate');
+  });
+
+  it('verification binding enforces resolution.occurredAt <= verification.occurredAt (review P2)', async () => {
+    const w = makeWorker();
+    await post(w, '/api/v1/events', syntheticRunEvents({ seed: 'bind2', reached: 5 }));
+    const ver = syntheticRunEvents({ seed: 'bind2', reached: 4 })[3];
+    // same cycle + same evidence, but occurredAt BEFORE its resolution (start + 20min) -> permanent
+    const early = {
+      ...ver,
+      eventId: 'evt-bind2-early',
+      factId: 'fact-bind2-early',
+      occurredAt: new Date(Date.parse(ver.occurredAt) - 25 * 60 * 1000).toISOString(),
+    };
+    const res = await post(w, '/api/v1/events', early);
+    assert.deepEqual((res.bodyJson as AckBody).items[0], {
+      eventId: early.eventId,
+      status: 'permanent_error',
+      retryable: false,
+      errorCode: 'unbound_verification_evidence',
+    });
+    // an equal-or-later verification for the same cycle is accepted (control)
+    const ok = { ...ver, eventId: 'evt-bind2-ok', factId: 'fact-bind2-ok' };
+    const okRes = await post(w, '/api/v1/events', ok);
+    assert.deepEqual((okRes.bodyJson as AckBody).items[0], { eventId: ok.eventId, status: 'accepted', retryable: false });
+  });
+
+  it('ACKs never echo an unvalidated/unsafe eventId (review P2.9)', async () => {
+    const w = makeWorker();
+    const unsafeId = 'evt\u4e2d\u6587-unsafe';
+    // permanent error with an unsafe eventId: fixed safe placeholder, never the raw value
+    const permanent = await post(w, '/api/v1/events', {
+      eventId: unsafeId,
+      eventType: 'nuke_all',
+      schemaVersion: 1,
+    });
+    const permanentAck = (permanent.bodyJson as AckBody).items[0];
+    assert.equal(permanentAck.status, 'permanent_error');
+    assert.equal(permanentAck.eventId, '[unknown]');
+    // quarantined unsafe event: the ACK carries the server-generated SAFE quarantine identity
+    const quarantined = await post(w, '/api/v1/events', {
+      ...syntheticRunEvents({ seed: 'acksafe' })[0],
+      eventId: unsafeId,
+      occurredAt: new Date(FIXED_NOW.getTime() - 25 * 60 * 60 * 1000).toISOString(),
+    });
+    const quarantineAck = (quarantined.bodyJson as AckBody).items[0];
+    assert.equal(quarantineAck.status, 'quarantined');
+    assert.notEqual(quarantineAck.eventId, unsafeId);
+    assert.match(quarantineAck.eventId, /^qz_[A-Za-z0-9_-]+$/);
+    // oversized (non-id-shaped) eventId in a permanent-error item is also never echoed
+    const oversized = await post(w, '/api/v1/events', { ...syntheticRunEvents({ seed: 'ackbig' })[0], eventId: 'evt-' + 'x'.repeat(200), eventType: 'nuke_all' });
+    assert.equal((oversized.bodyJson as AckBody).items[0].eventId, '[unknown]');
+    // nothing anywhere in the response echoes the unsafe raw id
+    assert.ok(!JSON.stringify(quarantined.bodyJson).includes('\u4e2d\u6587'));
   });
 
   it('quarantine identity for uncanonicalizable bytes is deterministic (never a random UUID)', async () => {

@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { canonicalJson } from '../src/canonical.ts';
 import { buildSnapshotForWindow, type SnapshotBuildOptions } from '../src/projection.ts';
+import type { BatchStatement, SqlDatabase } from '../src/store.ts';
 import { MetricStore } from '../src/store.ts';
 import { FIXED_NOW, makeAcceptedEvent, migratedInMemoryDb } from './helpers.ts';
 
@@ -353,6 +354,77 @@ describe('MetricStore snapshots + publication', () => {
     assert.equal(await store.hasPublishedRevision(ws, we, 'fix-funnel-v1', revC.snapshotId), false);
     // an unknown revision of a published window is not history either
     assert.equal(await store.hasPublishedRevision(ws, we, 'fix-funnel-v1', 's_unknown_revision_0000000001'), false);
+  });
+
+  it('pointer update + publication history insert are atomic (review P1.1)', async () => {
+    const { sql, raw } = migratedInMemoryDb();
+    const store = new MetricStore(sql);
+    await seedRuns(store, ['f1', 'f2', 'f3', 'f4', 'f5']);
+    const revA = await genuineRow(store);
+    await store.insertSnapshot(revA, revA.snapshotAt);
+    assert.equal(await store.publishRevision(ws, we, 'fix-funnel-v1', revA.snapshotId, we, we), true);
+    await seedRuns(store, ['f6']);
+    const revB = await genuineRow(store);
+    await store.insertSnapshot(revB, revB.snapshotAt);
+
+    // A database whose transaction poisons the SECOND (history) statement of the batch (a storage
+    // failure while binding the history row): the whole unit must roll back, leaving the pointer
+    // on revA and no history row for revB — a partial failure must never leave a pointer without
+    // its history row.
+    const failingDb: SqlDatabase = {
+      prepare: (s) => sql.prepare(s),
+      transaction: async (statements: BatchStatement[]) => sql.transaction(statements.map((s, i) => (i === statements.length - 1 ? { sql: s.sql, params: [...s.params, 'poison', 'poison'] } : s))),
+    };
+    await assert.rejects(() => new MetricStore(failingDb).publishRevision(ws, we, 'fix-funnel-v1', revB.snapshotId, we, we));
+    let pub = await store.getPublication(ws, we);
+    assert.equal(pub?.publishedSnapshotId, revA.snapshotId);
+    assert.equal(pub?.publicationGeneration, 0);
+    assert.equal(await store.hasPublishedRevision(ws, we, 'fix-funnel-v1', revB.snapshotId), false);
+
+    // Same guarantee on the FIRST-insert path: poisoning the history statement of a brand-new
+    // window's publication must leave NO pointer at all (neither half of the write landed).
+    const sepRow = await genuineRow(store, oct, {}, '2026-09-01T00:00:00.000Z', oct);
+    await store.insertSnapshot(sepRow, sepRow.snapshotAt);
+    // (the first-insert path resolves false through its race fallback — no partial state left)
+    assert.equal(await new MetricStore(failingDb).publishRevision('2026-09-01T00:00:00.000Z', oct, 'fix-funnel-v1', sepRow.snapshotId, oct, oct), false);
+    assert.equal(await store.getPublication('2026-09-01T00:00:00.000Z', oct), undefined);
+    const pointerRows = raw.prepare('SELECT COUNT(*) AS n FROM fix_metric_snapshot_publication').get() as { n: number };
+    assert.equal(Number(pointerRows.n), 1); // only the original window pointer
+
+    // after the transient failure, a healthy retry publishes atomically: pointer AND history
+    assert.equal(await store.publishRevision(ws, we, 'fix-funnel-v1', revB.snapshotId, we, we), true);
+    pub = await store.getPublication(ws, we);
+    assert.equal(pub?.publishedSnapshotId, revB.snapshotId);
+    assert.equal(await store.hasPublishedRevision(ws, we, 'fix-funnel-v1', revA.snapshotId), true);
+    assert.equal(await store.hasPublishedRevision(ws, we, 'fix-funnel-v1', revB.snapshotId), true);
+  });
+
+  it('rejects a skipped-month lineage gap and a corrupted grandparent (review P1.4)', async () => {
+    const { store, raw } = newStore();
+    await seedRuns(store, ['f1', 'f2', 'f3', 'f4', 'f5']);
+    const nov = '2026-11-01T00:00:00.000Z';
+
+    // continuous chain: root (Sep 1) -> child (Oct 1) -> grandchild (Nov 1) is accepted
+    const root = await genuineRow(store, we);
+    assert.equal(await store.insertSnapshot(root, root.snapshotAt), true);
+    const child = await genuineRow(store, oct, { parentSnapshotId: root.snapshotId, rebuildTaskId: 'rebuild_ok_oct' });
+    assert.equal(await store.insertSnapshot(child, child.snapshotAt), true);
+    const grand = await genuineRow(store, nov, { parentSnapshotId: child.snapshotId, rebuildTaskId: 'rebuild_ok_nov' });
+    assert.equal(await store.insertSnapshot(grand, grand.snapshotAt), true);
+
+    // skipped-month gap: a November revision anchored directly to the September root (skipping
+    // the October fixed point) is a broken chain and must be rejected
+    const skipped = await genuineRow(store, nov, { parentSnapshotId: root.snapshotId, rebuildTaskId: 'rebuild_skipped_month' });
+    await assert.rejects(() => store.insertSnapshot(skipped, nov), /snapshot_revision_mismatch/);
+
+    // corrupted grandparent: recursive chain validation invalidates all DESCENDANTS of a forged
+    // ancestor, not only its direct children
+    raw.prepare("UPDATE fix_metric_snapshots SET response_json = '{\"forged\":true}' WHERE snapshot_id = ?").run(root.snapshotId);
+    const afterCorruption = await genuineRow(store, nov, { parentSnapshotId: child.snapshotId, rebuildTaskId: 'rebuild_after_corruption' });
+    await assert.rejects(() => store.insertSnapshot(afterCorruption, nov), /snapshot_revision_mismatch/);
+    // the child itself is no longer a valid lineage anchor either (its chain reaches the root)
+    const childAgain = await genuineRow(store, oct, { parentSnapshotId: root.snapshotId, rebuildTaskId: 'rebuild_child_again' });
+    await assert.rejects(() => store.insertSnapshot(childAgain, oct), /snapshot_revision_mismatch/);
   });
 
   it('latestPublication picks the newest window', async () => {

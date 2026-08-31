@@ -17,7 +17,7 @@
 //   - responses never echo tokens, event bodies or business text
 
 import { MAX_EVENTS_PER_BATCH, MAX_REQUEST_BODY_BYTES, assertSyntheticOnly, type RuntimeConfig } from './config.ts';
-import { validateEvent, type AcceptedEvent } from './events.ts';
+import { RUN_ACCEPTED_WITHOUT_VERIFICATION, isSafeEventId, validateEvent, type AcceptedEvent } from './events.ts';
 import { json, jsonError } from './http.ts';
 import type { MetricStore } from './store.ts';
 
@@ -91,6 +91,8 @@ export async function handleEvents(request: Request, deps: IngestDeps): Promise<
 // minimum coherent contract this slice can enforce at ingest time:
 //   - a resolution_completed for the SAME runId AND resolutionCycleId must already be accepted
 //     (the verification cycle must match the resolution cycle it verifies);
+//   - the verification must not PRECEDE the resolution it verifies (review P2: evidence cannot
+//     be emitted before the fact it verifies — time order is enforced, not only cycle identity);
 //   - payload resolutionEvidenceRef, when present, must EQUAL the resolution's own evidence ref;
 //   - candidateRevision / sourceVersion, when present, must be present and equal on the
 //     resolution_completed (candidateRevision must stay consistent across implementation, review
@@ -117,6 +119,9 @@ async function verificationBindingIsCoherent(event: AcceptedEvent, store: Metric
   if (Object.hasOwn(ev, 'resolutionEvidenceRef')) {
     if (!Object.hasOwn(res, 'resolutionEvidenceRef') || ev.resolutionEvidenceRef !== res.resolutionEvidenceRef) return false;
   }
+  // Time order (review P2): the verification cannot precede the resolution it verifies. The
+  // NaN-safe negated form fails closed on a non-parseable stored timestamp as well.
+  if (!(Date.parse(event.occurredAt) >= Date.parse(resolution.occurredAt))) return false;
   if (event.candidateRevision !== undefined && (resolution.candidateRevision === undefined || resolution.candidateRevision !== event.candidateRevision)) return false;
   if (event.sourceVersion !== undefined && (resolution.sourceVersion === undefined || resolution.sourceVersion !== event.sourceVersion)) return false;
   return true;
@@ -127,10 +132,12 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 }
 
 async function processItem(item: unknown, store: MetricStore, cfg: RuntimeConfig, now: Date): Promise<ItemAck> {
-  const id =
-    typeof item === 'object' && item !== null && typeof (item as Record<string, unknown>).eventId === 'string'
-      ? ((item as Record<string, unknown>).eventId as string)
-      : '[unknown]';
+  // ACK safety (review P2.9): a raw eventId that is not a schema-safe identifier is NEVER echoed
+  // back. Permanent/unverifiable items get a fixed safe placeholder; quarantined items get the
+  // server-generated safe quarantine identity (see the quarantine branch below). Safe eventIds
+  // keep their own value everywhere.
+  const rawEventId = isPlainObject(item) ? item.eventId : undefined;
+  const safeAckId = isSafeEventId(rawEventId) ? rawEventId : '[unknown]';
 
   const outcome = await validateEvent(item, {
     now,
@@ -139,7 +146,7 @@ async function processItem(item: unknown, store: MetricStore, cfg: RuntimeConfig
   });
 
   if (outcome.kind === 'permanent') {
-    return { eventId: id, status: 'permanent_error', retryable: false, errorCode: outcome.errorCode };
+    return { eventId: safeAckId, status: 'permanent_error', retryable: false, errorCode: outcome.errorCode };
   }
 
   // Coherence gate for verification_passed (review P1.2): the fact must bind to the actual
@@ -155,18 +162,34 @@ async function processItem(item: unknown, store: MetricStore, cfg: RuntimeConfig
     }
   }
 
+  // Acceptance gate for run_accepted (review P1.5): the run must already carry the Acceptance
+  // evidence this slice models — an accepted verification_passed for the SAME run. A bare
+  // valid-shape run_accepted is a permanent error, never silently accepted. A storage failure
+  // during the evidence lookup stays retryable.
+  if (outcome.kind === 'ok' && outcome.event.eventType === 'run_accepted') {
+    try {
+      if (!(await store.hasAcceptedVerificationPassed(outcome.event.runId))) {
+        return { eventId: outcome.event.eventId, status: 'permanent_error', retryable: false, errorCode: RUN_ACCEPTED_WITHOUT_VERIFICATION };
+      }
+    } catch {
+      return { eventId: outcome.event.eventId, status: 'retryable_error', retryable: true, errorCode: 'storage_error' };
+    }
+  }
+
   if (outcome.kind === 'quarantine') {
     try {
       const result = await store.insertQuarantine(outcome.record);
       // ACK quarantined only when this record is now durably present (fresh insert) or the exact
       // same durable fact already exists. An id/key collision with different content is NOT a
-      // quarantine ACK: the incoming event was not persisted, so it is a permanent error.
+      // quarantine ACK: the incoming event was not persisted, so it is a permanent error. The ACK
+      // eventId is the server-side safe quarantine identity — an unsafe client eventId is never
+      // echoed (review P2.9).
       if (result.status === 'inserted' || result.status === 'duplicate') {
-        return { eventId: id, status: 'quarantined', retryable: false, errorCode: outcome.errorCode };
+        return { eventId: outcome.record.eventId, status: 'quarantined', retryable: false, errorCode: outcome.errorCode };
       }
-      return { eventId: id, status: 'permanent_error', retryable: false, errorCode: 'quarantine_id_or_key_conflict' };
+      return { eventId: safeAckId, status: 'permanent_error', retryable: false, errorCode: 'quarantine_id_or_key_conflict' };
     } catch {
-      return { eventId: id, status: 'retryable_error', retryable: true, errorCode: 'storage_error' };
+      return { eventId: safeAckId, status: 'retryable_error', retryable: true, errorCode: 'storage_error' };
     }
   }
 

@@ -145,6 +145,15 @@ export function validateSnapshotRowShape(row: SnapshotRow): boolean {
     typeof row.createdAt === 'string';
 }
 
+// Fixed as-of points in this slice are UTC month starts (the window boundary and subsequent
+// monthly points). A child revision must anchor to the IMMEDIATELY previous fixed point of the
+// same window — a skipped month is a broken chain (a missing intermediate revision must never be
+// papered over by anchoring two or more months ahead).
+function previousFixedPoint(snapshotAt: string): string {
+  const d = new Date(snapshotAt);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() - 1, 1)).toISOString();
+}
+
 /**
  * Parent lineage validation for the canonical snapshot contract. A revision that declares a parent
  * must be part of a coherent rebuild chain:
@@ -152,23 +161,37 @@ export function validateSnapshotRowShape(row: SnapshotRow): boolean {
  *     from the canonical inputs (full stored-snapshot verification, not a shape-only check — a
  *     forged or mutated parent row can never anchor a child lineage)
  *   - parent covers the SAME window and definition version
- *   - parent is a strictly EARLIER fixed as-of point
+ *   - parent is the IMMEDIATELY previous fixed as-of point of the window (continuous monthly
+ *     chain — a skipped-month gap is rejected, review P1.4)
+ *   - the WHOLE ancestor chain is validated recursively (review P1.4): every ancestor must itself
+ *     satisfy the same continuity + content-verification contract, so a corrupted grandparent
+ *     invalidates all of its descendants, not just its direct children
  *   - parentSnapshotId and rebuildTaskId are set together (a rebuild task without a parent, or a
  *     parent without a rebuild task, is incoherent lineage)
- * Root revisions (no parent) must not carry a rebuild task id.
+ * Root revisions (no parent) must not carry a rebuild task id. The optional `visited` set is
+ * internal recursion state (cycle guard).
  */
-export async function verifySnapshotLineage(store: MetricStore, row: SnapshotRow): Promise<boolean> {
+export async function verifySnapshotLineage(store: MetricStore, row: SnapshotRow, visited?: Set<string>): Promise<boolean> {
   if (row.parentSnapshotId === undefined) {
     return row.rebuildTaskId === undefined;
   }
   if (row.rebuildTaskId === undefined) return false;
+  const seen = visited ?? new Set<string>();
+  if (seen.has(row.snapshotId)) return false; // cycle guard
+  seen.add(row.snapshotId);
   const parent = await store.getSnapshot(row.parentSnapshotId);
   // Full verification of the stored parent: shape AND content recompute (verifyStoredSnapshot),
   // not merely the metadata/shape check. A parent row that was forged or mutated outside
   // insertSnapshot must fail the child's lineage no matter how well-formed it looks.
   if (!parent || !validateSnapshotRowShape(parent) || !(await verifyStoredSnapshot(store, parent))) return false;
-  return parent.definitionVersion === row.definitionVersion &&
-    parent.windowStart === row.windowStart &&
-    parent.windowEnd === row.windowEnd &&
-    Date.parse(parent.snapshotAt) < Date.parse(row.snapshotAt);
+  if (parent.definitionVersion !== row.definitionVersion ||
+    parent.windowStart !== row.windowStart ||
+    parent.windowEnd !== row.windowEnd) {
+    return false;
+  }
+  // Continuity: the parent must be the immediately previous fixed point (no skipped-month gap).
+  if (parent.snapshotAt !== previousFixedPoint(row.snapshotAt)) return false;
+  // Recursive chain validation: the parent must itself sit on a continuous, content-verified
+  // chain back to its root — a corrupted ancestor anywhere invalidates the whole chain.
+  return verifySnapshotLineage(store, parent, seen);
 }

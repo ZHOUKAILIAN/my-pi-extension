@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import type { SqlDatabase, SqlRow, SqlValue, Statement } from '../src/store.ts';
+import type { BatchStatement, SqlDatabase, SqlRow, SqlValue, Statement } from '../src/store.ts';
 
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'migrations');
 
@@ -74,22 +74,32 @@ export async function makeAcceptedEvent(
 // In-memory SqlDatabase backed by node:sqlite
 // ---------------------------------------------------------------------------
 
-export function migratedInMemoryDb(): { sql: SqlDatabase; raw: DatabaseSync } {
-  const raw = new DatabaseSync(':memory:');
-  const files = ['0001_initial.sql', '0002_publication_history.sql'];
-  for (const file of files) {
-    const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
-    // strip full-line comments first (the comment body may contain ';'), then one statement per
-    // ';' — the migration authoring rule forbids embedded semicolons in statements
-    const commentsStripped = sql
-      .split('\n')
-      .filter((line) => !line.trim().startsWith('--'))
-      .join('\n');
-    for (const statement of commentsStripped.split(';')) {
-      const trimmed = statement.trim();
-      if (trimmed.length > 0) raw.exec(trimmed);
-    }
+const MIGRATION_FILES = ['0001_initial.sql', '0002_publication_history.sql'] as const;
+
+/** Apply one migration file (comment-stripped, statement-per-';') to a raw database. */
+export function applyMigration(raw: DatabaseSync, file: string): void {
+  const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf8');
+  // strip full-line comments first (the comment body may contain ';'), then one statement per
+  // ';' — the migration authoring rule forbids embedded semicolons in statements
+  const commentsStripped = sql
+    .split('\n')
+    .filter((line) => !line.trim().startsWith('--'))
+    .join('\n');
+  for (const statement of commentsStripped.split(';')) {
+    const trimmed = statement.trim();
+    if (trimmed.length > 0) raw.exec(trimmed);
   }
+}
+
+/**
+ * In-memory database migrated through the given migration files (default: all). Passing a subset
+ * exercises upgrade paths (e.g. run 0001 only, seed pre-0002 state, then apply 0002).
+ */
+export function migratedInMemoryDb(
+  migrations: readonly string[] = MIGRATION_FILES,
+): { sql: SqlDatabase; raw: DatabaseSync } {
+  const raw = new DatabaseSync(':memory:');
+  for (const file of migrations) applyMigration(raw, file);
   return { sql: sqliteAdapter(raw), raw };
 }
 
@@ -109,6 +119,27 @@ function sqliteAdapter(raw: DatabaseSync): SqlDatabase {
           return stmt.all(...(params as never[])) as T[];
         },
       };
+    },
+    // Atomic multi-statement write mirroring D1 batch semantics: every statement executes inside
+    // one SQLite transaction; a failing statement rolls the whole unit back (review P1.1).
+    async transaction(statements: BatchStatement[]): Promise<number[]> {
+      const changes: number[] = [];
+      raw.exec('BEGIN');
+      try {
+        for (const statement of statements) {
+          const result = raw.prepare(statement.sql).run(...(statement.params as never[]));
+          changes.push(Number(result.changes ?? 0));
+        }
+        raw.exec('COMMIT');
+        return changes;
+      } catch (error) {
+        try {
+          raw.exec('ROLLBACK');
+        } catch {
+          // transaction already rolled back (e.g. the failing statement auto-aborted it)
+        }
+        throw error;
+      }
     },
   };
 }

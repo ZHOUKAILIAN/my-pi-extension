@@ -72,6 +72,13 @@ export async function handleLatest(_request: Request, deps: PublicDeps): Promise
   if (!publicationMatchesSnapshot(pub, row)) {
     return jsonError(500, 'publication_pointer_mismatch');
   }
+  // The future-as-of gate applies to the pointer target too (review P1.3): /latest follows the
+  // pointer only and never falls back, so a target whose fixed as-of point lies ahead of the
+  // validated server clock fails closed instead of being served. The NaN-safe negated form
+  // rejects non-ISO/invalid timestamps as well (a NaN comparison is always false).
+  if (!(Date.parse(row.snapshotAt) <= deps.now().getTime())) {
+    return jsonError(404, 'future_snapshot');
+  }
   const payload = parsePayload(row);
   if (!payload) return jsonError(500, 'invalid_snapshot_payload');
   // Defense in depth on the serving path: the served revision must still recompute from the
@@ -154,7 +161,12 @@ export async function handleFunnel(request: Request, deps: PublicDeps): Promise<
   }
   const pub = await deps.store.getPublication(row.windowStart, row.windowEnd);
   if (pub && publicationMatchesSnapshot(pub, row)) {
-    // current pointer target: pointer + row already agree on all metadata
+    // current pointer target: pointer + row already agree on all metadata — and the same future
+    // gate applies as on the retained path (review P1.3): a pointer target ahead of the server
+    // clock is never served, so ALL public read paths fail closed on future data.
+    if (!(Date.parse(row.snapshotAt) <= nowMs)) {
+      return jsonError(404, 'future_snapshot');
+    }
   } else {
     // retained-revision read path: this revision must be EXPLICITLY published history for its
     // window (pointer target or recorded publication history — review P1.5), its definition must

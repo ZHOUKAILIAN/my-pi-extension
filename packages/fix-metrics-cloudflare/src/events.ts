@@ -560,6 +560,21 @@ function payloadSchemaFor(eventType: FunnelEventType): Record<string, { required
   }
 }
 
+// Error code for the ingest-side Acceptance gate (src/ingest.ts): this slice models the
+// Acceptance facts a run_accepted may rely on as an already-accepted verification_passed for the
+// SAME run (the human decision record is a later slice). A bare valid-shape run_accepted without
+// that prior evidence is rejected as a permanent error, never silently accepted.
+export const RUN_ACCEPTED_WITHOUT_VERIFICATION = 'run_accepted_without_verification';
+
+/**
+ * True when a raw wire eventId is a schema-safe identifier fit for echoing back in an ACK
+ * (review P2.9). An eventId that fails this check is never echoed: the ACK carries a fixed safe
+ * placeholder (permanent items) or the server-generated quarantine identity (quarantined items).
+ */
+export function isSafeEventId(v: unknown): v is string {
+  return typeof v === 'string' && ID_PATTERN.test(v);
+}
+
 function jointCheck(eventType: FunnelEventType, raw: Record<string, unknown>): string | null {
   switch (eventType) {
     case 'run_started':
@@ -593,6 +608,10 @@ function jointCheck(eventType: FunnelEventType, raw: Record<string, unknown>): s
       }
       return null;
     case 'run_accepted':
+      // Schema-level union shape only. The ORDERING contract — run_accepted requires prior
+      // Acceptance evidence (an accepted verification_passed for the same run) — is enforced at
+      // ingest (src/ingest.ts, review P1.5), where stored facts are visible; a per-item schema
+      // check cannot see them.
       if (raw.terminalOutcome !== 'accepted') return 'invalid_union_shape';
       return null;
   }

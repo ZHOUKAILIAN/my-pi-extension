@@ -102,10 +102,11 @@ describe('buildSnapshotForWindow', () => {
         eventJson: '{}',
         ...(runId ? { runId } : {}),
       });
-    // five invalid events: three for ONE safe run, two without any safe run identity
-    await quarantine('q-a1', 'run-dup');
-    await quarantine('q-a2', 'run-dup');
-    await quarantine('q-a3', 'run-dup');
+    // five invalid events: three for ONE cohort-attributed safe run, two without any safe run
+    // identity (sample units are restricted to the snapshot cohort — review P2)
+    await quarantine('q-a1', 'run-f1');
+    await quarantine('q-a2', 'run-f1');
+    await quarantine('q-a3', 'run-f1');
     await quarantine('q-b1');
     await quarantine('q-b2');
     const built = await buildSnapshotForWindow(store, await store.allAcceptedEvents(), AUG_WS, SEP_WS, fixedNow());
@@ -115,7 +116,7 @@ describe('buildSnapshotForWindow', () => {
 
   it('multiple runs with quality records form multiple deduplicated sample units', async () => {
     const { store } = await dataset(['f1', 'f2', 'f3', 'f4', 'f5'], []);
-    for (const runId of ['run-1', 'run-2', 'run-3', 'run-4', 'run-5']) {
+    for (const runId of ['run-f1', 'run-f2', 'run-f3', 'run-f4', 'run-f5']) {
       await store.insertQuarantine({
         eventId: `q-${runId}`,
         factId: `fact-${runId}`,
@@ -130,6 +131,28 @@ describe('buildSnapshotForWindow', () => {
     }
     const built = await buildSnapshotForWindow(store, await store.allAcceptedEvents(), AUG_WS, SEP_WS, fixedNow());
     assert.equal(built.payload.dataQuality.invalidEventRuns, 5);
+  });
+
+  it('quarantine sample units are restricted to the snapshot cohort (cross-cohort runs never count, review P2)', async () => {
+    const { store } = await dataset(['f1', 'f2', 'f3', 'f4', 'f5'], []);
+    // quarantines attributed to runs OUTSIDE the August cohort: they keep the row diagnostic
+    // count but never create data-quality sample units for this snapshot
+    for (const runId of ['run-x1', 'run-x2', 'run-x3']) {
+      await store.insertQuarantine({
+        eventId: `q-${runId}`, factId: `fact-${runId}`, runId, eventBusinessKey: `k-${runId}`,
+        eventCanonicalHash: `h-${runId}`, reasonCode: 'late_event', receivedAt: FIXED_NOW.toISOString(),
+        occurredAt: '2026-08-15T00:00:00.000Z', eventJson: '{}',
+      });
+    }
+    // one cohort-attributed quarantine DOES create a sample unit
+    await store.insertQuarantine({
+      eventId: 'q-cohort', factId: 'fact-cohort', runId: 'run-f2', eventBusinessKey: 'k-cohort',
+      eventCanonicalHash: 'h-cohort', reasonCode: 'late_event', receivedAt: FIXED_NOW.toISOString(),
+      occurredAt: '2026-08-15T00:00:00.000Z', eventJson: '{}',
+    });
+    const built = await buildSnapshotForWindow(store, await store.allAcceptedEvents(), AUG_WS, SEP_WS, fixedNow());
+    assert.equal(built.payload.dataQuality.invalidEvents, 4); // row diagnostic counts all records
+    assert.equal(built.payload.dataQuality.invalidEventRuns, 1); // only the cohort run counts
   });
 
   it('late accepted events count deduplicated runs, not rows', async () => {
@@ -208,7 +231,7 @@ describe('buildSnapshotForWindow', () => {
     const events = await store.allAcceptedEvents();
     const base = await buildSnapshotForWindow(store, events, AUG_WS, SEP_WS, fixedNow());
     await store.insertQuarantine({
-      eventId: 'q-run', factId: 'fact-q', runId: 'run-attributed', eventBusinessKey: 'k-run',
+      eventId: 'q-run', factId: 'fact-q', runId: 'run-f1', eventBusinessKey: 'k-run',
       eventCanonicalHash: 'h-run', reasonCode: 'late_event', receivedAt: FIXED_NOW.toISOString(),
       occurredAt: '2026-08-15T00:00:00.000Z', eventJson: '{}',
     });
@@ -253,6 +276,43 @@ describe('buildSnapshotForWindow', () => {
     assert.equal(forward.payload.steps[2].runs, 1);
     assert.equal(forward.payload.totalRuns, 1);
     assert.equal(events.filter((e) => e.eventType === 'resolution_completed').length, 2);
+  });
+
+  it('same-time cycles across multiple runs are resolved by cycle id deterministically, in any input order (review P1.6)', async () => {
+    const { sql } = migratedInMemoryDb();
+    const storeM = new MetricStore(sql);
+    // two runs, EACH with two same-time resolution cycles; the later cycle id wins per run.
+    // The later cycles also carry the lexically SMALLER eventIds, and the input order is fully
+    // adversarial — the projection must never depend on either.
+    const runA = syntheticRunEvents({ seed: 'mra', reached: 5 });
+    const runB = syntheticRunEvents({ seed: 'mrb', reached: 5 });
+    const lateA = {
+      ...runA[2],
+      eventId: 'evt-mra-aaa',
+      factId: 'fact-mra-late',
+      resolutionCycleId: 'rc-mra-2',
+      resolutionType: 'versioned_config_change',
+      payload: { resolutionEvidenceRef: 'rev-mra-2' },
+    };
+    const lateB = {
+      ...runB[2],
+      eventId: 'evt-mrb-aaa',
+      factId: 'fact-mrb-late',
+      resolutionCycleId: 'rc-mrb-2',
+      resolutionType: 'no_change_expected_behavior',
+      payload: { resolutionEvidenceRef: 'rev-mrb-2' },
+    };
+    await ingestWire(storeM, [runB[0], lateA, runB[2], lateB, runA[0], runA[2], runB[1], runA[1]]);
+    const events = await storeM.allAcceptedEvents();
+    const forward = await buildSnapshotForWindow(storeM, events, AUG_WS, SEP_WS, fixedNow());
+    const reversed = await buildSnapshotForWindow(storeM, [...events].reverse(), AUG_WS, SEP_WS, fixedNow());
+    assert.deepEqual(forward.payload.resolutionTypes, { versioned_config_change: 1, no_change_expected_behavior: 1 });
+    assert.equal(forward.row.responseJson, reversed.row.responseJson);
+    assert.equal(forward.row.snapshotId, reversed.row.snapshotId);
+    assert.equal(forward.row.revisionHash, reversed.row.revisionHash);
+    // rework history stays but never inflates public run counts
+    assert.equal(forward.payload.totalRuns, 2);
+    assert.equal(forward.payload.steps[2].runs, 2);
   });
 
   it('verifyStoredSnapshot binds quarantine receivedAt even when the visible aggregates are unchanged (review P1.3)', async () => {

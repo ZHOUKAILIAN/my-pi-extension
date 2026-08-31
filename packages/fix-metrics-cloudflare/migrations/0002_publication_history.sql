@@ -16,3 +16,11 @@ CREATE TABLE fix_metric_snapshot_publication_history (
 );
 
 CREATE INDEX idx_fix_pub_history_snapshot ON fix_metric_snapshot_publication_history(snapshot_id);
+
+-- Upgrade-path backfill (review P1.2): deployments from migration 0001 already have publication
+-- pointer rows without a history table. The current pointer target of every window is backfilled
+-- as its first history row so pre-upgrade published revisions stay readable after the upgrade
+-- (an upgrade must never strand an already-published revision as unreadable).
+INSERT OR IGNORE INTO fix_metric_snapshot_publication_history (window_start, window_end, definition_version, snapshot_id, snapshot_at, published_at)
+SELECT window_start, window_end, definition_version, published_snapshot_id, snapshot_at, updated_at
+FROM fix_metric_snapshot_publication;

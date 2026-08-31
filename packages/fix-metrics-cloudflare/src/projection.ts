@@ -96,12 +96,16 @@ export async function buildSnapshotForWindow(
   // Resolution branch projection: for each run, the LATEST VALID resolution_completed in the run
   // decides the branch. "Latest" is resolved explicitly by (occurredAt, resolutionCycleId) —
   // see compareResolutionRecency — never by input array order or eventId, so the same stored
-  // events always project the same branch regardless of how the rows were read. A valid branch
-  // event is a resolution_completed that carries a resolutionType (the schema-required branch
-  // axis). Rework cycles (repeated resolution_completed per run) keep their event history in the
-  // immutable event store and are intentionally NOT counted as extra runs anywhere: the public
-  // funnel counts distinct runs per step and one final branch per run, so rework never inflates
-  // public run counts.
+  // events always project the same branch regardless of how the rows were read (review P1.6:
+  // deterministic cycle selection by (occurredAt, resolutionCycleId), not plain event ordering).
+  // A valid branch event is a resolution_completed that carries a resolutionType (the
+  // schema-required branch axis). DRIFT (review P1.6, documented in the package README): full
+  // terminal-cycle state — deferred or superseded cycles, disposition carried across cycles — is
+  // OUT of this slice; the branch is the latest valid resolution by (occurredAt,
+  // resolutionCycleId) only. Rework cycles (repeated resolution_completed per run) keep their
+  // event history in the immutable event store and are intentionally NOT counted as extra runs
+  // anywhere: the public funnel counts distinct runs per step and one final branch per run, so
+  // rework never inflates public run counts.
   const latestResolutionByRun = new Map<string, AcceptedEventRow>();
   for (const event of cohortEvents) {
     if (event.eventType !== 'resolution_completed' || !event.resolutionType) continue;
@@ -152,10 +156,16 @@ export async function buildSnapshotForWindow(
   // hash never depends on arbitrary row order or host collation.
   windowQuarantines.sort((a, b) => compareCodePoints(a.occurredAt, b.occurredAt) || compareCodePoints(a.eventId, b.eventId));
   const invalidEvents = windowQuarantines.length;
-  // Quarantine records retain their safe runId when one was present. Records without a safe
-  // runId cannot be attributed to a run and are conservatively suppressed from the run-unit
-  // count: they never create pseudo sample units (which could mask a small attributable cohort).
-  const invalidEventRuns = new Set(windowQuarantines.flatMap((record) => (record.runId ? [record.runId] : []))).size;
+  // Quarantine records retain their safe runId when one was present. Sample units are
+  // deduplicated safe runIds RESTRICTED TO THE SNAPSHOT COHORT (review P2): a quarantine record
+  // attributed to a run outside this snapshot's run_started cohort never creates a sample unit
+  // (the k-protection denominator is the cohort; cross-cohort units would leak a different
+  // population into a cohort-scoped group). Records without a safe runId or outside the cohort
+  // are conservatively suppressed from the run-unit count: they never create pseudo sample units
+  // (which could mask a small attributable cohort).
+  const invalidEventRuns = new Set(
+    windowQuarantines.flatMap((record) => (record.runId && cohort.has(record.runId) ? [record.runId] : [])),
+  ).size;
   // dataFreshnessSeconds is measured against the FIXED as-of point (snapshotAt), not the build
   // wall clock: the served snapshot is immutable, so its freshness is frozen at the as-of point
   // it represents. This keeps responseJson a PURE function of the canonical inputs (events,
