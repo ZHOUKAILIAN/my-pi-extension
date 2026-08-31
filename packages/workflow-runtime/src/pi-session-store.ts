@@ -1,6 +1,6 @@
 import type { Checkpoint, RunStore, Stage } from '@pi/workflow-contracts';
 
-const STAGES: ReadonlySet<string> = new Set(['INVESTIGATING', 'IMPLEMENTING', 'VERIFYING', 'ACCEPTED', 'BLOCKED', 'WAITING_FOR_USER']);
+const STAGES: ReadonlySet<string> = new Set(['INTAKE', 'INVESTIGATING', 'DISPOSITION', 'IMPLEMENTING', 'VERIFYING', 'BLOCKED', 'WAITING_FOR_USER', 'ACCEPTED']);
 
 /** 主 Pi session 的 entry 是持久化真相；内存只负责当前调用的轻量缓存。 */
 export class PiSessionRunStore implements RunStore {

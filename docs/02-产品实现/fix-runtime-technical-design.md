@@ -315,7 +315,6 @@ Policy 不得配置为绕过 L1 最低保证。以下控制由 Runtime 固定强
         "requiredApprovals": 1,
         "requireIndependentWorker": true,
         "excludeNodes": ["implement"],
-        "requiredFindingDisposition": "closed",
         "onRejected": "return_to_implementation"
       }
     },
@@ -684,7 +683,134 @@ flowchart TD
   compatibility -->|不通过| blocked
 ```
 
-当前实现只有 Stage 和部分 Artifact 恢复，尚未保存上述完整 Node Execution、Review 和版本 provenance。
+当前实现恢复阶段覆盖 Stage、Artifact 与候选版本；restore 对 checkpoint 做 fail-closed 的
+Provenance 与验收重放（见本节“恢复”段落）：
+
+- worker Artifact 必须以 runId 为前缀且 nodeExecutionId 的 node 段必须能产出对应 kind
+  （未知 node 一律拒绝）；受控终局定义下该 kind 绑定在 executeNode 提交时即强制（NODE_KIND_MISMATCH），
+  restore 对历史 checkpoint 同样 fail-closed；评审 Artifact 必须由与所评产物不同的 workerId 产出（防“自我评审”）；
+- controller/用户不得以 controller producerKind 伪造业务 Artifact 冒充 worker 产出；
+- BLOCKED checkpoint 保存产生阻塞所在 returnStage（如外部条件验证失败 → VERIFYING），
+  跨 session 恢复时回到阻塞点所在阶段，不默认回滚到 INVESTIGATING；
+- v2 ACCEPTED checkpoint 恢复 fail-closed 由三层事实共同构成：
+  1) Runtime decide() 盖章的显式决策记录（checkpoint.decisionRecord：producerKind='user_decision' +
+     source='runtime:decide' + requestId 绑定 pendingDecisionRequest）；平铺字段
+     decisionKind/decisionReference 可手填，不是可验证的 approve 事实；
+  2) 来源绑定：受控终局定义必须声明 definition.sourceVersion，且 checkpoint 顶层
+     sourceVersion === 定义声明值（unbound 或自洽伪造字符串都不是完整 V2 来源事实）；
+  3) 决策记录与 checkpoint 的版本绑定（approve 必须携带与 run 候选版本一致的 candidateRevision）；
+  并且 decisionRecord 必须被 checkpoint.artifacts 中 Runtime decide() 盖章归档的 user_decision 审批
+  Artifact 背书（producer='user'、producerKind='user_decision'）。该 Artifact 在 applyTransition('ACCEPTED')
+  之前写入 Runtime 产物集（checkpoint 序列化读同一产物集），因此真实写出与恢复校验同源；恢复时
+  restoreArtifacts 不对 user_decision 强制 worker business conclusion（它是 Runtime 的验收背书，不是
+  worker 业务事实）。
+  三者全过后再按 decisionReference 合成人工 approve 重新求值完整 Acceptance，任一验收事实缺失
+  或伪造（ACCEPTED_ACCEPTANCE_NOT_MET）都 fail-closed 拒绝恢复，不产出“已解决（验收通过）”报告。
+- 受控扩展 reviewPolicyFor：runReview 与 DISPOSITION→IMPLEMENTING 的 change_plan_review 门禁都绑定
+  “当前有效策略”（逻辑等价摘要 policyDigest）：降级策略 runReview 直接拒绝（REVIEW_POLICY_MISMATCH），
+  账本周期被篡改时门禁按当前策略重算 quorum 并按唯一评审者身份计数（同一 worker 重复出票不能凑足
+  人数，REVIEWER_WORKER_ID_REPEATED）。
+- change_plan_review 周期的身份绑定（S1 影子节点）：周期由 runReview 记账产出时必须绑定到规定义上的
+  change_plan_review 节点 id；门禁在 DISPOSITION→IMPLEMENTING 检查
+  NODE_KIND_BY_NODE_ID[cycle.reviewNodeId] === 'change_plan_review'，因此用声明之外的节点名
+  （如 change_plan_review_shadow）发起 runReview（runReview 对未知 id 保持通用语义）无法产生可放行
+  的正式周期（CHANGE_PLAN_REVIEW_NOT_BOUND）。恢复（配置 reviewPolicyFor 时）同样按
+  NODE_KIND_BY_NODE_ID[record.reviewNodeId] === record.reviewArtifactKind 校验每个周期节点，
+  语义不一致的周期 CHECKPOINT_REVIEW_LEDGER_INCONSISTENT。
+- reviewCycleId 唯一性：周期 id 是账本↔Artifact 盖章的绑定键，为 `${runId}.review.<clock>.<seq>`，
+  seq 为实例内单调序号（恢复时以已有周期 id 的最大序号后缀为起点，而不是条数——条数可能与最大序号
+  不一致）。默认 clock 为毫秒级，同一 run 内同一毫秒发起两次 runReview 若不区分序号会产生相同周期
+  id，导致门禁/恢复的账本-产物推导把多轮评审产物串进同一周期（误拒合法流程）。
+- 账本形状 fail-closed（S2b/S7）：checkpoint.reviewCycles 只要存在就必须逐条完整合法；非数组或
+  含形状非法记录一律 CHECKPOINT_REVIEW_LEDGER_INCONSISTENT，不得静默过滤后继续（过滤会丢失审计
+  事实并让受损账本看起来正常）。
+- 验收的账本要求（S1/P2-3）：change_plan_review_accepted 现在要求评审不仅内容/顺序/处置绑定成立，
+  还必须由 Runtime review cycle 记账产出（同一套绑定规则：cycle 存在 + 节点身份 + 当前策略摘要 +
+  推导数字一致 + quorum）——只删掉 reviewCycles 让伪造 ACCEPTED 过关的路径被关闭；无仓库变更路径
+  不需要方案评审，同样不需要账本。
+- 恢复账本一致性（SP3）：配置 reviewPolicyFor 的受控恢复在 restore 阶段即核对每个账本周期——
+  周期必须由当前有效策略产出（policyDigest 一致），且 approvals/passed/唯一评审者数字必须能被
+  checkpoint 中实际评审 Artifact 支撑；账本整体伪造（当前摘要 + 手写 cycleId + 虚增 quorum）在
+  restore 阶段即 fail-closed（CHECKPOINT_REVIEW_LEDGER_INCONSISTENT）。未配置 resolver 的通用
+  restore 保持形状校验。
+- 账本形状逐条完整（round-4 Spec P2）：形状校验覆盖全部必填字段——cycleId、reviewNodeId、
+  reviewArtifactKind、reviewedNodeId、requiredApprovals/approvals（有限非负整数，NaN/负数/小数
+  拒绝）、passed、reviewerWorkerIds（非空字符串数组）、policyDigest、dispositionIndexAtCycle
+  （≥ -1）、recordedAtIndex（≥ 0）。缺任一字段即 CHECKPOINT_REVIEW_LEDGER_INCONSISTENT。
+- 恢复重建 Node→Worker 身份（round-4 S1/P1）：restore 把 checkpoint 中带 nodeExecutionId 的
+  Artifact 按 node 段登记进 nodeWorkerIds，恢复后新发起的 runReview（requireIndependentWorker /
+  excludeNodes / reviewedNode 排除）仍把历史作者排除——恢复不是绕过评审独立性的后门。
+- run_started 一次性（round-4 S4/P4）：run_started 只在 Runtime 创建新 runId 后发一次；恢复同一
+  runId 时恢复已执行的 Artifact 即视为已启动，续跑的第一个 Node 不得再次产生启动事件。
+- 验证 Guard 稳定码（round-4 S2/P3）：guardVerification 的失败以 message 前缀码形式抛出，扩展端
+  withGuardCode 提升为结构化 code 写入 workflow-node-failure.data.code 与通知；无法解析前缀的
+  普通错误用 VERIFICATION_GUARD_FAILED 兜底（都是稳定码，不是自由文本）。
+- WAITING_FOR_USER 恢复的等待现场（P2-1 bound）：受控终局定义且 checkpoint 携带
+  pendingDecisionRequest 时，恢复的等待态必须由“已接受的验证（或配置类失败的验证）”背书，否则
+  CHECKPOINT_STATE_INCONSISTENT——凭空伪造的等待态不得续跑后在同一个调用里直接 approve。
+  无决策管线的最小形状校验现场不受影响。
+- 决策 Artifact 三处版本同源（P2-2）：run 产生候选版本时，approve 决策有三处必须绑定同一
+  candidateRevision——平铺 decisionCandidateRevision、decisionRecord.candidateRevision、以及
+  Runtime 盖章归档的 user_decision Artifact 上的 candidateRevision；任一处缺失或不一致 →
+  ACCEPTED_ACCEPTANCE_NOT_MET。
+- 受控终局能力显式声明（P1-1）：仅当定义显式声明 decision: 'user' 且 acceptance 带
+  human_final_approval marker 时，Runtime 才保有 ACCEPTED 终局唯一 owner 权；legacy 定义未
+  opt-in 时保留自身 guard/transition 语义（合法不变量保持）。不允许仅凭 marker 推断受控终局。
+- live 来源绑定（SP2）：受控终局定义下，applyTransition('ACCEPTED') 时若定义声明了 sourceVersion，
+  Runtime 当前来源必须等于声明值（ACCEPTED_SOURCE_VERSION_MISMATCH）。防止“伪造来源的非终局
+  checkpoint 续跑后在同一 continueRun 内 approve 直接产出 ACCEPTED 并发报告”（该 ACCEPTED 不再经过
+  restore 的顶层来源检查）。Runtime 控制面错误（CheckpointRestoreError / WorkflowRuntimeError /
+  ReviewPolicyError 等带稳定 code 的错误）在 extension 统一收敛为 `fix failed/paused: message (CODE)`
+  通知与 trace，失败后清理 workflow working 状态（避免 UI 一直显示执行中）。
+- 暂停即清理 working（round-4 S3）：workflow 停止主动执行并等待外部输入的所有分支——用户取消/
+  无交互收集中断、验收条件不满足、BLOCKED 无 UI、BLOCKED 用户未提供补充信息——都在 return 前
+  clearWorkflowWorking，避免 Pi UI 持续显示“执行中”。
+- nodeExecutionId 解析单点（round-5 S1/P1）：node 段只有一条严格规则 `${runId}.<node>.<ts>`（node
+  非空、不含点；ts 非空，不强制数字以兼容旧数据）。恢复校验与 collectNodeWorkerIds 共用同一
+  解析函数：多段/缺段/空段一律 fail-closed（INVALID_CHECKPOINT_PROVENANCE），杜绝“多段 executionId
+  通过恢复校验却不登记进排除表 → 同一作者恢复后自评”的绕过。
+- started 标记落盘（round-5 S2）：首次执行 Node 时，Runtime 在发出 run_started 的同一时刻补写一条
+  最小 checkpoint（仅 {runId, stage, started:true}，无业务字段）；此后每次 checkpoint 顶层带
+  started:true。恢复规则：started:true → 已启动；无字段但已有 Artifact → 推断已启动；两者皆无 →
+  确未启动，续跑仍允许首次启动事件。首个 Node 即使 Worker 提交前失败（0 Artifact）也不会对同一
+  runId 重复发出 run_started。contracts `Checkpoint` 增加 `started?: boolean`。
+- 账本身份/位置绑定（round-5 S3）：deriveCycleFacts 除 counts 外还推导评审者身份集合
+  （reviewerWorkerIds，去重排序）与周期最后一个 Artifact 的真实位置（lastCycleArtifactIndex）。
+  门禁、planReviewCycleBacked 与恢复 reconcile 三处都要求账本 reviewerWorkerIds 与推导集合完全一致
+  （sameReviewerSet）且 recordedAtIndex === lastCycleArtifactIndex——“同一个周期换同一人数的另一伙人”
+  或“把记账位置改到其他产物上”都只是不算数的伪造。身份集合与记账位置是与策略无关的事实，configured
+  与 unconfigured 两条路径都强制；严格性有保障：artifacts 只追加、下标永不重排，真实记账时刻
+  （book 时 artifacts.length-1）恢复到现场时仍精确等于该周期最后一条 Artifact 的下标。
+- 决策来源诚实（round-5 P5）：decisionRecord（含 source: 'runtime:decide'）只由 decide() 委托路径
+  盖章（决策全程置 decisionRecordProducer，失败/异常 finally 复位）；legacy resume()/gate 决策不附加
+  v2 决策来源记录，保持 legacy 形状。requestId 缺失时 decisionReference/decisionRecord.requestId 直接
+  省略，绝不写出 'undefined' 字面量。
+- 验证 Guard 码命名空间（round-5 P4）：withGuardCode 只承认 ^VERIFICATION_[A-Z0-9_]+: 前缀；
+  其他大写前缀的普通错误回退 VERIFICATION_GUARD_FAILED（稳定码，不把自由文本当码）。round-6 补齐
+  边界测试：VERIFICATION_ 前缀提升为码、其他大写前缀/裸前缀/大小写不符/非 Error 输入一律回退。
+- started 标记上下文完整（round-6 P1-1 回归修复）：启动标记从最小 {runId, stage, started:true} 升级为
+  携带 workflowVersion/policyDigest/sourceVersion（workflowVersion = definitionVersion ??
+  sourceVersion；sourceVersion = 实例来源 ?? definition 声明来源）。原因：首 Worker 在提交前失败后恢复
+  该标记，若缺版本/策略会被判定 checkpointIncomplete、缺来源则后续盖章退回 'baseline' 触发
+  ACCEPTED_SOURCE_VERSION_MISMATCH——ACCEPTED 在 rescue 路径上永远不可达。恢复时三者在 executeNode
+  前已恢复到实例；单元测试覆盖真实“首节点失败 → 恢复标记 → 重试 intake/verify → approve → ACCEPTED”
+  （requiresArtifactConclusion 下 checkpoint_complete 与来源绑定均需通过）。
+- cycleId 唯一性（round-6 P2-1）：cycleId 是账本↔Artifact 绑定键；checkpoint 中重复 cycleId 使反向
+  查找的解释依赖记录顺序，restore 一律 CHECKPOINT_REVIEW_LEDGER_INCONSISTENT fail-closed
+  （Set 大小 vs 长度），不再静默接受任一条。
+- 定义声明版本的恢复默认绑定（round-7 Spec P2）：restore 在定义声明 `version` 时以它作为默认期望
+  workflowVersion（expectedWorkflowVersion ?? definition.version）——调用方未显式传
+  expectedWorkflowVersion 也不能接受错误版本，恢复契约包含定义声明版本；
+  definition.version 未声明 → unbound，维持向后兼容。restore 重建的 definitionVersion 也使用该默认绑定。
+
+新增 follow-up（round-7 评审，均已记录、暂不扩 scope）：
+- 门禁重复校验路径：Transition Guard（assertChangePlanReviewGate）与 planReviewCycleBacked 各自复制了
+  账本查找/策略摘要/计数/评审者集合校验，返回形式不同；后续规则修改可能只更新一处（评审判断项，
+  非硬违约），重构前先收敛到共享校验路径。
+- test 33 证明力：重复 cycleId 的 fail-closed 实现已确认无绕过，但测试仅用最小 cycle record
+  （DISPOSITION 阶段、无 Artifact/策略 resolver 语境）；完整 Artifact + 策略 + 门禁回放场景留作后续加固。
+
+Pi 原生 `/resume` 负责选择并恢复历史 session。Fix 不注册自己的 `/resume` 命令；`session_start` 的 `reason=resume` 只允许 Fix 检查当前被恢复 session 内的未完成 Fix checkpoint。用户确认后，Controller 才能从该 checkpoint 继续原 `runId`；不得跨 session 搜索，不得创建新的 `runId`，也不得在没有用户确认时自动推进。投递 outbox 的恢复可以由 session 生命周期触发，但必须与 Fix Run 的恢复分开。
 
 ## 7. Audit Event 与漏斗计算
 
@@ -708,6 +834,27 @@ flowchart LR
 ```
 
 - Controller 在合同校验、Guard、Transition、人工决定和后验反馈发生时写入结构化事件；Worker 不能自行写成功事件或 Acceptance 结果；
+- 当前实现状态（本轮已落地子集）：事件由 Runtime.recordEvent 在真实产生点写入——runReview 评审
+  完成（investigation / change_plan_review / change_review 各自事件类型）、executeNode 提交/拒绝、
+  decide（人工决定 / run_accepted / run_rework 返工回流）、artifact 合同拒绝；事件携带实例内唯一 eventId
+  （idGen + 单调 eventSeq）、真实 sourceVersion 与 policyDigest，不虚构 bugCategory/riskLevel；
+  Fix 受控扩展经 auditSink 把全部事件桥到 host.appendEntry('workflow-audit', event)，写失败不阻塞业务。
+- 设计范围（S4/P2-4，未实现、目标 TODO）：完整漏斗事件（disposition_completed /
+  resolution_completed / verification_completed 等阶段/里程碑事件在流程中途的产生点）、完整
+  transition-record 账本（每条 Guard/Transition 的记录）、Projector / Metric 聚合器 / Snapshot。
+  这些仍是 7.3–7.7 的目标设计，不得当作已落地能力引用；当前只保证“已产生事件是可信原始事实”。
+- round-6 独立评审剩余产品语义/范围项（已记录，特此不静默扩 scope，需产品/L1 对齐后另行立项）：
+  P1-2 wait_decision / external_action 的“等待”语义是否应映射到 VERIFYING 而非当前 Stage；
+  P1-3 review reflow 对 reviewArtifacts[0] 与 conclusion.rejected 的处理；P1-4 requiresFormalPlanReview
+  尚未接线（见 README「已知 L1 / L2 Drift」表）；P1-5 非 approve 人工决定缺少盖章 Artifact（decisionRecord
+  目前只覆盖 approve 验收路径）；P1-6 Audit Event 完整性与原子性拓扑；S-1 Runtime 是否应承载 Fix 特定语义
+  （当前执行门禁如 review kind 映射、root_cause_alignment 等 check satisfier、change_plan_review gate 仍在
+  workflow-runtime，owner 待拆，见 README drift 表）；S-2 审计漏斗的架构
+  归属；S-3 正式计划评审的升级路径；P2-2 review-model 配置面；P2-3 报告投影；P2-4 reopened 语义。
+  这些 item 仅在 L1 确认后进入实现，或作为已知 drift 持续跟踪。
+- Fix 受控扩展在恢复路径（continueRun 与 applyReviewDecision）将 Runtime auditSink 桥接到
+  host.appendEntry('workflow-audit', event)：Fix 生产路径的事件走同一 append-only 通道，审计写入失败
+  不阻塞执行（recordEvent try/catch 吞掉，审计不得影响业务）；
 - Audit Event 是 append-only 原始事实；更正使用新事件和 `supersedesEventId`，不覆盖历史事件；
 - Trace 是面向用户的过程摘要，可以引用 Audit Event，但不能作为指标数据源；
 - Projector 按固定顺序把事件投影成 Run、candidate revision 和人工 Review cycle 状态；
@@ -724,13 +871,16 @@ type FixAuditEventType =
   | "artifact_submitted"
   | "artifact_rejected"
   | "investigation_review_completed"
+  | "change_plan_review_completed"
   | "disposition_completed"
+  | "resolution_completed"
   | "implementation_created"
   | "change_review_completed"
   | "verification_completed"
   | "human_review_decided"
   | "run_accepted"
-  | "run_reopened"
+  | "run_reopened"   // 预留给后验收 reopen 专项（D6）；语义源自归档评审草案，待 L1 回写，无 emit 点
+  | "run_rework"     // 验收前返工回流（decide 的 request_changes/reject/continue_* 路径）专用，不占用 reopened 语义
   | "run_rolled_back"
   | "post_acceptance_issue_confirmed";
 
@@ -744,8 +894,9 @@ interface FixAuditEvent<TType extends FixAuditEventType, TPayload> {
   workflowDefinitionVersion: string;
   policyDigest: string;
   stage: string;
-  bugCategory: string;
-  riskLevel: "low" | "medium" | "high" | "critical";
+  /** 未分类时不虚构：只有调用方/扩展实际传入分类时才写值（avoid fabricated defaults）。 */
+  bugCategory?: string;
+  riskLevel?: "low" | "medium" | "high" | "critical";
   nodeId?: string;
   nodeExecutionId?: string;
   workerId?: string;
@@ -763,12 +914,19 @@ interface FixAuditEvent<TType extends FixAuditEventType, TPayload> {
 
 约束如下：
 
-- `eventId` 全局唯一，`occurredAt` 统一使用 ISO 8601 UTC；同一事件只能追加一次；
+- `eventId` 全局唯一：当前实现以 `${runId}-<clock>.<seq>` 保证同一 run 内单调唯一（实例内事件序号
+  eventSeq 单调递增，避免同一毫秒内多个事件撞 id）；跨实例仍建议引入更强全局命名（见 7.1 设计范围）；
+  `occurredAt` 统一使用 ISO 8601 UTC；同一事件只能追加一次；
 - `runId` 是 Run 统计的去重键；`nodeExecutionId`、`workerId` 和 `reviewCycleId` 用于诊断重试、并行 Review 和返工；
-- `sourceVersion` / `candidateRevision` 必须引用发生该事件时实际校验的版本；人工决定必须记录 `approvedRevision` 或 `reviewedRevision`；
+- `sourceVersion` / `candidateRevision` 必须引用发生该事件时实际校验的版本；未分类时不虚构
+  bugCategory/riskLevel（缺分类事件进入数据质量，不当作已分类事实）；
+- runReview 的三类评审事件类型与评审种类严格对应：investigation_review →
+  `investigation_review_completed`、change_plan_review → `change_plan_review_completed`、
+  change_review → `change_review_completed`，不得把后两类混入 investigation 的默认类型；
 - `artifact_submitted` 记录尝试结果，`artifact_rejected` 记录合同、provenance 或业务 Guard 的拒绝原因；两者不能由 Worker 自行伪造；
+- `resolution_completed` 只能由 Controller 在当前 `resolutionCycleId` 的处置事实已完成、必要版本/生效/外部结果证据已确认，并且即将进入 `VERIFICATION` 时写入；`resolutionType` 必须是 L1 规定的五值之一；
 - `human_review_decided` 的 `decision` 只能由 Controller 接收用户的明确操作后写入，不能把模型输出当成人工决定；
-- `run_accepted` 只能在 Acceptance Definition 通过后由 Controller 写入；
+- `run_accepted` 只能在 Acceptance Definition 通过、人工 `approve` 且 Runtime 实际迁移到 `ACCEPTED` 后由 Controller 写入；
 - 后验问题、回滚和重新打开通过新事件追加，不能修改原来的 `run_accepted`；
 - 事件缺少指标所需字段时，必须进入数据质量统计，不能静默补值或进入成功分子。
 
@@ -914,37 +1072,63 @@ AI—人工一致率、错误放行率和后验逃逸率满足 L1 门槛
 
 任何条件不满足，结果是“继续全量人工”或“等待数据”，不是自动化通过。准入决策本身也写入版本化 Audit Event，记录适用的 Bug 类型、风险等级、指标快照和回退条件。
 
+### 7.7 Telemetry 事件与公共漏斗
+
+L1 公共漏斗在 L2 中固定投影为：
+
+```text
+run_started -> investigation_review_passed -> resolution_completed -> verification_passed -> run_accepted
+```
+
+投影按 `runId` 和公共节点去重；同一 Run 的重试、回退和返工不增加公共漏斗分母。`resolution_completed` 是跨五种 `resolutionType` 的统一中间事实，`implementation_created` 只属于代码或版本化配置分支。`insufficient_evidence`、等待和需求变更未完成采纳时不设置 `resolutionType`，并作为状态/原因事实单独投影。
+
+本地 `FixAuditEvent` 必须先经过显式白名单投影，才可形成离机 `FixTelemetryEvent`；不上传问题原文、Artifact 正文、模型输入输出、tool 参数、文件内容、Evidence 正文或 `workflow-trace`。Audit、outbox、传输失败和服务端投影的详细合同以本方案归档版本为参考，实施时必须补充对应源码和测试，不得从 Trace 或模型文本补推业务事件。
+
 ## 8. 当前实现与实施顺序
 
-当前源码事实：
+当前源码事实（v2 已实现，`packages/fix/src/definition.ts` 的 `fixDefinitionV2` 驱动）：
 
 ```text
-/fix
-  INVESTIGATING: investigate
-  IMPLEMENTING: implement
-  VERIFYING: verify
-  ACCEPTED: verification.accepted === true
+INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAITING_FOR_USER → ACCEPTED（BLOCKED 侧支）
+- INTAKE：summary + overview（phenomenon 已移除，旧仅 phenomenon 视为不完整）
+- INVESTIGATING：investigation + investigation_review（当前绑定 + 独立 Worker）
+- DISPOSITION：disposition + change_plan_review（repo-change 路径强制）
+- IMPLEMENTING：implementation + change_review（reviewedRevision 绑定当前 candidate）
+- VERIFYING：verification，accepted=false 按 failure.kind 三向分流
+- WAITING_FOR_USER：人工 approve/request_changes/reject/continue_verification；D3 等待路由（wait_decision / external_action 处置先停此处，pendingDecisionKind = disposition_decision / external_action_completion）
+- ACCEPTED：仅由 decide(approve) 经完整 Acceptance 进入
 ```
 
-当前尚未实现：
+当前尚未实现（已记录的 drift / 后续专项，不在本节之外声称完成；分期依据 L1「第一版范围」）：
 
 ```text
-INTAKE record
-investigation_review
-DISPOSITION
-change_plan_review
-change_review
-多 Reviewer Policy 和 quorum
-完整 workerId / nodeExecutionId 身份约束
-candidate revision 的跨 Artifact Guard
-基于实际工具 / 测试事实的 Verification Acceptance
-最终 WAITING_FOR_USER 人工验收
-静态 Review Panel 和 /fix review 入口
-完整 Audit Event、指标 Projector 和 Metric Snapshot
-完整 Node Execution checkpoint
+第一版待做：
+- owner 重构：Fix 业务执行门禁（review kind 映射、check satisfier、change_plan_review gate）与
+  PendingDecisionKind 语义迁回 packages/fix，或改为 WorkflowDefinition 显式 hook
+- 5 步公开漏斗与公开 API 合入（feat/fix-metrics-cloudflare 分支已实现，见 §7.7）
+
+后续版本（第一版由人工验收兑底）：
+- Arbiter 争议裁决
+- D5 requiresFormalPlanReview 的正式方案升级（第一版保守 BLOCKED）
+- ACCEPTED 后 reopen / rollback / 后验收复盘（D6）
+- 完整 Audit Event 漏斗、指标 Projector 与 Metric Snapshot（§7.3–7.6 为已归档目标设计，非第一版）
+- Feature workflow（D8）
+- parallel Review 执行（当前 runReview 串行）
+- UserDecision 完整 Artifact 持久化（当前为 checkpoint 字段级 decisionRecord）
+
+持续验证：
+- Context / Capability Isolation 的 OS 级隔离（D9）
 ```
 
-建议实施顺序：
+### TODO 跟踪
+
+- [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_KIND_BY_NODE_ID` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
+- [ ] **5 步公开漏斗合入（第一版）**：合入 `feat/fix-metrics-cloudflare` 分支（§7.7 公共漏斗、公开 API 与低样本保护）
+- [ ] **L2 §7.1–7.6 文档收敛（第一版）**：标注为已归档目标，或以 L2 内容重写归档件（原件已丢失，见 README drift 表）；仅 §7.7 保持第一版活跃目标设计
+- [ ] **最终处置报告完整模板（后续优化）**：扩展 `investigation` / `verification` / `disposition` 合同字段并重写渲染；方案与评审见归档评审件《2026-08-29-fix-报告重构-方案与评审》
+- [ ] **后续版本机制（第一版由人工验收兑底）**：Arbiter 争议裁决；D5 正式方案升级流程（当前保守 BLOCKED）；D6 后验收 reopen / rollback
+
+实施顺序（主体已完成；遗留项按上方 drift 跟踪）：
 
 ```mermaid
 flowchart TD
@@ -953,11 +1137,11 @@ Artifact envelope、Review、Verification、provenance]
   policy[2. Policy
 Review participants、数量、quorum、验证要求]
   runtime[3. Runtime
-Node execution、身份、Guard、checkpoint]
+Node execution、身份、Guard、checkpoint；业务门禁 owner 待拆]
   fixDefinition[4. Fix Definition
-迁入 packages/fix，Runtime 保留通用机制]
+状态图已迁 packages/fix，执行门禁待迁]
   extension[5. Extension
-按 Policy 调度多个 Reviewer 和回退路径]
+按 Policy 调度 Reviewer 和回退路径]
   evidence[6. Evidence / Acceptance
 工具事实、版本绑定、整体验收]
   tests[7. Tests

@@ -1,110 +1,192 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import extension from '../src/extension.ts';
+import { loadEffectivePolicy } from '../src/effective-policy.ts';
+import { FIX_NODE_IDS } from '../src/definition.ts';
 
-function commandHarness(options: { answers?: any[]; cwd?: string; model?: any; registry?: any; hasUI?: boolean; input?: string } = {}) {
+// ============================================================
+// fix v2 /fix command 契约测试：命令路由、审计载荷、checkpoint 顺序、验证契约重试。
+// 测试壳：注入单 worker 顺序消费 answers；appendEntry 收集 audit 条目。
+// ============================================================
+
+const intakeShape = { kind: 'intake', summary: '登录后白屏', overview: '登录后白屏，影响核心链路，怀疑前端渲染异常', conclusion: { status: 'accepted', summary: 'intake recorded' } };
+const investigationShape = { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'], conclusion: { status: 'accepted', summary: 'cause investigated' } };
+const ireviewShape = (status: 'accepted' | 'rejected') => ({
+  kind: 'investigation_review',
+  rootCauseConclusion: 'cause',
+  evidenceSufficiency: 'sufficient',
+  gaps: [],
+  conclusion: { status, summary: 'ok' },
+});
+const dispositionShape = (requiresRepositoryChange: boolean) => ({
+  kind: 'disposition',
+  dispositionType: 'remediation',
+  requiresRepositoryChange,
+  minimalScope: 'a.ts',
+  risks: [],
+  verificationTarget: 'tests',
+  conclusion: { status: 'accepted', summary: 'plan' },
+});
+const cprShape = {
+  kind: 'change_plan_review',
+  rootCauseAlignment: true,
+  changedScope: 'a.ts',
+  risks: [],
+  compatibility: [],
+  verification: [],
+  rollback: [],
+  findings: [],
+  conclusion: { status: 'accepted', summary: 'ok' },
+};
+const implementationShape = (rev = 'rev-1') => ({
+  kind: 'implementation',
+  artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: rev },
+  conclusion: { status: 'accepted', summary: 'implementation completed' },
+});
+const creviewShape = (rev = 'rev-1') => ({
+  kind: 'change_review',
+  reviewedRevision: rev,
+  findings: [],
+  findingDisposition: 'all_closed',
+  conclusion: { status: 'accepted', summary: 'ok' },
+});
+const verificationChecks = {
+  original_issue: true,
+  root_cause_cut: true,
+  identified_impact_surface: true,
+  regression_and_compatibility: true,
+};
+const verificationShape = (extra: Record<string, unknown> = {}) => ({
+  kind: 'verification',
+  accepted: true,
+  evidence: ['test:unit'],
+  candidateRevision: 'rev-1',
+  checks: verificationChecks,
+  conclusion: { status: 'accepted', summary: 'verification completed' },
+  remainingRisk: ['无'],
+  ...extra,
+});
+
+const fullFlowAnswers = () => [
+  intakeShape,
+  investigationShape,
+  ireviewShape('accepted'),
+  dispositionShape(true),
+  cprShape,
+  cprShape,
+  implementationShape(),
+  creviewShape(),
+  verificationShape(),
+];
+
+function commandHarness(opts: { answers?: any[]; input?: string; selects?: string[] } = {}) {
   const entries: any[] = [];
   const notifications: string[] = [];
-  let command: any;
+  let handler: any;
   let calls = 0;
-  let inputCalls = 0;
-  const answers = options.answers ?? [];
+  let inputAnswer = opts.input ?? '';
+  const selects = [...(opts.selects ?? ['通过并接受'])];
+  const answers = opts.answers ?? [];
   const pi: any = {
+    on: () => {},
     fixWorker: { execute: async () => answers[calls++] },
     appendEntry: (customType: string, data: any) => entries.push({ customType, data }),
-    registerCommand: (_name: string, value: any) => { command = value.handler; },
+    sendMessage: () => {},
+    registerCommand: (_name: string, def: any) => { handler = def.handler; },
   };
   const ctx: any = {
-    cwd: options.cwd ?? mkdtempSync(join(tmpdir(), 'fix-test-cwd-')),
-    model: options.model,
-    modelRegistry: options.registry,
+    cwd: mkdtempSync(join(tmpdir(), 'fix-test-')),
+    hasUI: true,
     thinkingLevel: 'high',
-    hasUI: options.hasUI ?? true,
     isProjectTrusted: () => true,
     sessionManager: { getEntries: () => entries },
     ui: {
-      input: async () => { inputCalls += 1; return options.input; },
-      notify: (message: string) => notifications.push(message),
+      notify: (message: string, type?: string) => notifications.push(`${type ?? 'info'}: ${message}`),
+      confirm: async () => true,
+      input: async () => inputAnswer,
+      select: async () => selects.shift(),
     },
   };
   extension(pi);
-  return { command, ctx, entries, notifications, calls: () => calls, inputCalls: () => inputCalls };
+  return {
+    run: (args: string) => handler(args, ctx),
+    calls: () => calls,
+    entries,
+    notifications,
+    ctx,
+    setInput: (value: string) => { inputAnswer = value; },
+  };
 }
 
-const acceptedAnswers = () => [
-  { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
-  { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
-  { kind: 'verification', accepted: true, evidence: ['tests'], candidateRevision: 'rev-1' },
-];
+const workflowRuns = (h: ReturnType<typeof commandHarness>) => h.entries.filter((entry) => entry.customType === 'workflow-run');
 
-test('each identical problem starts a distinct run', async () => {
-  const h = commandHarness({ answers: [...acceptedAnswers(), ...acceptedAnswers()] });
-  await h.command('登录后白屏', h.ctx);
-  await h.command('登录后白屏', h.ctx);
-  const initials = h.entries.filter((entry) => entry.customType === 'workflow-run' && entry.data.id.endsWith('-initial'));
-  assert.equal(initials.length, 2);
-  assert.notEqual(initials[0].data.runId, initials[1].data.runId);
-});
-
-test('a policy failure writes no command, checkpoint, audit, or worker output', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'fix-command-'));
-  mkdirSync(join(cwd, '.pi'));
-  writeFileSync(join(cwd, '.pi', 'workflow-models.json'), '{');
-  const h = commandHarness({ cwd, answers: acceptedAnswers() });
-  await h.command('登录后白屏', h.ctx);
+test('空问题只显示 usage，不起新 run 也不调用 worker', async () => {
+  const h = commandHarness({ answers: fullFlowAnswers() });
+  await h.run('');
   assert.equal(h.calls(), 0);
-  assert.deepEqual(h.entries, []);
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-command').length, 0);
+  assert.ok(h.notifications.some((text) => text.includes('usage')), `notifications: ${h.notifications.join(' | ')}`);
 });
 
-test('a missing configured model writes no command, checkpoint, audit, or worker output', async () => {
-  const cwd = mkdtempSync(join(tmpdir(), 'fix-command-'));
-  mkdirSync(join(cwd, '.pi'));
-  writeFileSync(join(cwd, '.pi', 'workflow-models.json'), JSON.stringify({ version: 1, default: 'missing/model' }));
-  const h = commandHarness({ cwd, answers: acceptedAnswers(), registry: { find: () => undefined } });
-  await h.command('登录后白屏', h.ctx);
+test('完整 9 调用流程写出 start 审计、INTAKE checkpoint 与 8 节点 model-policy', async () => {
+  const h = commandHarness({ answers: fullFlowAnswers() });
+  await h.run('登录后白屏');
+  assert.equal(h.calls(), 9);
+
+  const start = h.entries.find((entry) => entry.customType === 'workflow-command');
+  assert.ok(start, 'workflow-command entry missing');
+  assert.equal(start.data.operation, 'start');
+  assert.ok(typeof start.data.runId === 'string' && start.data.runId.length > 0);
+
+  // run-start 条目带 workflowVersion/policyDigest，started 标记条目只带 started:true；
+  // 取 run-start 条目校验定义与策略信封。
+  const firstRun = [...workflowRuns(h)].find((entry) => entry.data.workflowVersion === 'fix-v2')!;
+  assert.equal(firstRun.data.stage, 'INTAKE');
+  assert.equal(firstRun.data.workflowVersion, 'fix-v2');
+  assert.equal(firstRun.data.policyDigest, loadEffectivePolicy(h.ctx.cwd, { trusted: true }).digest);
+
+  const modelPolicyNodeIds = h.entries
+    .filter((entry) => entry.customType === 'workflow-model-policy')
+    .map((entry) => entry.data.nodeId);
+  assert.deepEqual([...new Set(modelPolicyNodeIds)].sort(), [...FIX_NODE_IDS].sort());
+});
+
+test('checkpoint stage 序列覆盖 8 阶段主流程', async () => {
+  const h = commandHarness({ answers: fullFlowAnswers() });
+  await h.run('登录后白屏');
+  // 启动标记（run_started 一次性语义的落盘）先于业务 checkpoint 写入，因此在 INTAKE 阶段会
+  // 出现两条 workflow-run 条目：run-start 条目与 started 标记条目。业务阶段序列从 INVESTIGATING 起。
+  const stages = workflowRuns(h).map((entry) => entry.data.stage);
+  assert.deepEqual(stages, ['INTAKE', 'INTAKE', 'INVESTIGATING', 'DISPOSITION', 'IMPLEMENTING', 'VERIFYING', 'WAITING_FOR_USER', 'ACCEPTED']);
+});
+
+test('/fix review 无待评审 run 时只 notify，不起新 run', async () => {
+  const h = commandHarness({ answers: fullFlowAnswers() });
+  await h.run('review 任意token');
   assert.equal(h.calls(), 0);
-  assert.deepEqual(h.entries, []);
+  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-command').length, 0);
+  assert.ok(h.notifications.some((text) => text.includes('no pending fix review')), `notifications: ${h.notifications.join(' | ')}`);
 });
 
-test('a BLOCKED run without UI does not ask for input or retry', async () => {
-  const h = commandHarness({
-    hasUI: false,
-    answers: [{ kind: 'investigation', route: 'needs_more_evidence', rootCause: 'evidence incomplete', evidence: ['missing'] }],
-  });
-  await h.command('登录后白屏', h.ctx);
-  assert.equal(h.calls(), 1);
-  assert.equal(h.inputCalls(), 0);
-  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'BLOCKED');
-});
-
-test('an invalid implementation artifact is retried and only a valid retry advances the workflow', async () => {
+test('验证契约不满足时自动重试一次 verify，重试通过后 ACCEPTED', async () => {
   const h = commandHarness({
     answers: [
-      { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
-      { kind: 'implementation', artifact: { summary: 'missing revision', filesChanged: ['a.ts'] } },
-      { kind: 'implementation', artifact: { summary: 'patch', filesChanged: ['a.ts'], candidateRevision: 'rev-1' } },
-      { kind: 'verification', accepted: true, evidence: ['tests'], candidateRevision: 'rev-1' },
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionShape(true),
+      cprShape,
+      cprShape,
+      implementationShape(),
+      creviewShape(),
+      verificationShape({ evidence: ['raw-evidence'] }),
+      verificationShape(),
     ],
   });
-  await h.command('登录后白屏', h.ctx);
-  assert.equal(h.calls(), 4);
-  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'ACCEPTED');
-});
-
-test('a repeatedly invalid implementation result pauses with an IMPLEMENTING checkpoint', async () => {
-  const h = commandHarness({
-    answers: [
-      { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] },
-      { kind: 'implementation', artifact: { summary: 'missing revision', filesChanged: ['a.ts'] } },
-      { kind: 'implementation', artifact: { summary: 'still missing revision', filesChanged: ['a.ts'] } },
-    ],
-  });
-  await h.command('登录后白屏', h.ctx);
-  assert.equal(h.calls(), 3);
-  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1).data.stage, 'IMPLEMENTING');
-  assert.equal(h.entries.filter((entry) => entry.customType === 'workflow-node-failure').at(-1).data.code, 'MISSING_CANDIDATE_REVISION');
-  assert.match(h.notifications.at(-1), /IMPLEMENTING paused/);
+  await h.run('登录后白屏');
+  assert.equal(h.calls(), 10);
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'ACCEPTED');
 });
