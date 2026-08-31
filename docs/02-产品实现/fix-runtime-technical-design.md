@@ -1099,18 +1099,34 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 - ACCEPTED：仅由 decide(approve) 经完整 Acceptance 进入
 ```
 
-当前尚未实现（已记录的 drift / 后续专项，不在本节之外声称完成）：
+当前尚未实现（已记录的 drift / 后续专项，不在本节之外声称完成；分期依据 L1「第一版范围」）：
 
 ```text
-Arbiter 争议裁决
-D5 requiresFormalPlanReview 的正式方案升级
-完整 Audit Event 漏斗、指标 Projector 与 Metric Snapshot（§7.3–7.7 目标设计）
-ACCEPTED 后 reopen / rollback / 后验收复盘（D6）
-Feature workflow（D8）
-Context / Capability Isolation 的 OS 级隔离（D9）
-parallel Review 执行（当前 runReview 串行）
-UserDecision 完整 Artifact 持久化（当前为 checkpoint 字段级 decisionRecord）
+第一版待做：
+- owner 重构：Fix 业务执行门禁（review kind 映射、check satisfier、change_plan_review gate）与
+  PendingDecisionKind 语义迁回 packages/fix，或改为 WorkflowDefinition 显式 hook
+- 5 步公开漏斗与公开 API 合入（feat/fix-metrics-cloudflare 分支已实现，见 §7.7）
+
+后续版本（第一版由人工验收兑底）：
+- Arbiter 争议裁决
+- D5 requiresFormalPlanReview 的正式方案升级（第一版保守 BLOCKED）
+- ACCEPTED 后 reopen / rollback / 后验收复盘（D6）
+- 完整 Audit Event 漏斗、指标 Projector 与 Metric Snapshot（§7.3–7.6 为已归档目标设计，非第一版）
+- Feature workflow（D8）
+- parallel Review 执行（当前 runReview 串行）
+- UserDecision 完整 Artifact 持久化（当前为 checkpoint 字段级 decisionRecord）
+
+持续验证：
+- Context / Capability Isolation 的 OS 级隔离（D9）
 ```
+
+### TODO 跟踪
+
+- [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_KIND_BY_NODE_ID` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
+- [ ] **5 步公开漏斗合入（第一版）**：合入 `feat/fix-metrics-cloudflare` 分支（§7.7 公共漏斗、公开 API 与低样本保护）
+- [ ] **L2 §7.1–7.6 文档收敛（第一版）**：标注为已归档目标，或以 L2 内容重写归档件（原件已丢失，见 README drift 表）；仅 §7.7 保持第一版活跃目标设计
+- [ ] **最终处置报告完整模板（后续优化）**：扩展 `investigation` / `verification` / `disposition` 合同字段并重写渲染；方案与评审见归档评审件《2026-08-29-fix-报告重构-方案与评审》
+- [ ] **后续版本机制（第一版由人工验收兑底）**：Arbiter 争议裁决；D5 正式方案升级流程（当前保守 BLOCKED）；D6 后验收 reopen / rollback
 
 实施顺序（主体已完成；遗留项按上方 drift 跟踪）：
 
