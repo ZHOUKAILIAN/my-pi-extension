@@ -1,0 +1,33 @@
+{
+  // Fix Metrics — PoC slice, synthetic-data-only.
+  //
+  // No real domain route, no production D1 id, no ingest secrets here.
+  //   - INGEST_TOKEN_CURRENT / INGEST_TOKEN_PREVIOUS are provided only via `wrangler secret put`
+  //     (or .dev.vars in local), never committed.
+  //   - FIX_METRICS_SYNTHETIC_ONLY defaults to "true" in code; setting it to "false" still cannot
+  //     enable real telemetry because the PoC worker refuses ingest when synthetic-only is off
+  //     (src/config.ts assertSyntheticOnly). Real production enablement requires a later slice.
+  //   - routes/custom domain are deliberately absent so this config can never serve the public
+  //     metrics.zhoukailian.wiki domain.
+  "name": "fix-metrics",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-08-30",
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "fix-metrics-poc",
+      "database_id": "poc-local-placeholder-do-not-deploy",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "vars": {
+    "FIX_METRICS_SYNTHETIC_ONLY": "true"
+  }
+}

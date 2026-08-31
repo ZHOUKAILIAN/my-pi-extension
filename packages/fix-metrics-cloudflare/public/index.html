@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fix Metrics — PoC (synthetic only)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; max-width: 720px; margin: 48px auto; padding: 0 16px; color: #1f2328; }
+    h1 { font-size: 20px; }
+    .banner { background: #fff7e6; border: 1px solid #ffd591; border-radius: 6px; padding: 10px 14px; font-size: 13px; }
+    table { border-collapse: collapse; width: 100%; margin-top: 16px; }
+    th, td { border: 1px solid #d0d7de; padding: 6px 10px; text-align: left; font-size: 14px; }
+    .status { margin-top: 16px; font-size: 14px; }
+    .muted { color: #656d76; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Fix Metrics</h1>
+  <div class="banner">合成数据 PoC（synthetic-data-only）。本页面与 <code>/api/v1/funnel</code> 只展示聚合结果；未接入真实 /fix telemetry，不展示单个 Run 明细，样本不足（k=5）时不显示任何分组数字。</div>
+  <div class="status" id="status">加载中…</div>
+  <div id="content" hidden></div>
+
+  <script type="module">
+    const statusEl = document.getElementById('status');
+    const contentEl = document.getElementById('content');
+
+    async function main() {
+      const latestRes = await fetch('/api/v1/snapshots/latest');
+      const latest = await latestRes.json();
+      if (latest.status === 'insufficient_history') {
+        statusEl.textContent = '暂无已发布 snapshot（insufficient_history）。';
+        return;
+      }
+      if (latest.status === 'low_sample_protected') {
+        statusEl.textContent = '样本不足（k=5），聚合结果已隐藏。';
+        return;
+      }
+      if (!latest.snapshotId) throw new Error('published snapshot metadata missing');
+      const funnelRes = await fetch('/api/v1/funnel?snapshotId=' + encodeURIComponent(latest.snapshotId));
+      const funnel = await funnelRes.json();
+      if (funnel.status === 'low_sample_protected') {
+        statusEl.textContent = '样本不足（k=5），聚合结果已隐藏。';
+        return;
+      }
+      if (funnel.status !== 'calculable') {
+        statusEl.textContent = '数据状态：' + funnel.status;
+        return;
+      }
+      statusEl.textContent = '窗口 ' + funnel.windowStart + ' → ' + funnel.windowEnd;
+      contentEl.hidden = false;
+      let rows = '';
+      for (const step of funnel.steps) {
+        rows += '<tr><td>' + step.eventType + '</td><td>' + step.runs + '</td><td>' +
+          (step.fromPreviousRate == null ? '—' : (step.fromPreviousRate * 100).toFixed(1) + '%') + '</td></tr>';
+      }
+      contentEl.innerHTML =
+        '<table><thead><tr><th>节点</th><th>去重 Run 数</th><th>相对上一步</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+        '<p class="muted">dataFreshnessSeconds: ' + funnel.dataFreshnessSeconds + '</p>';
+    }
+
+    main().catch((err) => { statusEl.textContent = '加载失败：' + err.message; });
+  </script>
+</body>
+</html>
