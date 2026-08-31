@@ -2364,6 +2364,62 @@ test('restore accepts a disposition wait with the matching pendingDecisionKind',
   }
 });
 
+// F2b：验证等待的 pendingDecisionKind 必须与验证现场配对——final_acceptance ↔ 已接受验证、
+// configuration_wait ↔ 配置类失败验证（accepted=false + failure.kind=configuration）。
+// 配对不合法（accepted=true 却声明 configuration_wait 或反之）的伪造/损坏 checkpoint fail-closed；
+// legacy 缺字段沿用推导回退（F2-4 已覆盖），合法配对不误拒。
+const verificationWaitRestoreCheckpoint = (opts: {
+  accepted: boolean;
+  failureKind?: 'configuration' | 'implementation';
+  pendingDecisionKind?: string;
+}) => ({
+  customType: 'workflow-run',
+  data: {
+    runId: 'run-f2v', schemaVersion: 1, stage: 'WAITING_FOR_USER', at: 1, id: 'c-f2v', workflowVersion: 'v1', policyDigest: 'd1',
+    pendingDecisionRequest: 'req-f2v',
+    ...(opts.pendingDecisionKind !== undefined ? { pendingDecisionKind: opts.pendingDecisionKind } : {}),
+    artifacts: [
+      {
+        kind: 'verification', accepted: opts.accepted, evidence: ['test:passed'], unverified: [], schemaVersion: 1, runId: 'run-f2v',
+        producerKind: 'worker', sourceVersion: 'def-src-v1', nodeExecutionId: 'run-f2v.verify.1', workerId: 'w',
+        ...(opts.accepted === false ? { failure: { kind: opts.failureKind ?? 'configuration', reason: '配置问题' } } : {}),
+        ...(opts.accepted ? { conclusion: { status: 'accepted', summary: 'ok' } } : { conclusion: { status: 'rejected', summary: 'failed' } }),
+      },
+    ],
+  },
+});
+
+// F2b-1：final_acceptance + 已接受验证 → 接受恢复（合法等待不误拒）。
+test('restore accepts final_acceptance paired with an accepted verification', () => {
+  const { entries, store } = makeStore();
+  entries.push(verificationWaitRestoreCheckpoint({ accepted: true, pendingDecisionKind: 'final_acceptance' }));
+  assert.equal(WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v').stage, 'WAITING_FOR_USER');
+  assert.equal(WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v').getPendingDecisionKind(), 'final_acceptance');
+});
+
+// F2b-2：final_acceptance + 配置类失败验证 → fail-closed（验证现场与等待种类不配对）。
+test('restore rejects final_acceptance declared on a configuration-failed verification', () => {
+  const { entries, store } = makeStore();
+  entries.push(verificationWaitRestoreCheckpoint({ accepted: false, failureKind: 'configuration', pendingDecisionKind: 'final_acceptance' }));
+  throwsCode(() => WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v'), 'CHECKPOINT_STATE_INCONSISTENT');
+});
+
+// F2b-3：configuration_wait + 已接受验证（accepted=true 却声明配置等待）→ fail-closed。
+test('restore rejects configuration_wait declared on an accepted verification', () => {
+  const { entries, store } = makeStore();
+  entries.push(verificationWaitRestoreCheckpoint({ accepted: true, pendingDecisionKind: 'configuration_wait' }));
+  throwsCode(() => WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v'), 'CHECKPOINT_STATE_INCONSISTENT');
+});
+
+// F2b-4：configuration_wait + 配置类失败验证 → 接受恢复（合法配置等待不误拒）。
+test('restore accepts configuration_wait paired with a configuration-failed verification', () => {
+  const { entries, store } = makeStore();
+  entries.push(verificationWaitRestoreCheckpoint({ accepted: false, failureKind: 'configuration', pendingDecisionKind: 'configuration_wait' }));
+  const restored = WorkflowRuntime.restore(makeDefinition(), store, 'run-f2v');
+  assert.equal(restored.stage, 'WAITING_FOR_USER');
+  assert.equal(restored.getPendingDecisionKind(), 'configuration_wait');
+});
+
 // F1：continue_disposition 决策记录（decisionRecord）必须保存用户决定内容（note/reasonCode），
 // 作为 trace 事实（完整 UserDecision Artifact 持久化仍为延后专项）。
 test('decide continue_disposition persists note/reasonCode in the decisionRecord', async () => {

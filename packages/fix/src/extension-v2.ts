@@ -1,11 +1,13 @@
 import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
 import type {
   Artifact,
+  Checkpoint,
   DispositionArtifact,
   EffectivePolicy,
   InvestigationArtifact,
   NodeDefinition,
   NodeExecutionConfig,
+  PendingDecisionKind,
   Stage,
   UserDecisionArtifact,
   VerificationArtifact,
@@ -638,7 +640,7 @@ export async function continueRun(
           // 等待种类以 Runtime 持久化的 pendingDecisionKind 为准（D3 两类处置等待没有验证现场，
           // isPendingConfigurationWait 推导不出）；legacy checkpoint 缺字段时回退到 Verification 推导。
           const pendingWaitKind = runtime.getPendingDecisionKind();
-          const isDispositionWait = pendingWaitKind === 'disposition_decision' || pendingWaitKind === 'external_action_completion';
+          const isDispositionWait = isDispositionWaitKind(pendingWaitKind);
           const isConfigWait = (pendingWaitKind === 'configuration_wait') || (!isDispositionWait && runtime.isPendingConfigurationWait());
           const configReason = isConfigWait ? results.verification?.failure?.reason : undefined;
           const dispositionWaitNotice = isDispositionWait
@@ -714,7 +716,8 @@ export async function continueRun(
           // 收集中断返回 undefined（用户取消/RPC 无 UI）时保持 WAITING_FOR_USER。
           const hasSelect = typeof ctx.ui.select === 'function';
           // 配置类等待只提供“继续验证/拒绝”；D3 处置等待提供“继续（用户已决定/外部动作已完成）/打回/
-          // 拒绝”（approve 在无验证现场时会被 acceptance 拒绝，不列为选项）。
+          // 拒绝”（approve 在无验证现场时会被 acceptance 拒绝，不列为选项）；final_acceptance 只提供
+          // 验收三动作，不展示 continue-disposition（无处置等待现场，decide 会抛 NOT_AVAILABLE）。
           const decision = await collectDecision(
             {
               hasUI: ctx.hasUI && hasSelect,
@@ -732,7 +735,9 @@ export async function continueRun(
                 }
               : isConfigWait
                 ? { requestId, candidateRevision: candidate, summary, actions: ['继续验证（配置已修改）', '拒绝'] }
-                : { requestId, candidateRevision: candidate, summary },
+                // final_acceptance（或 legacy 验证已接受的等待）：只提供验收三动作，不展示无效的
+                // continue-disposition 选项（选中后 decide 抛 CONTINUE_DISPOSITION_NOT_AVAILABLE 冒泡）。
+                : { requestId, candidateRevision: candidate, summary, actions: ['通过并接受', '打回（选择原因）', '拒绝'] },
           );
           if (decision === undefined) {
             ctx.ui.notify(`WAITING_FOR_USER: ${runId}`);
@@ -818,6 +823,26 @@ const withErrorCode = (message: string, error: unknown): string => {
   return code === undefined ? message : `${message} (${code})`;
 };
 
+// 处置等待种类判定（pendingDecisionKind）：disposition_decision / external_action_completion 两类
+// 处置等待才提供 continue-disposition 出口；final_acceptance / configuration_wait 不展示该动作
+//（选中后 decide 会抛 CONTINUE_DISPOSITION_NOT_AVAILABLE，见 workflow-runtime decideCore）。
+const isDispositionWaitKind = (kind: PendingDecisionKind | undefined): boolean =>
+  kind === 'disposition_decision' || kind === 'external_action_completion';
+
+// 由 checkpoint 现场推导“配置类验证失败等待”（与 runtime.isPendingConfigurationWait 语义一致：
+// 最新 verification accepted=false 且 failure.kind=configuration），供 /fix review 无 action 路径
+// 在 restore 之前按等待种类收窄动作集（legacy checkpoint 缺 pendingDecisionKind 时回退推导）。
+const checkpointIsConfigWait = (checkpoint: Checkpoint): boolean => {
+  const verification = [...(checkpoint.artifacts ?? [])].reverse().find((artifact) => artifact.kind === 'verification') as VerificationArtifact | undefined;
+  return verification?.accepted === false && verification?.failure?.kind === 'configuration';
+};
+
+// 引号包裹的多词内容解析：`"..."` 剥掉最外层英文引号；无引号（单 token）保持原样（向后兼容）。
+const unquoteContent = (token: string): string => {
+  const quoted = /^"([\s\S]*)"$/.exec(token);
+  return quoted ? quoted[1] : token;
+};
+
 // 应用一次人工最终验收决策：恢复 run（版本/策略摘要校验）、求值 acceptance、decide 并产出结果。
 // 供 runReviewCommand 的两个分支（命令行已带 action / UI collectDecision 收集）复用；
 // approve 通过时写最终处置报告（与 continueRun ACCEPTED 收尾共用模块级 buildFixReport）。
@@ -887,10 +912,15 @@ async function runReviewCommand(
   args: string,
   deps: { store: PiSessionRunStore; host: FixHost; policyDigest?: string },
 ): Promise<void> {
-  const match = args.match(/^review(?:\s+(\S+))?(?:\s+(approve|request-changes|reject|continue-verification|continue-disposition))?(?:\s+(\S+))?\s*$/);
+  // 动作后的剩余全部内容作为 note/reasonCode 载体（P3）：continue-disposition 需要承载含空格的
+  // 多词决定内容，支持引号包裹（`"..."`）；无引号的单 token 保持向后兼容。
+  const match = args.match(/^review(?:\s+(\S+))?(?:\s+(approve|request-changes|reject|continue-verification|continue-disposition))?(?:\s+(.+))?\s*$/);
   const runIdToken = match?.[1] || undefined;
   const action = match?.[2] as 'approve' | 'request-changes' | 'reject' | 'continue-verification' | 'continue-disposition' | undefined;
   const reasonToken = match?.[3] || undefined;
+  // 引号包裹的多词内容：`/fix review <runId> continue-disposition "用户决定按 mitigation 处置"`；
+  // 无引号单 token 保持原样（向后兼容）。request-changes 的原因码仍必须是 FIX_REVIEW_REASONS 枚举值。
+  const content = reasonToken === undefined ? undefined : unquoteContent(reasonToken.trim());
 
   const trusted = typeof (ctx as any).isProjectTrusted === 'function' ? (ctx as any).isProjectTrusted() : true;
   const currentPolicyDigest = loadEffectivePolicy(ctx.cwd, { trusted }).digest;
@@ -917,6 +947,19 @@ async function runReviewCommand(
     });
     ctx.ui.notify(`fix review pending: ${runId}`);
     if (ctx.hasUI && typeof ctx.ui.select === 'function') {
+      // 按等待种类（checkpoint.pendingDecisionKind；legacy 缺字段时由验证现场推导）收窄动作集：
+      // 处置等待才展示 continue-disposition；configuration_wait 只提供“继续验证/拒绝”；
+      // final_acceptance 只提供验收三动作，不展示无效的 continue-disposition 选项。
+      const pendingKind = checkpoint.pendingDecisionKind;
+      const isDispositionWait = isDispositionWaitKind(pendingKind);
+      const isConfigWait = pendingKind === 'configuration_wait' || (!isDispositionWait && checkpointIsConfigWait(checkpoint));
+      const actions = isDispositionWait
+        ? pendingKind === 'disposition_decision'
+          ? ['继续（已作出处置决定）', '打回（选择原因）', '拒绝']
+          : ['继续（外部动作已完成）', '打回（选择原因）', '拒绝']
+        : isConfigWait
+          ? ['继续验证（配置已修改）', '拒绝']
+          : ['通过并接受', '打回（选择原因）', '拒绝'];
       const decision = await collectDecision(
         {
           hasUI: true,
@@ -925,7 +968,7 @@ async function runReviewCommand(
           // F1：continue-disposition 需要收集用户处置决定内容（note）；无 input 能力的宿主缺省跳过。
           input: typeof ctx.ui.input === 'function' ? (prompt, placeholder) => ctx.ui.input(prompt, placeholder ?? '') : undefined,
         },
-        { requestId, candidateRevision: candidate },
+        { requestId, candidateRevision: candidate, actions },
       );
       if (decision) await applyReviewDecision(ctx, { ...deps, policyDigest: currentPolicyDigest }, runId, decision);
     }
@@ -942,20 +985,21 @@ async function runReviewCommand(
   }
   let reasonCode: string | undefined;
   if (action === 'request-changes') {
-    if (!reasonToken || !(Object.values(FIX_REVIEW_REASONS) as string[]).includes(reasonToken)) {
+    if (!content || !(Object.values(FIX_REVIEW_REASONS) as string[]).includes(content)) {
       ctx.ui.notify('usage: /fix review <runId> request-changes <原因码>');
       return;
     }
-    reasonCode = reasonToken;
+    reasonCode = content;
   } else if (action === 'continue-disposition') {
     // F1：continue_disposition 必须携带用户决定内容，避免无内容继续造成 wait_decision 反复循环。
-    if (!reasonToken) {
+    // 内容可含空格：引号包裹或多 token 整体作为内容；无引号单 token 保持兼容。
+    if (!content) {
       ctx.ui.notify('usage: /fix review <runId> continue-disposition <处置决定内容>');
       return;
     }
-    reasonCode = reasonToken;
+    reasonCode = content;
   } else {
-    reasonCode = reasonToken;
+    reasonCode = content;
   }
   const decision: UserDecisionArtifact = {
     kind: 'user_decision',

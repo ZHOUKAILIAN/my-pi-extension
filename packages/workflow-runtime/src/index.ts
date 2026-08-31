@@ -1884,6 +1884,12 @@ export class WorkflowRuntime {
         const pendingKindMismatch = pendingKind !== undefined && (
           (waitsOnDispositionDecision && pendingKind !== dispositionKindFor(restoredDisposition?.dispositionType))
           || (!waitsOnDispositionDecision && (pendingKind === 'disposition_decision' || pendingKind === 'external_action_completion'))
+          // F2b：验证等待的等待种类必须与验证现场配对——final_acceptance 只能由已接受验证产生，
+          // configuration_wait 只能由配置类失败验证（accepted=false + failure.kind=configuration）产生；
+          // accepted=true 却声明 configuration_wait（或反之）的伪造/损坏 checkpoint fail-closed，
+          // 避免 resume 后按错误等待种类渲染或误用 continue_verification/approve 出口。
+          || (pendingKind === 'final_acceptance' && restoredVerification?.accepted !== true)
+          || (pendingKind === 'configuration_wait' && !(restoredVerification?.accepted === false && restoredVerification.failure?.kind === 'configuration'))
         );
         if (!(waitsOnValidVerification || waitsOnDispositionDecision)
           || pendingKindMismatch

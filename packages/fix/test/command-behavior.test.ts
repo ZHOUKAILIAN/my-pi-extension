@@ -454,3 +454,96 @@ test('/fix review approve 在处置等待上被拒（无验证现场，验收未
   const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
   assert.equal(report, undefined, '被拒的 approve 不得产出最终处置报告');
 });
+// ============================================================
+// P2：/fix review 无 action 路径与 continueRun 的 collectDecision 按等待种类收窄动作集——
+// final_acceptance 只展示验收三动作、configuration_wait 只展示“继续验证/拒绝”，
+// 处置等待才展示 continue-disposition（避免展示无效选项选中后抛 NOT_AVAILABLE 冒泡）。
+// ============================================================
+
+test('/fix review 无 action：final_acceptance 只展示验收三动作（不含 continue-disposition）', async () => {
+  const h = commandHarness({ answers: [] });
+  // 显式 final_acceptance 种类（验证已接受）；同时覆盖 legacy 缺字段推导（base 无 pendingDecisionKind）。
+  h.entries.push(reviewWaitCheckpoint({ pendingDecisionKind: 'final_acceptance' }));
+  const selectCalls: string[][] = [];
+  h.ctx.ui.select = async (_title: string, options: string[]) => { selectCalls.push(options); return '通过并接受'; };
+  await h.run('review fix-r');
+  assert.deepEqual(selectCalls[0], ['通过并接受', '打回（选择原因）', '拒绝'], `动作集应按 final_acceptance 收窄: ${selectCalls[0]?.join(' | ')}`);
+  assert.ok(!selectCalls[0].includes('继续（已作出处置决定）'), 'final_acceptance 不得展示 continue-disposition 动作');
+  assert.ok(!selectCalls[0].includes('继续验证（配置已修改）'), 'final_acceptance 不得展示 continue-verification 动作');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'ACCEPTED', '选择验收动作应可 approve');
+});
+
+test('/fix review 无 action：处置等待展示 continue-disposition 动作（不含验收三动作）', async () => {
+  const h = commandHarness({ answers: [], input: '用户决定按 mitigation 处置' });
+  h.entries.push(dispositionWaitCheckpoint('wait_decision'));
+  const selectCalls: string[][] = [];
+  h.ctx.ui.select = async (_title: string, options: string[]) => { selectCalls.push(options); return '继续（已作出处置决定）'; };
+  await h.run('review fix-r');
+  assert.deepEqual(selectCalls[0], ['继续（已作出处置决定）', '打回（选择原因）', '拒绝'], `动作集应按处置等待收窄: ${selectCalls[0]?.join(' | ')}`);
+  assert.ok(!selectCalls[0].includes('通过并接受'), '处置等待不展示验收动作');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'DISPOSITION', '继续处置后回 DISPOSITION 重落地');
+});
+
+test('/fix review 无 action：configuration_wait 只展示“继续验证/拒绝”', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(reviewWaitCheckpoint({
+    candidateRevision: 'base-v1',
+    reviewCycles: [],
+    pendingDecisionKind: 'configuration_wait',
+    artifacts: [
+      { ...intakeShape, conclusion: { status: 'accepted', summary: 'stamped' }, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.intake.1', workerId: 'w:intake:1', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { ...investigationShape, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.investigate.2', workerId: 'w:investigate:2', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { ...ireviewShape('accepted'), schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.investigation_review.3', workerId: 'w:investigation_review:3', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { ...dispositionShape(false), schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.disposition.4', workerId: 'w:disposition:4', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+      { kind: 'verification', accepted: false, evidence: ['event:config'], candidateRevision: 'base-v1', checks: verificationChecks, remainingRisk: ['无'], failure: { kind: 'configuration', reason: '配置问题' }, conclusion: { status: 'rejected', summary: 'configuration failure' }, schemaVersion: 1, runId: 'fix-r', nodeExecutionId: 'fix-r.verify.5', workerId: 'w:verify:5', producerKind: 'worker', sourceVersion: FIX_SOURCE_VERSION, unverified: [] },
+    ],
+  }));
+  const selectCalls: string[][] = [];
+  h.ctx.ui.select = async (_title: string, options: string[]) => { selectCalls.push(options); return '继续验证（配置已修改）'; };
+  await h.run('review fix-r');
+  assert.deepEqual(selectCalls[0], ['继续验证（配置已修改）', '拒绝'], `动作集应按 configuration_wait 收窄: ${selectCalls[0]?.join(' | ')}`);
+  assert.ok(!selectCalls[0].includes('继续（已作出处置决定）'), 'configuration_wait 不得展示 continue-disposition 动作');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'VERIFYING', '继续验证回 VERIFYING 复测');
+});
+// ============================================================
+// P3：CLI continue-disposition 内容可承载含空格的多词文本（引号包裹或动作后剩余全部内容），
+// 无引号单 token 保持向后兼容。
+// ============================================================
+
+test('/fix review continue-disposition 支持引号包裹的多词内容（含空格）', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('wait_decision'));
+  await h.run('review fix-r continue-disposition "用户决定按 mitigation 处置"');
+  assert.equal(h.calls(), 0, 'review 命令不得触发任何 worker 调用');
+  const record = h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1)!.data.decisionRecord;
+  assert.equal(record.decision, 'continue_disposition');
+  assert.equal(record.reasonCode, '用户决定按 mitigation 处置', '引号包裹的多词内容应完整承载（含空格）');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'DISPOSITION', 'wait_decision 继续后回到 DISPOSITION 重落地处置');
+});
+
+test('/fix review continue-disposition 支持无引号多 token 内容（动作后剩余全部内容）', async () => {
+  const h = commandHarness({ answers: [] });
+  h.entries.push(dispositionWaitCheckpoint('external_action'));
+  await h.run('review fix-r continue-disposition 外部动作已完成 权限开通');
+  assert.equal(h.calls(), 0, 'review 命令不得触发任何 worker 调用');
+  const record = h.entries.filter((entry) => entry.customType === 'workflow-run').at(-1)!.data.decisionRecord;
+  assert.equal(record.reasonCode, '外部动作已完成 权限开通', '动作后剩余全部内容应完整承载（含空格）');
+  assert.equal(workflowRuns(h).at(-1).data.stage, 'VERIFYING', 'external_action 继续后无仓库变更回 VERIFYING 复测');
+});
+
+test('/fix review request-changes 仍按原因码枚举校验（多 token 内容不通过）', async () => {
+  // 合法原因码单 token 仍可用（回流 INVESTIGATING）。
+  const ok = commandHarness({ answers: [] });
+  ok.entries.push(reviewWaitCheckpoint());
+  await ok.run('review fix-r request-changes root_cause_or_impact');
+  assert.equal(workflowRuns(ok).at(-1).data.stage, 'INVESTIGATING', '根因错误打回回流 INVESTIGATING');
+  // 非法原因码（含多 token 内容）→ usage 拒绝且不推进阶段。
+  const bad = commandHarness({ answers: [] });
+  bad.entries.push(reviewWaitCheckpoint());
+  await bad.run('review fix-r request-changes 非法原因码 额外内容');
+  assert.ok(
+    bad.notifications.some((text) => text.includes('usage') && text.includes('request-changes')),
+    `notifications: ${bad.notifications.join(' | ')}`,
+  );
+  assert.equal(workflowRuns(bad).at(-1).data.stage, 'WAITING_FOR_USER', '非法原因码拒绝且不推进阶段');
+});
