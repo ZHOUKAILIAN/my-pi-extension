@@ -19,9 +19,9 @@ const ireviewShape = (status: 'accepted' | 'rejected') => ({
   gaps: [],
   conclusion: { status, summary: 'ok' },
 });
-const dispositionShape = (requiresRepositoryChange: boolean) => ({
+const dispositionShape = (requiresRepositoryChange: boolean, dispositionType = 'remediation') => ({
   kind: 'disposition',
-  dispositionType: 'remediation',
+  dispositionType,
   requiresRepositoryChange,
   minimalScope: 'a.ts',
   risks: [],
@@ -149,6 +149,59 @@ test('无仓库变更（requiresRepositoryChange:false）跳过实现与评审�
   // 实现实际执行 5 次 worker 调用：intake/investigate/investigation_review/disposition/verify。
   assert.equal(h.calls(), 5);
   assert.equal(lastStage(h), 'ACCEPTED');
+});
+
+// 最终报告「状态」按处置类型映射（remediation→已解决；mitigation→已缓解；explanation→无需修改），
+// 不得把已缓解/无需修改硬编码成「已解决（验收通过）」；未映射的非常规处置类型（如 change_request）
+// fallback 到「未解决」（wait_decision/external_action 被 D3 guard 拦在 WAITING_FOR_USER，无法直达
+// ACCEPTED，故 fallback 测试用可直达的 change_request 锚定）。
+test('报告状态按处置类型映射：mitigation→已缓解，explanation→无需修改，fallback→未解决（非仓库变更流）', async () => {
+  const reportStatusOf = async (dispositionType: string) => {
+    const h = commandHarness({
+      answers: [
+        intakeShape,
+        investigationShape,
+        ireviewShape('accepted'),
+        dispositionShape(false, dispositionType),
+        verificationShape(),
+      ],
+    });
+    await h.run();
+    assert.equal(lastStage(h), 'ACCEPTED');
+    const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
+    assert.ok(report, `workflow-fix-report missing for ${dispositionType}`);
+    return String(report.data.report);
+  };
+  const mitigationReport = await reportStatusOf('mitigation');
+  assert.ok(mitigationReport.includes('- 状态：已缓解（验收通过）'), mitigationReport.split('\n').slice(0, 6).join('\n'));
+  assert.ok(!mitigationReport.includes('已解决（验收通过）'));
+  const explanationReport = await reportStatusOf('explanation');
+  assert.ok(explanationReport.includes('- 状态：无需修改（验收通过）'), explanationReport.split('\n').slice(0, 6).join('\n'));
+  assert.ok(!explanationReport.includes('已解决（验收通过）'));
+  // fallback：映射表未涵盖的非常规 dispositionType（change_request）到 ACCEPTED 后报告「未解决」。
+  const fallbackReport = await reportStatusOf('change_request');
+  assert.ok(fallbackReport.includes('- 状态：未解决（验收通过）'), fallbackReport.split('\n').slice(0, 6).join('\n'));
+  assert.ok(!fallbackReport.includes('已解决（验收通过）'));
+});
+
+// F-4：external_action 完成后验收 → 报告状态「已解决（验收通过）」（外部动作完成且验证证明处置后实际状态）。
+test('报告状态映射：external_action 完成→已解决（D3 等待路由后验收）', async () => {
+  const h = commandHarness({
+    answers: [
+      intakeShape,
+      investigationShape,
+      ireviewShape('accepted'),
+      dispositionWaitShape('external_action'),
+      verificationShape(),
+    ],
+    selects: ['继续（外部动作已完成）', '通过并接受'],
+    input: '外部动作已完成：权限已由管理员开通',
+  });
+  await h.run();
+  assert.equal(lastStage(h), 'ACCEPTED');
+  const report = h.entries.find((entry) => entry.customType === 'workflow-fix-report');
+  assert.ok(report, 'workflow-fix-report missing');
+  assert.ok(String(report.data.report).includes('- 状态：已解决（验收通过）'));
 });
 
 test('评审拒绝回流：investigation_review rejected 后重跑 investigate 再到 ACCEPTED', async () => {

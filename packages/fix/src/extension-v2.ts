@@ -302,6 +302,22 @@ const buildFixReport = (results: Record<string, any>): string => {
   const verification = results.verification ?? {};
   const revision = implementation.candidateRevision ?? verification.candidateRevision ?? '未产生候选版本';
   const dispositionType = disposition.dispositionType ?? '未确认';
+  // 「状态」按处置类型映射 L1 最终处置报告状态枚举（已解决/已缓解/未解决/无需修改/等待确认/已阻塞）。
+  // 报告仅在 ACCEPTED（人工验收通过）后产出，故统一带（验收通过）后缀：
+  // - remediation：修复切断根因因果链 → 已解决（L1「已解决」成立条件）；
+  // - external_action：外部动作完成且验证证明处置后实际状态（原始现象已验证消失）→ 已解决；
+  // - mitigation：只修补表面故障点，不得声称完整解决 → 已缓解；
+  // - explanation：当前行为符合预期、不修改 → 无需修改；
+  // - 其余（wait_decision / change_request / insufficient_evidence / 未确认）：L1 无对应的
+  //   解决/缓解/无需修改语义，保守映射为「未解决」（L1 ACCEPTED 行允许“经明确接受决定的有限未解决结果”）。
+  const dispositionReportStatus: Partial<Record<DispositionArtifact['dispositionType'], string>> = {
+    remediation: '已解决',
+    external_action: '已解决',
+    mitigation: '已缓解',
+    explanation: '无需修改',
+  };
+  // disposition 来自未类型化的 results 投影：索引前收窄到合同枚举，非法值走 fallback「未解决」。
+  const reportStatus = `${dispositionReportStatus[dispositionType as DispositionArtifact['dispositionType']] ?? '未解决'}（验收通过）`;
   const evidenceLines = (items: unknown[]) =>
     items.length ? items.map((item) => `- ${typeof item === 'string' ? item : JSON.stringify(item)}`) : ['- 未提供'];
   const reviewConclusions = [results.investigation_review, results.change_plan_review, results.change_review]
@@ -315,7 +331,7 @@ const buildFixReport = (results: Record<string, any>): string => {
     '# Fix 处置结果',
     '',
     '## 结论',
-    '- 状态：已解决（验收通过）',
+    `- 状态：${reportStatus}`,
     `- 处置类型：${dispositionType}`,
     `- 风险：${disposition.risks?.length ? disposition.risks.join('、') : '无'}`,
     `- 未验证：${verification.unverified?.length ? verification.unverified.join('、') : '无'}`,

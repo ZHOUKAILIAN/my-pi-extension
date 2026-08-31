@@ -836,7 +836,7 @@ flowchart LR
 - Controller 在合同校验、Guard、Transition、人工决定和后验反馈发生时写入结构化事件；Worker 不能自行写成功事件或 Acceptance 结果；
 - 当前实现状态（本轮已落地子集）：事件由 Runtime.recordEvent 在真实产生点写入——runReview 评审
   完成（investigation / change_plan_review / change_review 各自事件类型）、executeNode 提交/拒绝、
-  decide（人工决定 / run_accepted / run_reopened）、artifact 合同拒绝；事件携带实例内唯一 eventId
+  decide（人工决定 / run_accepted / run_rework 返工回流）、artifact 合同拒绝；事件携带实例内唯一 eventId
   （idGen + 单调 eventSeq）、真实 sourceVersion 与 policyDigest，不虚构 bugCategory/riskLevel；
   Fix 受控扩展经 auditSink 把全部事件桥到 host.appendEntry('workflow-audit', event)，写失败不阻塞业务。
 - 设计范围（S4/P2-4，未实现、目标 TODO）：完整漏斗事件（disposition_completed /
@@ -879,7 +879,8 @@ type FixAuditEventType =
   | "verification_completed"
   | "human_review_decided"
   | "run_accepted"
-  | "run_reopened"
+  | "run_reopened"   // 预留给后验收 reopen 专项（D6）；语义源自归档评审草案，待 L1 回写，无 emit 点
+  | "run_rework"     // 验收前返工回流（decide 的 request_changes/reject/continue_* 路径）专用，不占用 reopened 语义
   | "run_rolled_back"
   | "post_acceptance_issue_confirmed";
 
@@ -1094,7 +1095,7 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 - DISPOSITION：disposition + change_plan_review（repo-change 路径强制）
 - IMPLEMENTING：implementation + change_review（reviewedRevision 绑定当前 candidate）
 - VERIFYING：verification，accepted=false 按 failure.kind 三向分流
-- WAITING_FOR_USER：人工 approve/request_changes/reject/continue_verification
+- WAITING_FOR_USER：人工 approve/request_changes/reject/continue_verification；D3 等待路由（wait_decision / external_action 处置先停此处，pendingDecisionKind = disposition_decision / external_action_completion）
 - ACCEPTED：仅由 decide(approve) 经完整 Acceptance 进入
 ```
 
@@ -1102,7 +1103,6 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 
 ```text
 Arbiter 争议裁决
-D3 wait_decision / external_action 的 DISPOSITION->WAITING_FOR_USER 等待路由
 D5 requiresFormalPlanReview 的正式方案升级
 完整 Audit Event 漏斗、指标 Projector 与 Metric Snapshot（§7.3–7.7 目标设计）
 ACCEPTED 后 reopen / rollback / 后验收复盘（D6）

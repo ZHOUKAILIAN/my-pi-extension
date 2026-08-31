@@ -361,6 +361,8 @@ test('decide approves a pending WAITING_FOR_USER run after verification', async 
   const types = events.map((event) => event.eventType);
   assert.ok(types.includes('human_review_decided'));
   assert.ok(types.includes('run_accepted'));
+  // approve 不产生返工事件。
+  assert.ok(!types.includes('run_rework'));
   assert.ok(!types.includes('run_reopened'));
 });
 
@@ -429,13 +431,16 @@ test('decide maps request_changes reasonCode to INVESTIGATING and reopens the ru
   assert.equal(result.outcome, 'reopened');
   assert.equal(result.toStage, 'INVESTIGATING');
   assert.equal(runtime.stage, 'INVESTIGATING');
-  assert.ok(events.some((event) => event.eventType === 'run_reopened'));
+  // 返工回流发 run_rework（返工语义），不得误发 run_reopened（后验收 reopen 语义，源自归档评审草案、待 D6 专项 L1 回写）。
+  assert.ok(events.some((event) => event.eventType === 'run_rework'));
+  assert.ok(!events.some((event) => event.eventType === 'run_reopened'));
 });
 
 // 9. decide reject
 test('decide reject blocks the run', async () => {
+  const events: FixAuditEvent[] = [];
   const { entries, store } = makeStore();
-  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9', () => 9, () => 'gen');
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-9', () => 9, () => 'gen', { auditSink: sink(events) });
   const verify = await runtime.executeNode(
     { id: 'verify', worker: bareWorker(() => ({ kind: 'verification', accepted: true, evidence: ['test:passed'], candidateRevision: 'rev-1' })) },
     {},
@@ -446,6 +451,11 @@ test('decide reject blocks the run', async () => {
   assert.equal(result.outcome, 'blocked');
   assert.equal(result.toStage, 'BLOCKED');
   assert.equal(runtime.stage, 'BLOCKED');
+  // reject 是返工/阻塞回流，发 run_rework；不得误发 run_reopened（后验收 reopen 语义，源自归档评审草案、待 D6 专项 L1 回写）。
+  const types = events.map((event) => event.eventType);
+  assert.ok(types.includes('human_review_decided'));
+  assert.ok(types.includes('run_rework'));
+  assert.ok(!types.includes('run_reopened'));
 });
 
 // 9b. F：配置类验证失败进入 WAITING_FOR_USER 后，continue_verification 只能回 VERIFYING。
@@ -466,7 +476,9 @@ test('decide continue_verification reopens only a configuration-wait run to VERI
   assert.equal(runtime.stage, 'VERIFYING');
   const types = events.map((event) => event.eventType);
   assert.ok(types.includes('human_review_decided'));
-  assert.ok(types.includes('run_reopened'));
+  // 配置类验证失败的继续验证也是返工回流：run_rework，不得误发 run_reopened。
+  assert.ok(types.includes('run_rework'));
+  assert.ok(!types.includes('run_reopened'));
   assert.ok(!types.includes('run_accepted'));
 });
 
@@ -505,7 +517,9 @@ test('decide continue_disposition reopens a disposition_decision wait back to DI
   assert.equal(runtime.stage, 'DISPOSITION');
   const types = events.map((event) => event.eventType);
   assert.ok(types.includes('human_review_decided'));
-  assert.ok(types.includes('run_reopened'));
+  // 处置决定继续同样是返工回流：run_rework，不得误发 run_reopened。
+  assert.ok(types.includes('run_rework'));
+  assert.ok(!types.includes('run_reopened'));
   assert.ok(!types.includes('run_accepted'));
 });
 

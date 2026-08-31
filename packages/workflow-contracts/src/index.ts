@@ -75,7 +75,10 @@ export type FixAuditEventType =
   | 'verification_completed'
   | 'human_review_decided'
   | 'run_accepted'
+  /** 预留给后验收 reopen 专项（D6）；语义源自归档评审草案，待 L1 回写，当前无 emit 点。 */
   | 'run_reopened'
+  /** 人工返工回流（decide 的 request_changes / reject / continue_* 回流到执行 Stage）。 */
+  | 'run_rework'
   | 'run_rolled_back'
   | 'post_acceptance_issue_confirmed';
 export interface FixAuditEvent<T = Record<string, unknown>> {

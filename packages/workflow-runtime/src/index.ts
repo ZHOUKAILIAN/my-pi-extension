@@ -1351,7 +1351,7 @@ export class WorkflowRuntime {
       }
       this.transition('VERIFYING', decision);
       this.recordEvent('human_review_decided', { decision: 'continue_verification', requestId: decision.requestId }, { decision: 'continue_verification' });
-      this.recordEvent('run_reopened', { reasonCode: 'configuration_revoked', toStage: 'VERIFYING' }, { reasonCode: 'configuration_revoked', candidateRevision: this.candidateRevision });
+      this.recordEvent('run_rework', { reasonCode: 'configuration_revoked', toStage: 'VERIFYING' }, { reasonCode: 'configuration_revoked', candidateRevision: this.candidateRevision });
       this.pendingDecision = undefined;
       return { outcome: 'reopened', toStage: 'VERIFYING' };
     }
@@ -1372,7 +1372,7 @@ export class WorkflowRuntime {
           : 'VERIFYING';
       this.transition(toStage, decision);
       this.recordEvent('human_review_decided', { decision: 'continue_disposition', requestId: decision.requestId, toStage }, { decision: 'continue_disposition' });
-      this.recordEvent('run_reopened', { reasonCode: 'disposition_resolved', toStage }, { reasonCode: 'disposition_resolved', candidateRevision: this.candidateRevision });
+      this.recordEvent('run_rework', { reasonCode: 'disposition_resolved', toStage }, { reasonCode: 'disposition_resolved', candidateRevision: this.candidateRevision });
       this.pendingDecision = undefined;
       return { outcome: 'reopened', toStage };
     }
@@ -1384,7 +1384,7 @@ export class WorkflowRuntime {
         { decision: 'request_changes', reasonCode: decision.reasonCode, toStage },
         { decision: 'request_changes', reasonCode: decision.reasonCode },
       );
-      this.recordEvent('run_reopened', { reasonCode: decision.reasonCode, toStage }, { reasonCode: decision.reasonCode, candidateRevision: this.candidateRevision });
+      this.recordEvent('run_rework', { reasonCode: decision.reasonCode, toStage }, { reasonCode: decision.reasonCode, candidateRevision: this.candidateRevision });
       this.pendingDecision = undefined;
       return { outcome: 'reopened', toStage };
     }
@@ -1392,7 +1392,7 @@ export class WorkflowRuntime {
       const reasonCode = decision.reasonCode;
       this.transition('BLOCKED', decision);
       this.recordEvent('human_review_decided', { decision: 'reject', reasonCode, requestId: decision.requestId }, { decision: 'reject', reasonCode });
-      this.recordEvent('run_reopened', { reasonCode, toStage: 'BLOCKED' }, { reasonCode });
+      this.recordEvent('run_rework', { reasonCode, toStage: 'BLOCKED' }, { reasonCode });
       this.pendingDecision = undefined;
       return { outcome: 'blocked', toStage: 'BLOCKED' };
     }
