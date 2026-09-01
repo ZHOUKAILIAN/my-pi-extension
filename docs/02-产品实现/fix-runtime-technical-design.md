@@ -446,6 +446,34 @@ Acceptance Result 是否由 Controller 生成
 
 ## 4. Artifact Contract 与来源绑定
 
+### 4.1 双门禁：pi 入口 schema 校验 → execute 内权威校验
+
+Worker 通过 `submit_artifact` 工具提交 Artifact 时有两道门禁，分工不同：
+
+| 门禁 | 位置 | 职责 | 失败去向 |
+| --- | --- | --- | --- |
+| 入口 schema 校验 | pi SDK 工具声明（`parameters`） | 结构：每节点唯一 kind 的字段类型/枚举/必填（`ARTIFACT_JSON_SCHEMAS`） | 校验失败 → error tool result 回喂，模型同 session 内重试 |
+| 权威语义校验 | `execute` 内（`validateSubmitArtifact`） | 语义：条件必填、非空、跨字段矛盾、信封与上下文绑定 | 抛 `ArtifactContractError` → 同样回喂重试，外层 `maxArtifactAttempts=2` 兼底 |
+
+- `validateSubmitArtifact` 仍是唯一校验权威；schema 层只约束结构，不改变权威层语义。
+- 两者同源：字段定义来自 contracts 内同一份 per-kind 字段定义表（`SUBMIT_ARTIFACT_FIELD_RULES`），`ARTIFACT_JSON_SCHEMAS` 由它派生，schema 与字段级校验靠构造一致。
+- 每个节点的工具声明只含该节点唯一 kind 的 schema（`NODE_ARTIFACT_KINDS` 节点→kind 映射，与 restore 校验 / `NODE_KIND_MISMATCH` 门禁共用同一份）；未知 node.id 退最小宽松 schema（只声明 kind 必填）并发 `schema_fallback` progress 事件保证降级可见。
+
+### 4.2 pi 隐式 coerce 平台行为（已知行为）
+
+pi 入口校验（`validateToolArguments`）在 validate 前会做隐式类型转换（convert），这是一个平台事实，取舍如下：
+
+| 输入类别 | pi 管道行为 | 取舍 |
+| --- | --- | --- |
+| boolean 判决字段（`rootCauseAlignment`、`requiresRepositoryChange`、`accepted`）传 `"true"` / `null` / `1` | **被拒绝**（schema 层用 `{ enum: [true, false] }` 且不带 `type` 关键字，convert 不触发 boolean 转换，输入不在枚举内直接拒绝） | 与权威层行为一致，杜绝 `null→false` 静默翻转判决（回归场景：`INVALID_CHANGE_PLAN_REVIEW_ROOT_CAUSE_ALIGNMENT`） |
+| string 字段传数字（如 `filesChanged: [123]`） | 转为 `"123"` 后通过 | 接受（意图等价，风险低），记录为平台行为 |
+| 可选字段传 `null`（如 `prUrl: null`） | pi 删除该字段后通过（等价于未提供） | 接受，记录为平台行为 |
+| enum / 形状 / required 错误 | pi 入口拒绝，错误更早更精确 | 改善，无语义变化 |
+
+非空 / 非空数组（minLength/minItems）语义不进 schema 层，仍由权威层校验；条件必填（如 `requiresRepositoryChange`→`candidateRevision`、`accepted=false`→`failure`）也留在权威层。
+
+### 4.3 Artifact Schema、Runtime Guard 和 Acceptance 的职责
+
 Artifact Schema、Runtime Guard 和 Acceptance 的职责不同：
 
 ```mermaid
@@ -712,10 +740,10 @@ Provenance 与验收重放（见本节“恢复”段落）：
   人数，REVIEWER_WORKER_ID_REPEATED）。
 - change_plan_review 周期的身份绑定（S1 影子节点）：周期由 runReview 记账产出时必须绑定到规定义上的
   change_plan_review 节点 id；门禁在 DISPOSITION→IMPLEMENTING 检查
-  NODE_KIND_BY_NODE_ID[cycle.reviewNodeId] === 'change_plan_review'，因此用声明之外的节点名
+  NODE_ARTIFACT_KINDS[cycle.reviewNodeId] === 'change_plan_review'，因此用声明之外的节点名
   （如 change_plan_review_shadow）发起 runReview（runReview 对未知 id 保持通用语义）无法产生可放行
   的正式周期（CHANGE_PLAN_REVIEW_NOT_BOUND）。恢复（配置 reviewPolicyFor 时）同样按
-  NODE_KIND_BY_NODE_ID[record.reviewNodeId] === record.reviewArtifactKind 校验每个周期节点，
+  NODE_ARTIFACT_KINDS[record.reviewNodeId] === record.reviewArtifactKind 校验每个周期节点，
   语义不一致的周期 CHECKPOINT_REVIEW_LEDGER_INCONSISTENT。
 - reviewCycleId 唯一性：周期 id 是账本↔Artifact 盖章的绑定键，为 `${runId}.review.<clock>.<seq>`，
   seq 为实例内单调序号（恢复时以已有周期 id 的最大序号后缀为起点，而不是条数——条数可能与最大序号
@@ -1122,7 +1150,7 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 
 ### TODO 跟踪
 
-- [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_KIND_BY_NODE_ID` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
+- [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_ARTIFACT_KINDS` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
 - [ ] **5 步公开漏斗合入（第一版）**：合入 `feat/fix-metrics-cloudflare` 分支（§7.7 公共漏斗、公开 API 与低样本保护）
 - [ ] **L2 §7.1–7.6 文档收敛（第一版）**：标注为已归档目标，或以 L2 内容重写归档件（原件已丢失，见 README drift 表）；仅 §7.7 保持第一版活跃目标设计
 - [ ] **最终处置报告完整模板（后续优化）**：扩展 `investigation` / `verification` / `disposition` 合同字段并重写渲染；方案与评审见归档评审件《2026-08-29-fix-报告重构-方案与评审》

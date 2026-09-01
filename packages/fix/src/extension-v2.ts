@@ -142,6 +142,11 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
       host.trace(`${nodeId} · artifact attempt ${progress.attempt}/${progress.maxAttempts} · ${progress.reason}`);
       return;
     }
+    if (progress.type === 'schema_fallback') {
+      // 未知 node.id 退宽松 schema 的降级可见事件（结构与语义校验仍由权威层兜底）。
+      host.trace(`${nodeId} · schema fallback: no per-kind schema bound for node "${progress.nodeId}"; falling back to loose schema`, 'error');
+      return;
+    }
     if (progress.type === 'tool_start') {
       const detail = `tool start: ${progress.name} ${summarize(progress.args)}`;
       host.setWorkflowStatus(ctx, `fix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);

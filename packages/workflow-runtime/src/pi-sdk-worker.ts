@@ -1,6 +1,6 @@
 import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir, type ToolDefinition, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { Artifact, NodeDefinition, WorkerExecutor, Capsule } from '@pi/workflow-contracts';
-import { ArtifactContractError, validateSubmitArtifact } from '@pi/workflow-contracts';
+import { ArtifactContractError, validateSubmitArtifact, NODE_ARTIFACT_KINDS, ARTIFACT_JSON_SCHEMAS } from '@pi/workflow-contracts';
 
 export type WorkerProgress =
   | { type: 'tool_start'; name: string; args: unknown }
@@ -8,7 +8,11 @@ export type WorkerProgress =
   | { type: 'text'; text: string }
   | { type: 'artifact_fallback'; artifact: Artifact }
   | { type: 'model_end'; stopReason?: string; errorMessage?: string }
-  | { type: 'artifact_attempt'; attempt: number; maxAttempts: number; reason: 'initial' | 'missing_artifact' | 'invalid_artifact' | 'transient_error' };
+  | { type: 'artifact_attempt'; attempt: number; maxAttempts: number; reason: 'initial' | 'missing_artifact' | 'invalid_artifact' | 'transient_error' }
+  /** 未知 node.id 无法绑定 per-kind schema（ARTIFACT_JSON_SCHEMAS 无对应 kind）时退回
+   *  最小宽松 schema（只声明 kind），结构校验完全交给 execute 内权威层兜底；发本事件
+   *  保证该降级在进度流中可见，不会被静默吞掉。 */
+  | { type: 'schema_fallback'; nodeId: string };
 
 export class WorkerArtifactSubmissionError extends Error {
   readonly code: string;
@@ -21,79 +25,25 @@ export class WorkerArtifactSubmissionError extends Error {
   }
 }
 
-// Keep the schema dependency-free: Pi validates this JSON Schema-shaped object at
-// the SDK boundary, while validateSubmitArtifact remains the Runtime authority.
-const artifactSchema = {
+// 未知 node.id 的最小宽松 schema：只声明 kind 必填，其余字段交给 execute 内
+// validateSubmitArtifact 权威校验兜底；同时发 schema_fallback progress 事件保证可见。
+const FALLBACK_ARTIFACT_SCHEMA = {
   type: 'object',
-  properties: {
-    kind: { type: 'string', enum: ['investigation', 'implementation', 'verification', 'intake', 'investigation_review', 'disposition', 'change_plan_review', 'change_review', 'user_decision'] },
-    route: { type: 'string', enum: ['local_fix', 'requirement_change', 'design_change', 'needs_more_evidence', 'blocked'] },
-    rootCause: { type: 'string' },
-    accepted: { type: 'boolean' },
-    evidence: { type: 'array', items: { type: 'string' } },
-    artifact: {
-      type: 'object',
-      properties: {
-        summary: { type: 'string' },
-        filesChanged: { type: 'array', items: { type: 'string' } },
-        candidateRevision: { type: 'string' },
-        prUrl: { type: 'string' },
-      },
-    },
-    unverified: { type: 'array', items: { type: 'string' } },
-    checks: { type: 'object' },
-    remainingRisk: { type: 'array', items: { type: 'string' } },
-    conclusion: {
-      type: 'object',
-      properties: {
-        status: { type: 'string', enum: ['accepted', 'rejected', 'blocked', 'inconclusive', 'needs_more_evidence'] },
-        summary: { type: 'string' },
-      },
-    },
-    // 新 kind 的常用字段；均为宽松提示，严格校验在 validateSubmitArtifact。
-    summary: { type: 'string' },
-    overview: { type: 'string' },
-    environment: { type: 'string' },
-    scope: { type: 'string' },
-    urgency: { type: 'string', enum: ['low', 'medium', 'high', 'critical'] },
-    failure: {
-      type: 'object',
-      properties: {
-        kind: { type: 'string', enum: ['implementation', 'configuration', 'external_condition'] },
-        reason: { type: 'string' },
-        responsibility: { type: 'string' },
-        resolution: { type: 'string' },
-      },
-    },
-    rootCauseConclusion: { type: 'string' },
-    evidenceSufficiency: { type: 'string', enum: ['sufficient', 'insufficient'] },
-    gaps: { type: 'array', items: { type: 'string' } },
-    dispositionType: { type: 'string', enum: ['remediation', 'mitigation', 'explanation', 'external_action', 'wait_decision', 'change_request', 'insufficient_evidence'] },
-    requiresRepositoryChange: { type: 'boolean' },
-    minimalScope: { type: 'string' },
-    risks: { type: 'array', items: { type: 'string' } },
-    verificationTarget: { type: 'string' },
-    changedScope: { type: 'string' },
-    compatibility: { type: 'array', items: { type: 'string' } },
-    rollback: { type: 'array', items: { type: 'string' } },
-    reviewedRevision: { type: 'string' },
-    findingDisposition: { type: 'string', enum: ['all_closed', 'open'] },
-    findings: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string' },
-          summary: { type: 'string' },
-          severity: { type: 'string', enum: ['info', 'warning', 'blocker'] },
-          disposition: { type: 'string', enum: ['open', 'closed', 'accepted_with_note'] },
-        },
-      },
-    },
-  },
+  properties: { kind: { type: 'string' } },
   required: ['kind'],
   additionalProperties: true,
 } as any;
+
+// 每节点唯一 kind 的 JSON Schema 由 contracts 单一定义表派生（ARTIFACT_JSON_SCHEMAS），
+// 注入 submit_artifact 工具声明进入口校验（pi convert → validate）；
+// validateSubmitArtifact 仍是权威校验（语义/条件必填层）。
+function artifactSchemaFor(nodeId: string, onProgress?: (progress: WorkerProgress) => void): any {
+  const kind = NODE_ARTIFACT_KINDS[nodeId];
+  const schema = kind ? (ARTIFACT_JSON_SCHEMAS as Record<string, Record<string, unknown>>)[kind] : undefined;
+  if (schema) return schema;
+  onProgress?.({ type: 'schema_fallback', nodeId });
+  return FALLBACK_ARTIFACT_SCHEMA;
+}
 
 function submissionContract(nodeId: string): string {
   switch (nodeId) {
@@ -193,7 +143,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       description: 'Submit the required structured workflow artifact. Ordinary text is not accepted as completion.',
       promptSnippet: 'Submit the final structured workflow artifact. Ordinary text is not completion.',
       promptGuidelines: ['Before completing this workflow node, call submit_artifact exactly once with the required artifact.'],
-      parameters: artifactSchema,
+      parameters: artifactSchemaFor(node.id, this.options.onProgress),
       execute: async (_id, params) => {
         try {
           validateSubmitArtifact(params);

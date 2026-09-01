@@ -2208,7 +2208,7 @@ test('restored ledger quorum is enforced: passing artifacts with a tampered sub-
 });
 
 // S1 影子评审节点：runReview 记账在影子节点（change_plan_review_shadow，已知 kind 表外 → 命名层
-// 不拦截），但门禁的语义节点控制面按 NODE_KIND_BY_NODE_ID 判定周期节点必须等于规定义上的
+// 不拦截），但门禁的语义节点控制面按 NODE_ARTIFACT_KINDS 判定周期节点必须等于规定义上的
 // change_plan_review —— 影子周期不得放行 DISPOSITION → IMPLEMENTING。
 test('shadow review node cycle cannot leave DISPOSITION to IMPLEMENTING (gate requires change_plan_review node)', async () => {
   const { store } = makeStore();

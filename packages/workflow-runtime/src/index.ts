@@ -2,6 +2,7 @@ import {
   validateSubmitArtifact,
   ArtifactContractError,
   CheckpointRestoreError,
+  NODE_ARTIFACT_KINDS,
   type Artifact,
   type ArtifactConclusion,
   type ArtifactExecutionContext,
@@ -48,16 +49,8 @@ const BUSINESS_ARTIFACT_KINDS = new Set([
 // nodeExecutionId 的 node 段（${runId}.${node.id}.${ts}）→ 该节点能产出的业务 kind。
 // restore 时校验 nodeId 与 Artifact kind 的必要关联：只有 Worker 信封携带 nodeExecutionId，
 // 评审节点 id 也映射到其评审 kind（investigation_review 等）。
-const NODE_KIND_BY_NODE_ID: Record<string, Artifact['kind']> = {
-  intake: 'intake',
-  investigate: 'investigation',
-  investigation_review: 'investigation_review',
-  disposition: 'disposition',
-  change_plan_review: 'change_plan_review',
-  implement: 'implementation',
-  change_review: 'change_review',
-  verify: 'verification',
-};
+// 映射唯一源在 @pi/workflow-contracts 的 NODE_ARTIFACT_KINDS（与 per-kind schema 绑定共用，
+// 不含 guard_rejection/user_decision），此处不再维护本地副本。
 
 // 评审 Artifact kind → 被评审的业务 kind；restore 时校验评审者 Worker 身份与被评审产物独立。
 const REVIEWED_KIND_BY_REVIEW_KIND: Record<string, Artifact['kind']> = {
@@ -417,7 +410,7 @@ export class WorkflowRuntime {
             `checkpoint worker artifact ${String(record.kind)} has malformed nodeExecutionId ${String(record.nodeExecutionId)} (expected ${this.runId}.<node>.<ts>)`,
           );
         }
-        const expectedKindForNode = NODE_KIND_BY_NODE_ID[nodeId];
+        const expectedKindForNode = NODE_ARTIFACT_KINDS[nodeId];
         if (expectedKindForNode === undefined || expectedKindForNode !== record.kind) {
           throw new CheckpointRestoreError(
             'INVALID_CHECKPOINT_PROVENANCE',
@@ -662,7 +655,7 @@ export class WorkflowRuntime {
       || cycle.dispositionIndexAtCycle !== this.artifacts.indexOf(disposition)
       // 语义节点绑定：cplan 周期必须由规定义上的 change_plan_review 节点记账产出，未知/影子
       // 节点（如伪造的 change_plan_review_shadow）不得参与正式门禁（与 runReview 语义节点绑定同源）。
-      || NODE_KIND_BY_NODE_ID[cycle.reviewNodeId] !== 'change_plan_review') {
+      || NODE_ARTIFACT_KINDS[cycle.reviewNodeId] !== 'change_plan_review') {
       throw new WorkflowRuntimeError(
         'CHANGE_PLAN_REVIEW_NOT_BOUND',
         'change_plan_review must be produced by a Runtime review cycle on the change_plan_review node bound to the current disposition/plan before leaving DISPOSITION to IMPLEMENTING',
@@ -1014,10 +1007,10 @@ export class WorkflowRuntime {
       this.recordEvent('artifact_rejected', { code: contractError.code, message: contractError.message, nodeId: node.id });
       throw error;
     }
-    // NodeId ↔ Artifact kind 必要关联（与 restore 的 NODE_KIND_BY_NODE_ID 同源）：已知节点的 Worker
+    // NodeId ↔ Artifact kind 必要关联（与 restore 的 NODE_ARTIFACT_KINDS 同源）：已知节点的 Worker
     // 只能提交该节点能产出的 kind，避免 verify 节点冒充验收通过等跨节点产物。未知节点 id（如测试/扩展
     // 自定义评审者）不在此表内时跳过，保持 executeNode 的通用性；restore 对未知 nodeId 仍 fail-closed。
-    const expectedKindForNode = NODE_KIND_BY_NODE_ID[node.id];
+    const expectedKindForNode = NODE_ARTIFACT_KINDS[node.id];
     if (expectedKindForNode !== undefined && expectedKindForNode !== stamped.kind) {
       const error = new WorkflowRuntimeError(
         'NODE_KIND_MISMATCH',
@@ -1064,13 +1057,13 @@ export class WorkflowRuntime {
     // 被评审节点）。未知 node id（测试/扩展自定义评审者）保持通用性——由门禁与 restore 的
     // 语义节点控制面把关（cplan 门禁要求周期 node 等于 change_plan_review；restore 要求
     // nodeExecutionId 的 node 段与 Artifact kind 关联）。
-    const reviewNodeKind = NODE_KIND_BY_NODE_ID[reviewNodeId];
+    const reviewNodeKind = NODE_ARTIFACT_KINDS[reviewNodeId];
     if (reviewNodeKind !== undefined && reviewNodeKind !== opts.reviewArtifactKind) {
       throw new ReviewPolicyError('REVIEW_NODE_KIND_MISMATCH', `reviewNodeId ${reviewNodeId} cannot produce ${opts.reviewArtifactKind} (it produces ${reviewNodeKind})`);
     }
     const reviewedBusinessKind = REVIEWED_KIND_BY_REVIEW_KIND[opts.reviewArtifactKind];
     if (reviewedBusinessKind !== undefined) {
-      const reviewedNodeKind = NODE_KIND_BY_NODE_ID[opts.reviewedNodeId];
+      const reviewedNodeKind = NODE_ARTIFACT_KINDS[opts.reviewedNodeId];
       if (reviewedNodeKind !== undefined && reviewedNodeKind !== reviewedBusinessKind) {
         throw new ReviewPolicyError('REVIEWED_NODE_KIND_MISMATCH', `reviewedNodeId ${opts.reviewedNodeId} cannot produce the ${reviewedBusinessKind} under review (it produces ${reviewedNodeKind})`);
       }
@@ -1238,7 +1231,7 @@ export class WorkflowRuntime {
     if (!cycle || cycle.reviewArtifactKind !== 'change_plan_review' || cycle.reviewedNodeId !== 'disposition'
       || cycle.dispositionIndexAtCycle !== this.artifacts.indexOf(disposition)
       // 语义节点绑定：周期必须由规定义上的 change_plan_review 节点记账产出（影子节点不得验收）。
-      || NODE_KIND_BY_NODE_ID[cycle.reviewNodeId] !== 'change_plan_review') return false;
+      || NODE_ARTIFACT_KINDS[cycle.reviewNodeId] !== 'change_plan_review') return false;
     const currentPolicy = this.reviewPolicyFor?.('change_plan_review');
     if (this.reviewPolicyFor && (!currentPolicy || serializeReviewPolicy(currentPolicy) !== cycle.policyDigest)) return false;
     const derived = this.reviewPolicyFor
@@ -1786,7 +1779,7 @@ export class WorkflowRuntime {
           }
           // 语义节点绑定（与 live 门禁同源）：周期必须由规定义上能产出该评审 kind 的节点记账产出，
           // 影子/跨 kind 节点（如 change_plan_review_shadow 或称 investigate 的周期）不得通过恢复。
-          if (NODE_KIND_BY_NODE_ID[record.reviewNodeId] !== record.reviewArtifactKind) {
+          if (NODE_ARTIFACT_KINDS[record.reviewNodeId] !== record.reviewArtifactKind) {
             throw new CheckpointRestoreError(
               'CHECKPOINT_REVIEW_LEDGER_INCONSISTENT',
               `review cycle ${record.cycleId} reviewNodeId ${record.reviewNodeId} cannot produce ${record.reviewArtifactKind}`,

@@ -232,6 +232,272 @@ const isValidFinding = (value: unknown): value is Finding => {
 };
 const findingList = (value: unknown): value is Finding[] => Array.isArray(value) && value.every(isValidFinding);
 
+/**
+ * Per-kind 字段规则定义表：submit_artifact 字段级校验与 per-kind JSON Schema（ARTIFACT_JSON_SCHEMAS）
+ * 的单一定义源。表内顺序即 validateSubmitArtifact 的检查顺序（错误优先级由等价性基线测试钉住）。
+ * 每条规则都携带显式 required 属性——它是「是否必填」的唯一知识来源，同时驱动：
+ * 权威层的缺省检查（validateFieldRule）与 schema 的 required 派生（ARTIFACT_JSON_SCHEMAS），
+ * 不存在第二份 per-type 白名单。非空/非空数组（minLength/minItems）语义留在权威校验器，
+ * 不进 schema 层；schema 层只描述类型/枚举/必填。
+ */
+type FieldRule =
+  | { type: 'string'; name: string; required: boolean; code: string; message: string }
+  | { type: 'stringList'; name: string; required: boolean; allowEmpty: boolean; code: string; message: string }
+  | { type: 'evidenceList'; name: string; required: boolean; code: string; message: string }
+  | { type: 'enum'; name: string; values: readonly string[]; required: boolean; code: string; message: string }
+  /** boolean 判决字段：schema 层用 `{ enum: [true, false] }`（无 type 关键字）拒绝隐式 coerce
+   *  （"true"/null/1 不得被翻转成判决），见 ARTIFACT_JSON_SCHEMAS 的 deriveFieldSchema。 */
+  | { type: 'boolean'; name: string; required: boolean; code: string; message: string }
+  | { type: 'conclusion'; name: string; required: boolean }
+  | { type: 'findingList'; name: string; required: boolean; code: string; message: string }
+  | { type: 'implementationDetails'; name: string; required: boolean };
+
+const CONCLUSION_STATUSES = ['accepted', 'rejected', 'blocked', 'inconclusive', 'needs_more_evidence'] as const;
+const INVESTIGATION_ROUTES = ['local_fix', 'requirement_change', 'design_change', 'needs_more_evidence', 'blocked'] as const;
+const DISPOSITION_TYPES = ['remediation', 'mitigation', 'explanation', 'external_action', 'wait_decision', 'change_request', 'insufficient_evidence'] as const;
+const FINDING_SEVERITIES = ['info', 'warning', 'blocker'] as const;
+const FINDING_DISPOSITIONS = ['open', 'closed', 'accepted_with_note'] as const;
+
+/** 类型收窄守卫：让 Record<SchemaArtifactKind, …> 定义表的运行时查找与编译期键约束互为验证。 */
+const isSchemaArtifactKind = (kind: string): kind is SchemaArtifactKind => Object.hasOwn(SUBMIT_ARTIFACT_FIELD_RULES, kind);
+
+const SUBMIT_ARTIFACT_FIELD_RULES: Record<SchemaArtifactKind, readonly FieldRule[]> = {
+  intake: [
+    { type: 'string', name: 'summary', required: true, code: 'MISSING_INTAKE_SUMMARY', message: 'intake.summary is required' },
+    { type: 'string', name: 'overview', required: true, code: 'MISSING_INTAKE_OVERVIEW', message: 'intake.overview is required' },
+    { type: 'string', name: 'environment', required: false, code: 'INVALID_INTAKE_ENVIRONMENT', message: 'intake.environment must be a non-empty string when provided' },
+    { type: 'string', name: 'scope', required: false, code: 'INVALID_INTAKE_SCOPE', message: 'intake.scope must be a non-empty string when provided' },
+    { type: 'enum', name: 'urgency', values: ['low', 'medium', 'high', 'critical'], required: false, code: 'INVALID_INTAKE_URGENCY', message: 'intake.urgency is invalid' },
+  ],
+  investigation: [
+    { type: 'enum', name: 'route', values: INVESTIGATION_ROUTES, required: true, code: 'INVALID_INVESTIGATION_ROUTE', message: 'investigation.route is invalid' },
+    { type: 'string', name: 'rootCause', required: true, code: 'MISSING_ROOT_CAUSE', message: 'investigation.rootCause is required' },
+    { type: 'evidenceList', name: 'evidence', required: true, code: 'MISSING_INVESTIGATION_EVIDENCE', message: 'investigation.evidence must contain at least one non-empty item' },
+  ],
+  implementation: [
+    { type: 'implementationDetails', name: 'artifact', required: true },
+  ],
+  verification: [
+    { type: 'boolean', name: 'accepted', required: true, code: 'MISSING_VERIFICATION_DECISION', message: 'verification.accepted must be boolean' },
+    { type: 'evidenceList', name: 'evidence', required: true, code: 'MISSING_VERIFICATION_EVIDENCE', message: 'verification.evidence must contain at least one non-empty item' },
+  ],
+  investigation_review: [
+    { type: 'string', name: 'targetArtifactId', required: false, code: 'INVALID_INVESTIGATION_REVIEW_TARGET', message: 'investigation_review.targetArtifactId must be a non-empty string when provided' },
+    { type: 'string', name: 'rootCauseConclusion', required: true, code: 'MISSING_INVESTIGATION_REVIEW_ROOT_CAUSE_CONCLUSION', message: 'investigation_review.rootCauseConclusion is required' },
+    { type: 'enum', name: 'evidenceSufficiency', values: ['sufficient', 'insufficient'], required: true, code: 'INVALID_INVESTIGATION_REVIEW_EVIDENCE_SUFFICIENCY', message: 'investigation_review.evidenceSufficiency is invalid' },
+    { type: 'stringList', name: 'gaps', required: true, allowEmpty: true, code: 'INVALID_INVESTIGATION_REVIEW_GAPS', message: 'investigation_review.gaps must be an array of non-empty strings' },
+    { type: 'string', name: 'stopReason', required: false, code: 'INVALID_INVESTIGATION_REVIEW_STOP_REASON', message: 'investigation_review.stopReason must be a non-empty string when provided' },
+    { type: 'conclusion', name: 'conclusion', required: true },
+  ],
+  disposition: [
+    { type: 'enum', name: 'dispositionType', values: DISPOSITION_TYPES, required: true, code: 'INVALID_DISPOSITION_TYPE', message: 'disposition.dispositionType is invalid' },
+    { type: 'boolean', name: 'requiresRepositoryChange', required: true, code: 'INVALID_DISPOSITION_REQUIRES_REPOSITORY_CHANGE', message: 'disposition.requiresRepositoryChange must be boolean' },
+    { type: 'boolean', name: 'requiresFormalPlanReview', required: false, code: 'INVALID_DISPOSITION_REQUIRES_FORMAL_PLAN_REVIEW', message: 'disposition.requiresFormalPlanReview must be boolean when provided' },
+    { type: 'string', name: 'minimalScope', required: true, code: 'MISSING_DISPOSITION_MINIMAL_SCOPE', message: 'disposition.minimalScope is required' },
+    { type: 'stringList', name: 'risks', required: true, allowEmpty: true, code: 'INVALID_DISPOSITION_RISKS', message: 'disposition.risks must be an array of non-empty strings' },
+    { type: 'string', name: 'verificationTarget', required: true, code: 'MISSING_DISPOSITION_VERIFICATION_TARGET', message: 'disposition.verificationTarget is required' },
+    { type: 'conclusion', name: 'conclusion', required: true },
+  ],
+  change_plan_review: [
+    { type: 'string', name: 'targetPlanRevision', required: false, code: 'INVALID_CHANGE_PLAN_REVIEW_TARGET_REVISION', message: 'change_plan_review.targetPlanRevision must be a non-empty string when provided' },
+    { type: 'boolean', name: 'rootCauseAlignment', required: true, code: 'INVALID_CHANGE_PLAN_REVIEW_ROOT_CAUSE_ALIGNMENT', message: 'change_plan_review.rootCauseAlignment must be boolean' },
+    { type: 'string', name: 'changedScope', required: true, code: 'MISSING_CHANGE_PLAN_REVIEW_CHANGED_SCOPE', message: 'change_plan_review.changedScope is required' },
+    { type: 'stringList', name: 'risks', required: true, allowEmpty: true, code: 'INVALID_CHANGE_PLAN_REVIEW_RISKS', message: 'change_plan_review.risks must be an array of non-empty strings' },
+    { type: 'stringList', name: 'compatibility', required: true, allowEmpty: true, code: 'INVALID_CHANGE_PLAN_REVIEW_COMPATIBILITY', message: 'change_plan_review.compatibility must be an array of non-empty strings' },
+    { type: 'stringList', name: 'verification', required: true, allowEmpty: true, code: 'INVALID_CHANGE_PLAN_REVIEW_VERIFICATION', message: 'change_plan_review.verification must be an array of non-empty strings' },
+    { type: 'stringList', name: 'rollback', required: true, allowEmpty: true, code: 'INVALID_CHANGE_PLAN_REVIEW_ROLLBACK', message: 'change_plan_review.rollback must be an array of non-empty strings' },
+    { type: 'findingList', name: 'findings', required: true, code: 'INVALID_CHANGE_PLAN_REVIEW_FINDINGS', message: 'change_plan_review.findings must be an array of valid findings' },
+    { type: 'conclusion', name: 'conclusion', required: true },
+  ],
+  change_review: [
+    { type: 'string', name: 'reviewedRevision', required: false, code: 'INVALID_CHANGE_REVIEW_REVISION', message: 'change_review.reviewedRevision must be a non-empty string when provided' },
+    { type: 'string', name: 'prRef', required: false, code: 'INVALID_CHANGE_REVIEW_PR_REF', message: 'change_review.prRef must be a non-empty string when provided' },
+    { type: 'findingList', name: 'findings', required: true, code: 'INVALID_CHANGE_REVIEW_FINDINGS', message: 'change_review.findings must be an array of valid findings' },
+    { type: 'enum', name: 'findingDisposition', values: ['all_closed', 'open'], required: true, code: 'INVALID_CHANGE_REVIEW_FINDING_DISPOSITION', message: 'change_review.findingDisposition is invalid' },
+    { type: 'conclusion', name: 'conclusion', required: true },
+  ],
+};
+
+const implementationDetailsCheck = (value: unknown): void => {
+  const details = value as Record<string, unknown> | undefined;
+  if (!details || typeof details !== 'object') throw new ArtifactContractError('MISSING_IMPLEMENTATION_DETAILS', 'implementation.artifact is required');
+  if (!nonEmptyString(details.summary)) throw new ArtifactContractError('MISSING_IMPLEMENTATION_SUMMARY', 'implementation.artifact.summary is required');
+  if (!Array.isArray(details.filesChanged) || details.filesChanged.length === 0 || !details.filesChanged.every(nonEmptyString)) throw new ArtifactContractError('MISSING_FILES_CHANGED', 'implementation.artifact.filesChanged must contain at least one file');
+  if (!nonEmptyString(details.candidateRevision)) throw new ArtifactContractError('MISSING_CANDIDATE_REVISION', 'implementation.artifact.candidateRevision is required');
+  if (details.prUrl !== undefined && !nonEmptyString(details.prUrl)) throw new ArtifactContractError('INVALID_PR_URL', 'implementation.artifact.prUrl must be a non-empty string when provided');
+};
+
+const validateFieldRule = (rule: FieldRule, artifact: Record<string, unknown>): void => {
+  const fieldValue = artifact[rule.name];
+  switch (rule.type) {
+    case 'string': {
+      if (rule.required) {
+        if (!nonEmptyString(fieldValue)) throw new ArtifactContractError(rule.code, rule.message);
+      } else if (fieldValue !== undefined && !nonEmptyString(fieldValue)) {
+        throw new ArtifactContractError(rule.code, rule.message);
+      }
+      return;
+    }
+    case 'stringList': {
+      // 缺省语义由 required 单独控制：required=false 时缺省放行；required=true 时缺省必须拒
+      //（stringList 语义是「必须存在、可为空数组」——缺省拒、[] 过，两类行为都要有测试钉住）。
+      if (!rule.required && fieldValue === undefined) return;
+      const valid = Array.isArray(fieldValue) && (rule.allowEmpty || fieldValue.length > 0) && fieldValue.every(nonEmptyString);
+      if (!valid) throw new ArtifactContractError(rule.code, rule.message);
+      return;
+    }
+    case 'evidenceList': {
+      if (!rule.required && fieldValue === undefined) return;
+      if (!evidenceList(fieldValue)) throw new ArtifactContractError(rule.code, rule.message);
+      return;
+    }
+    case 'enum': {
+      if (!rule.required && fieldValue === undefined) return;
+      if (!rule.values.includes(String(fieldValue))) throw new ArtifactContractError(rule.code, rule.message);
+      return;
+    }
+    case 'boolean': {
+      if (!rule.required && fieldValue === undefined) return;
+      if (typeof fieldValue !== 'boolean') throw new ArtifactContractError(rule.code, rule.message);
+      return;
+    }
+    case 'conclusion': {
+      if (!rule.required && fieldValue === undefined) return;
+      requireConclusion(fieldValue);
+      return;
+    }
+    case 'findingList': {
+      if (!rule.required && fieldValue === undefined) return;
+      if (!findingList(fieldValue)) throw new ArtifactContractError(rule.code, rule.message);
+      return;
+    }
+    case 'implementationDetails': {
+      if (!rule.required && fieldValue === undefined) return;
+      implementationDetailsCheck(fieldValue);
+      return;
+    }
+  }
+};
+
+const CONCLUSION_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    status: { type: 'string', enum: [...CONCLUSION_STATUSES] },
+    summary: { type: 'string' },
+  },
+  required: ['status', 'summary'],
+  additionalProperties: true,
+};
+
+const FINDING_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    id: { type: 'string' },
+    summary: { type: 'string' },
+    severity: { type: 'string', enum: [...FINDING_SEVERITIES] },
+    disposition: { type: 'string', enum: [...FINDING_DISPOSITIONS] },
+  },
+  required: ['id', 'summary'],
+  additionalProperties: true,
+};
+
+// EvidenceItem = 非空字符串 | 带 ref 的对象；schema 层只约束形状，非空语义留在权威层。
+const EVIDENCE_ITEM_JSON_SCHEMA: Record<string, unknown> = {
+  anyOf: [
+    { type: 'string' },
+    {
+      type: 'object',
+      properties: {
+        ref: { type: 'string' },
+        kind: { type: 'string', enum: ['tool', 'test', 'log', 'external'] },
+        summary: { type: 'string' },
+      },
+      required: ['ref'],
+      additionalProperties: true,
+    },
+  ],
+};
+
+const IMPLEMENTATION_DETAILS_JSON_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    summary: { type: 'string' },
+    filesChanged: { type: 'array', items: { type: 'string' } },
+    candidateRevision: { type: 'string' },
+    prUrl: { type: 'string' },
+  },
+  required: ['summary', 'filesChanged', 'candidateRevision'],
+  additionalProperties: true,
+};
+
+const deriveFieldSchema = (rule: FieldRule): Record<string, unknown> => {
+  switch (rule.type) {
+    case 'string': return { type: 'string' };
+    case 'stringList': return { type: 'array', items: { type: 'string' } };
+    case 'evidenceList': return { type: 'array', items: EVIDENCE_ITEM_JSON_SCHEMA };
+    case 'enum': return { type: 'string', enum: [...rule.values] };
+    // boolean 判决字段刻意不带 type 关键字：pi 入口校验（convert → validate）只按 type
+    // 触发类型转换；纯 enum 声明使 "true"/null/1 不被转换成 boolean，直接被 enum 拒绝，
+    // 与权威层行为一致，杜绝 null→false 静默翻转判决（探针已验证，见 per-kind schema 方案 §7）。
+    case 'boolean': return { enum: [true, false] };
+    case 'conclusion': return CONCLUSION_JSON_SCHEMA;
+    case 'findingList': return { type: 'array', items: FINDING_JSON_SCHEMA };
+    case 'implementationDetails': return IMPLEMENTATION_DETAILS_JSON_SCHEMA;
+  }
+};
+
+/** Worker 通过 submit_artifact 可提交的业务 artifact kind（user_decision/guard_rejection 不经 worker 工具提交）。 */
+export type SchemaArtifactKind = 'intake' | 'investigation' | 'investigation_review' | 'disposition' | 'change_plan_review' | 'implementation' | 'change_review' | 'verification';
+
+/** 递归冻结 schema 对象：模块级导出被直接引用进每次工具声明，
+ *  任何原地修改（含嵌套 properties/required/enum 数组）都会静默污染后续节点；
+ *  pi 侧 validateToolArguments 只读 schema（convert 写入的是 args 克隆，Compile 生成独立校验器），
+ *  深冻结无兼容性风险（已验证）。 */
+const deepFreezeSchema = <T>(value: T): T => {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const item of Object.values(value as Record<string, unknown>)) deepFreezeSchema(item);
+  }
+  return value;
+};
+
+/**
+ * 每个 worker 节点唯一 kind 的完整 JSON Schema：由 SUBMIT_ARTIFACT_FIELD_RULES 派生，
+ * 注入 submit_artifact 工具声明（pi 入口校验，convert → validate）。
+ * required 只由每条 FieldRule 自身的显式 required 属性驱动（无第二份 per-type 白名单），
+ * 与权威层 validateSubmitArtifact 的必填检查同源。
+ * additionalProperties: true 与权威层一致（envelope 字段合法）；条件必填（如
+ * requiresRepositoryChange→candidateRevision、accepted=false→failure）不进 schema，留权威层。
+ * 导出深冻结：防止调用方原地修改污染共享 schema（每次访问都拿到同一冻结对象）。
+ */
+export const ARTIFACT_JSON_SCHEMAS: Record<SchemaArtifactKind, Record<string, unknown>> = deepFreezeSchema(
+  Object.fromEntries(
+    (Object.keys(SUBMIT_ARTIFACT_FIELD_RULES) as SchemaArtifactKind[]).map((kind) => {
+      const properties: Record<string, unknown> = { kind: { type: 'string', enum: [kind] } };
+      const required: string[] = ['kind'];
+      for (const rule of SUBMIT_ARTIFACT_FIELD_RULES[kind]) {
+        properties[rule.name] = deriveFieldSchema(rule);
+        if (rule.required) required.push(rule.name);
+      }
+      return [kind, { type: 'object', properties, required, additionalProperties: true }];
+    }),
+  ) as unknown as Record<SchemaArtifactKind, Record<string, unknown>>,
+);
+
+/** 语义节点 id → 该节点能产出的唯一业务 kind。全仓库唯一一份映射：
+ *  runtime restore 校验、NODE_KIND_MISMATCH 门禁与 per-kind schema 绑定共用（不含
+ *  guard_rejection/user_decision——它们不经 worker 节点提交）。 */
+export const NODE_ARTIFACT_KINDS: Record<string, Artifact['kind']> = {
+  intake: 'intake',
+  investigate: 'investigation',
+  investigation_review: 'investigation_review',
+  disposition: 'disposition',
+  change_plan_review: 'change_plan_review',
+  implement: 'implementation',
+  change_review: 'change_review',
+  verify: 'verification',
+};
+
 export function validateArtifactEnvelope(value: unknown, context?: ArtifactExecutionContext): asserts value is ArtifactEnvelope {
   if (!value || typeof value !== 'object') throw new ArtifactContractError('INVALID_ARTIFACT_ENVELOPE', 'artifact envelope must be an object');
   const envelope = value as Record<string, unknown>;
@@ -287,98 +553,42 @@ export function validateSubmitArtifact(value:unknown, context?: ArtifactExecutio
     if (!nonEmptyString(artifact.error)) throw new ArtifactContractError('MISSING_GUARD_REJECTION_ERROR', 'guard_rejection.error is required');
     return;
   }
-  if (artifact.kind === 'investigation') {
-    if (!['local_fix', 'requirement_change', 'design_change', 'needs_more_evidence', 'blocked'].includes(String(artifact.route))) {
-      throw new ArtifactContractError('INVALID_INVESTIGATION_ROUTE', 'investigation.route is invalid');
-    }
-    if (!nonEmptyString(artifact.rootCause)) throw new ArtifactContractError('MISSING_ROOT_CAUSE', 'investigation.rootCause is required');
-    if (!evidenceList(artifact.evidence)) throw new ArtifactContractError('MISSING_INVESTIGATION_EVIDENCE', 'investigation.evidence must contain at least one non-empty item');
-    return;
-  }
-  if (artifact.kind === 'implementation') {
-    const details = artifact.artifact as Record<string, unknown> | undefined;
-    if (!details || typeof details !== 'object') throw new ArtifactContractError('MISSING_IMPLEMENTATION_DETAILS', 'implementation.artifact is required');
-    if (!nonEmptyString(details.summary)) throw new ArtifactContractError('MISSING_IMPLEMENTATION_SUMMARY', 'implementation.artifact.summary is required');
-    if (!Array.isArray(details.filesChanged) || details.filesChanged.length === 0 || !details.filesChanged.every(nonEmptyString)) throw new ArtifactContractError('MISSING_FILES_CHANGED', 'implementation.artifact.filesChanged must contain at least one file');
-    if (!nonEmptyString(details.candidateRevision)) throw new ArtifactContractError('MISSING_CANDIDATE_REVISION', 'implementation.artifact.candidateRevision is required');
-    if (details.prUrl !== undefined && !nonEmptyString(details.prUrl)) throw new ArtifactContractError('INVALID_PR_URL', 'implementation.artifact.prUrl must be a non-empty string when provided');
-    return;
-  }
-    if (artifact.kind === 'verification') {
-    if (typeof artifact.accepted !== 'boolean') throw new ArtifactContractError('MISSING_VERIFICATION_DECISION', 'verification.accepted must be boolean');
-    if (!evidenceList(artifact.evidence)) throw new ArtifactContractError('MISSING_VERIFICATION_EVIDENCE', 'verification.evidence must contain at least one non-empty item');
-    // candidateRevision 按 requiresRepositoryChange 区分：仓库变更路径必须绑定被验证的
-    // implementation 版本（一致性由 Runtime/Acceptance 控制面强制，版本一致率 100%）；
-    // 无仓库变更路径没有 implementation 可比对，允许省略（声明了版本时不在此拒绝，
-    // 跨 Artifact 矛盾由 Runtime 校验）。
-    if (context?.requiresRepositoryChange === true && !nonEmptyString(artifact.candidateRevision)) throw new ArtifactContractError('MISSING_VERIFICATION_REVISION', 'verification.candidateRevision is required on a repository-change path (bind the verified implementation revision)');
-    if (artifact.accepted === false) {
-      // v2 工作流（requiresArtifactConclusion，校验上下文携带 requiresArtifactConclusion=true）下验证失败
-      // 必须声明失败类别：契约强制 D4 三向路由的事实基础，禁止静默回 IMPLEMENTING。
-      // legacy 定义（裸 Artifact 路径，validateSubmitArtifact 无上下文或上下文未声明的受控结论要求）
-      // 不在此强制结构化 failure——accepted=false 的流向由 legacy 自己的 transition/guard 定义
-      //（如 legacy fixDefinition 的 VERIFYING→IMPLEMENTING 只要求 accepted=false + 证据），
-      // 不能把 v2 失败契约无条件套到 legacy 上。accepted=true 携带 failure 的自相矛盾仍是全局规则。
-      if (context?.requiresArtifactConclusion === true) {
-        if (!artifact.failure || typeof artifact.failure !== 'object') throw new ArtifactContractError('MISSING_VERIFICATION_FAILURE', 'verification.failure is required when accepted is false');
-        const failure = artifact.failure as Record<string, unknown>;
-        if (!['implementation', 'configuration', 'external_condition'].includes(String(failure.kind))) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_KIND', 'verification.failure.kind is invalid');
-        if (!nonEmptyString(failure.reason)) throw new ArtifactContractError('MISSING_VERIFICATION_FAILURE_REASON', 'verification.failure.reason is required');
-        if (failure.responsibility !== undefined && !nonEmptyString(failure.responsibility)) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_RESPONSIBILITY', 'verification.failure.responsibility must be a non-empty string when provided');
-        if (failure.resolution !== undefined && !nonEmptyString(failure.resolution)) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_RESOLUTION', 'verification.failure.resolution must be a non-empty string when provided');
-      }
-    } else if (artifact.failure !== undefined) {
-      throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_ON_ACCEPTED', 'verification.failure must be absent when accepted is true');
-    }
-    return;
-  }
-  if (artifact.kind === 'intake') {
+  // 字段级检查：遍历 per-kind 定义表（顺序即错误优先级，等价性基线测试钉住）。
+  // 表键被 Record<SchemaArtifactKind, …> 收紧，非 schema kind（user_decision/guard_rejection 等）
+  // 查不到规则，走下方各自分支。
+  const fieldRules = isSchemaArtifactKind(String(artifact.kind)) ? SUBMIT_ARTIFACT_FIELD_RULES[artifact.kind as SchemaArtifactKind] : undefined;
+  if (fieldRules) {
     // 新 Intake 契约为 summary/overview；旧 phenomenon 兼容字段已移除，携带即拒绝（不做静默降级）。
-    if ('phenomenon' in artifact) throw new ArtifactContractError('INVALID_INTAKE_PHENOMENON', 'intake.phenomenon is removed; use summary/overview');
-    if (!nonEmptyString(artifact.summary)) throw new ArtifactContractError('MISSING_INTAKE_SUMMARY', 'intake.summary is required');
-    if (!nonEmptyString(artifact.overview)) throw new ArtifactContractError('MISSING_INTAKE_OVERVIEW', 'intake.overview is required');
-    if (!optionalString(artifact.environment)) throw new ArtifactContractError('INVALID_INTAKE_ENVIRONMENT', 'intake.environment must be a non-empty string when provided');
-    if (!optionalString(artifact.scope)) throw new ArtifactContractError('INVALID_INTAKE_SCOPE', 'intake.scope must be a non-empty string when provided');
-    if (artifact.urgency !== undefined && !['low', 'medium', 'high', 'critical'].includes(String(artifact.urgency))) throw new ArtifactContractError('INVALID_INTAKE_URGENCY', 'intake.urgency is invalid');
-    return;
-  }
-  if (artifact.kind === 'investigation_review') {
-    if (!optionalString(artifact.targetArtifactId)) throw new ArtifactContractError('INVALID_INVESTIGATION_REVIEW_TARGET', 'investigation_review.targetArtifactId must be a non-empty string when provided');
-    if (!nonEmptyString(artifact.rootCauseConclusion)) throw new ArtifactContractError('MISSING_INVESTIGATION_REVIEW_ROOT_CAUSE_CONCLUSION', 'investigation_review.rootCauseConclusion is required');
-    if (!['sufficient', 'insufficient'].includes(String(artifact.evidenceSufficiency))) throw new ArtifactContractError('INVALID_INVESTIGATION_REVIEW_EVIDENCE_SUFFICIENCY', 'investigation_review.evidenceSufficiency is invalid');
-    if (!stringList(artifact.gaps)) throw new ArtifactContractError('INVALID_INVESTIGATION_REVIEW_GAPS', 'investigation_review.gaps must be an array of non-empty strings');
-    if (!optionalString(artifact.stopReason)) throw new ArtifactContractError('INVALID_INVESTIGATION_REVIEW_STOP_REASON', 'investigation_review.stopReason must be a non-empty string when provided');
-    requireConclusion(artifact.conclusion);
-    return;
-  }
-  if (artifact.kind === 'disposition') {
-    if (!['remediation', 'mitigation', 'explanation', 'external_action', 'wait_decision', 'change_request', 'insufficient_evidence'].includes(String(artifact.dispositionType))) throw new ArtifactContractError('INVALID_DISPOSITION_TYPE', 'disposition.dispositionType is invalid');
-    if (typeof artifact.requiresRepositoryChange !== 'boolean') throw new ArtifactContractError('INVALID_DISPOSITION_REQUIRES_REPOSITORY_CHANGE', 'disposition.requiresRepositoryChange must be boolean');
-    if (artifact.requiresFormalPlanReview !== undefined && typeof artifact.requiresFormalPlanReview !== 'boolean') throw new ArtifactContractError('INVALID_DISPOSITION_REQUIRES_FORMAL_PLAN_REVIEW', 'disposition.requiresFormalPlanReview must be boolean when provided');
-    if (!nonEmptyString(artifact.minimalScope)) throw new ArtifactContractError('MISSING_DISPOSITION_MINIMAL_SCOPE', 'disposition.minimalScope is required');
-    if (!stringList(artifact.risks)) throw new ArtifactContractError('INVALID_DISPOSITION_RISKS', 'disposition.risks must be an array of non-empty strings');
-    if (!nonEmptyString(artifact.verificationTarget)) throw new ArtifactContractError('MISSING_DISPOSITION_VERIFICATION_TARGET', 'disposition.verificationTarget is required');
-    requireConclusion(artifact.conclusion);
-    return;
-  }
-  if (artifact.kind === 'change_plan_review') {
-    if (!optionalString(artifact.targetPlanRevision)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_TARGET_REVISION', 'change_plan_review.targetPlanRevision must be a non-empty string when provided');
-    if (typeof artifact.rootCauseAlignment !== 'boolean') throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_ROOT_CAUSE_ALIGNMENT', 'change_plan_review.rootCauseAlignment must be boolean');
-    if (!nonEmptyString(artifact.changedScope)) throw new ArtifactContractError('MISSING_CHANGE_PLAN_REVIEW_CHANGED_SCOPE', 'change_plan_review.changedScope is required');
-    if (!stringList(artifact.risks)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_RISKS', 'change_plan_review.risks must be an array of non-empty strings');
-    if (!stringList(artifact.compatibility)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_COMPATIBILITY', 'change_plan_review.compatibility must be an array of non-empty strings');
-    if (!stringList(artifact.verification)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_VERIFICATION', 'change_plan_review.verification must be an array of non-empty strings');
-    if (!stringList(artifact.rollback)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_ROLLBACK', 'change_plan_review.rollback must be an array of non-empty strings');
-    if (!findingList(artifact.findings)) throw new ArtifactContractError('INVALID_CHANGE_PLAN_REVIEW_FINDINGS', 'change_plan_review.findings must be an array of valid findings');
-    requireConclusion(artifact.conclusion);
-    return;
-  }
-  if (artifact.kind === 'change_review') {
-    if (!optionalString(artifact.reviewedRevision)) throw new ArtifactContractError('INVALID_CHANGE_REVIEW_REVISION', 'change_review.reviewedRevision must be a non-empty string when provided');
-    if (!optionalString(artifact.prRef)) throw new ArtifactContractError('INVALID_CHANGE_REVIEW_PR_REF', 'change_review.prRef must be a non-empty string when provided');
-    if (!findingList(artifact.findings)) throw new ArtifactContractError('INVALID_CHANGE_REVIEW_FINDINGS', 'change_review.findings must be an array of valid findings');
-    if (!['all_closed', 'open'].includes(String(artifact.findingDisposition))) throw new ArtifactContractError('INVALID_CHANGE_REVIEW_FINDING_DISPOSITION', 'change_review.findingDisposition is invalid');
-    requireConclusion(artifact.conclusion);
+    // 这是一条 kind 内的条件规则，保持在手写层（先于表内字段检查）。
+    if (artifact.kind === 'intake' && 'phenomenon' in artifact) {
+      throw new ArtifactContractError('INVALID_INTAKE_PHENOMENON', 'intake.phenomenon is removed; use summary/overview');
+    }
+    for (const rule of fieldRules) validateFieldRule(rule, artifact);
+    if (artifact.kind === 'verification') {
+      // candidateRevision 按 requiresRepositoryChange 区分：仓库变更路径必须绑定被验证的
+      // implementation 版本（一致性由 Runtime/Acceptance 控制面强制，版本一致率 100%）；
+      // 无仓库变更路径没有 implementation 可比对，允许省略（声明了版本时不在此拒绝，
+      // 跨 Artifact 矛盾由 Runtime 校验）。条件逻辑，不进定义表。
+      if (context?.requiresRepositoryChange === true && !nonEmptyString(artifact.candidateRevision)) throw new ArtifactContractError('MISSING_VERIFICATION_REVISION', 'verification.candidateRevision is required on a repository-change path (bind the verified implementation revision)');
+      if (artifact.accepted === false) {
+        // v2 工作流（requiresArtifactConclusion，校验上下文携带 requiresArtifactConclusion=true）下验证失败
+        // 必须声明失败类别：契约强制 D4 三向路由的事实基础，禁止静默回 IMPLEMENTING。
+        // legacy 定义（裸 Artifact 路径，validateSubmitArtifact 无上下文或上下文未声明的受控结论要求）
+        // 不在此强制结构化 failure——accepted=false 的流向由 legacy 自己的 transition/guard 定义
+        //（如 legacy fixDefinition 的 VERIFYING→IMPLEMENTING 只要求 accepted=false + 证据），
+        // 不能把 v2 失败契约无条件套到 legacy 上。accepted=true 携带 failure 的自相矛盾仍是全局规则。
+        if (context?.requiresArtifactConclusion === true) {
+          if (!artifact.failure || typeof artifact.failure !== 'object') throw new ArtifactContractError('MISSING_VERIFICATION_FAILURE', 'verification.failure is required when accepted is false');
+          const failure = artifact.failure as Record<string, unknown>;
+          if (!['implementation', 'configuration', 'external_condition'].includes(String(failure.kind))) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_KIND', 'verification.failure.kind is invalid');
+          if (!nonEmptyString(failure.reason)) throw new ArtifactContractError('MISSING_VERIFICATION_FAILURE_REASON', 'verification.failure.reason is required');
+          if (failure.responsibility !== undefined && !nonEmptyString(failure.responsibility)) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_RESPONSIBILITY', 'verification.failure.responsibility must be a non-empty string when provided');
+          if (failure.resolution !== undefined && !nonEmptyString(failure.resolution)) throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_RESOLUTION', 'verification.failure.resolution must be a non-empty string when provided');
+        }
+      } else if (artifact.failure !== undefined) {
+        throw new ArtifactContractError('INVALID_VERIFICATION_FAILURE_ON_ACCEPTED', 'verification.failure must be absent when accepted is true');
+      }
+    }
     return;
   }
   if (artifact.kind === 'user_decision') {
