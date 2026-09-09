@@ -258,11 +258,31 @@ export async function fetchUsageSnapshot(authResult: unknown, options: FetchUsag
   }
 }
 
-export function formatProgressBar(remainingPercent: number): string {
-  const filled = Number.isFinite(remainingPercent)
+const ANSI_RESET = '\u001b[0m';
+const ALLOWED_METRIC_COLOR = '\u001b[38;2;116;217;165m';
+const EMPTY_PROGRESS_COLOR = '\u001b[38;2;89;103;124m';
+
+function progressFillCount(remainingPercent: number): number {
+  return Number.isFinite(remainingPercent)
     ? Math.max(0, Math.min(10, Math.round(remainingPercent / 10)))
     : 0;
+}
+
+export function formatProgressBar(remainingPercent: number): string {
+  const filled = progressFillCount(remainingPercent);
   return '█'.repeat(filled) + '░'.repeat(10 - filled);
+}
+
+function ansiSegment(color: string, text: string): string {
+  return text.length === 0 ? '' : `${color}${text}${ANSI_RESET}`;
+}
+
+function formatMetric(window: UsageWindow, theme?: UsageThemeLike): string {
+  const filled = progressFillCount(window.remainingPercent);
+  const filledText = '█'.repeat(filled);
+  const emptyText = '░'.repeat(10 - filled);
+  if (!theme) return `${window.remainingPercent}% ${filledText}${emptyText}`;
+  return `${ansiSegment(ALLOWED_METRIC_COLOR, `${window.remainingPercent}% ${filledText}`)}${ansiSegment(EMPTY_PROGRESS_COLOR, emptyText)}`;
 }
 
 function formatResetTime(seconds: number): string {
@@ -279,16 +299,9 @@ function style(theme: UsageThemeLike | undefined, color: UsageThemeColor, text: 
   return styled;
 }
 
-function metricColor(remainingPercent: number): UsageThemeColor {
-  if (remainingPercent >= 50) return 'success';
-  if (remainingPercent >= 20) return 'warning';
-  return 'error';
-}
-
 function formatWindow(window: UsageWindow, theme?: UsageThemeLike): string {
-  const metric = `${window.remainingPercent}% ${formatProgressBar(window.remainingPercent)}`;
   const reset = window.resetsAt === undefined ? '' : ` · ${style(theme, 'dim', formatResetTime(window.resetsAt))}`;
-  return `${style(theme, metricColor(window.remainingPercent), metric)}${reset}`;
+  return `${formatMetric(window, theme)}${reset}`;
 }
 
 function formatSnapshotBody(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {

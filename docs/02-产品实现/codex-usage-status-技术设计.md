@@ -143,7 +143,7 @@ stateDiagram-v2
 
 每次成功 scope 确认授予 60 秒 scope lease，并安排 lease timer。lease timer 触发时先递增 generation、清除 snapshot 和 hard-expiry timer、显示 `unavailable`，再后台重校验；因此授权解析长期 pending 也不能使旧账户数据展示超过 lease。每次校验后都比较 fingerprint；缺失、变化或不匹配时同样清除。所有在途授权/HTTP 的晚到结果 generation 不一致时丢弃。成功 usage 快照另在 `fetchedAt + 10m` 安排 hard-expiry timer，触发时重新检查 age 与 scope 后清除旧比例；因此没有新请求结果也不会超过硬期限展示 stale。
 
-`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。`setStatus()` 不提供 extension 可用宽度。格式必须把许可状态、比例和进度条放在重置详情前，让宿主截断时保留主要信息；扩展不得声称自行适配全局 footer 宽度。
+`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。正常状态以受限 truecolor ANSI 输出：比例和填充块 `#74d9a5`（`38;2;116;217;165`），空块 faint `#59677c`（`38;2;89;103;124`），每个被着色片段后立即附 `reset`；不得接受服务端颜色/ANSI。`Codex`/重置时间仍通过 `ctx.ui.theme.fg("dim", …)`，`stale`/`status unknown` 用 `warning`、`limit reached` 用 `error`。`setStatus()` 不提供 extension 可用宽度。格式必须把许可状态、比例和进度条放在重置详情前，让宿主截断时保留主要信息；扩展不得声称自行适配全局 footer 宽度。
 
 ## 5. 失败、恢复与可运营性
 
