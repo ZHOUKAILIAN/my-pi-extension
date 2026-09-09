@@ -86,14 +86,14 @@ test('formats availability, progress, and reset details without a default label'
   const allowed = parseUsagePayload({
     rate_limit: {
       allowed: true,
-      primary_window: { used_percent: 2, reset_at: 2000000000 },
+      primary_window: { used_percent: 2, limit_window_seconds: 18000, reset_at: 2000000000 },
     },
   }, 'acct-test', 1000);
   assert.ok(allowed);
   const reset = new Date(2000000000 * 1000);
   const pad = (value: number) => String(value).padStart(2, '0');
   const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][reset.getMonth()];
-  assert.equal(formatUsageSnapshot(allowed), `Codex 98% left [██████████] · resets ${month} ${reset.getDate()} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`);
+  assert.equal(formatUsageSnapshot(allowed), `Codex · 98% ██████████ · ${month} ${reset.getDate()} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`);
 
   const limited = parseUsagePayload({
     rate_limit: {
@@ -109,7 +109,7 @@ test('formats availability, progress, and reset details without a default label'
     rate_limit: { primary_window: { used_percent: 50 } },
   }, 'acct-test', 1000);
   assert.ok(unknown);
-  assert.equal(formatUsageSnapshot(unknown), 'Codex status unknown · 50% left [█████░░░░░]');
+  assert.equal(formatUsageSnapshot(unknown), 'Codex status unknown · 50% █████░░░░░');
 });
 
 test('marks a same-scope failed refresh stale without additional windows', async () => {
@@ -138,7 +138,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.match(statuses.at(-1) ?? '', /^Codex 72% left \[/u);
+    assert.match(statuses.at(-1) ?? '', /^Codex · 72% ███████░░░ · /u);
 
     // The scope lease and usage interval are both one minute. Move only the
     // usage attempt clock so this test stays within the active scope lease.
@@ -146,8 +146,8 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.match(statuses.at(-1) ?? '', /^Codex: stale · 72% left \[/u);
-    assert.doesNotMatch(statuses.at(-1) ?? '', /model-x|a-first|z-last/u);
+    assert.match(statuses.at(-1) ?? '', /^Codex: stale · 72% ███████░░░ · /u);
+    assert.doesNotMatch(statuses.at(-1) ?? '', /model-x|a-first|z-last|5h|7d|left|resets|\[/u);
   } finally {
     controller.shutdown();
   }

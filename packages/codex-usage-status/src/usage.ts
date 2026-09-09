@@ -256,11 +256,6 @@ export function formatProgressBar(remainingPercent: number): string {
   return '█'.repeat(filled) + '░'.repeat(10 - filled);
 }
 
-function formatWindowDuration(minutes: number): string {
-  const rounded = Math.round(minutes);
-  return rounded % 1440 === 0 ? `${rounded / 1440}d` : rounded % 60 === 0 ? `${rounded / 60}h` : `${rounded}m`;
-}
-
 function formatResetTime(seconds: number): string {
   const date = new Date(seconds * 1000);
   const pad = (value: number) => String(value).padStart(2, '0');
@@ -269,17 +264,20 @@ function formatResetTime(seconds: number): string {
 }
 
 function formatWindow(window: UsageWindow): string {
-  const details: string[] = [];
-  if (window.windowDurationMins !== undefined) details.push(formatWindowDuration(window.windowDurationMins));
-  if (window.resetsAt !== undefined) details.push(`resets ${formatResetTime(window.resetsAt)}`);
-  return `${window.remainingPercent}% left [${formatProgressBar(window.remainingPercent)}]${details.length === 0 ? '' : ` · ${details.join(' · ')}`}`;
+  const reset = window.resetsAt === undefined ? '' : ` · ${formatResetTime(window.resetsAt)}`;
+  return `${window.remainingPercent}% ${formatProgressBar(window.remainingPercent)}${reset}`;
 }
 
 export function formatUsageSnapshot(snapshot: UsageDisplaySnapshot): string {
   if (snapshot.availability === 'limited') return 'Codex limit reached';
   const windows = snapshot.windows.map(formatWindow).join(' · ');
   if (snapshot.availability === 'unknown') return windows.length === 0 ? 'Codex status unknown' : `Codex status unknown · ${windows}`;
-  return windows.length === 0 ? 'Codex' : `Codex ${windows}`;
+  return windows.length === 0 ? 'Codex' : `Codex · ${windows}`;
+}
+
+function formatStaleSnapshot(snapshot: UsageDisplaySnapshot): string {
+  const previous = formatUsageSnapshot(snapshot).replace(/^Codex(?: ·)?\s*/u, '');
+  return `Codex: stale · ${previous}`;
 }
 
 function isEligible(context: UsageContextLike, model = context.model): boolean {
@@ -570,7 +568,7 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.context?.ui.setStatus('codex-usage-status', `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex'.length).trimStart()}`);
+    this.context?.ui.setStatus('codex-usage-status', formatStaleSnapshot(this.snapshot.display));
   }
 
   private render(): void {
@@ -584,7 +582,7 @@ export class UsageController {
       return;
     }
     this.context.ui.setStatus('codex-usage-status', this.usageFailure
-      ? `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex'.length).trimStart()}`
+      ? formatStaleSnapshot(this.snapshot.display)
       : formatUsageSnapshot(this.snapshot.display));
   }
 }
