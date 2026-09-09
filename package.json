@@ -9,7 +9,7 @@
     "test": "node --experimental-strip-types --test packages/*/test/*.test.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.4",
     "typescript": "^5.7.0"
   }
 }
