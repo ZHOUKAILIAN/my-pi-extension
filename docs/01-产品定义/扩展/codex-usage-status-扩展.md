@@ -19,7 +19,7 @@ flowchart LR
 
 扩展必须：
 
-1. 只展示默认 Codex 主额度 bucket 的有效窗口；完全忽略 `additional_rate_limits`（例如 `GPT-5.3-Codex-Spark`）。不展示 `default` 标签。正常格式为 `Codex 98% left [██████████] · resets Sep 16 10:41`；不把窗口名称或时长硬编码为“5 小时”或“每周”。
+1. 只展示默认 Codex 主额度 bucket 的有效窗口；完全忽略 `additional_rate_limits`（例如 `GPT-5.3-Codex-Spark`）。不展示 `default` 标签。采用 C「胶囊额度」样式，正常格式为 `Codex · 98% ██████████ · Sep 16 10:41`；不把窗口名称或时长硬编码为“5 小时”或“每周”。
 2. 进度条表达**剩余比例**，由 10 个固定单元组成：填充数为 `round(remainingPercent / 10)`，已填充为 `█`、未填充为 `░`。许可状态和比例必须排在重置详情之前；Pi 宿主可截断过长 footer。
 3. 明确区分“窗口剩余比例”与“当前允许使用”：默认 bucket 的 `allowed` 为 false 时显示 `Codex limit reached`；其缺失时显示 `Codex status unknown`，不得仅因 `NN% left` 推断仍能使用。
 4. 区分当前快照、过期快照和不可用。刷新失败后，最近成功且账户作用域仍匹配的快照仅在 `now - fetchedAt < 10 分钟` 时显示 `stale`；到达 `now - fetchedAt >= 10 分钟` 时必须清除旧比例并显示 `Codex: unavailable`，即使没有新请求结果。
@@ -47,7 +47,7 @@ flowchart LR
 | 非 TUI 或当前模型不是 Codex | 不显示本扩展状态 | 不解析授权、不联网、不启动定时器；不影响其他模式/provider。 |
 | 会话开始、切入 Codex 或用户输入 | 后台校验授权；必要时异步获取快照 | 不阻塞会话启动、模型切换或输入处理。 |
 | 每次 scope lease 到期（最多 60 秒） | 先清除快照，再后台重校验当前授权作用域 | 授权解析长期 pending 也不得延长旧快照展示；发现授权缺失或作用域变化时立即清除。 |
-| 成功查询且默认 `allowed=true` | 显示主窗口与 10 单元剩余进度条 | 仅采用字段完整、数值合法且账户作用域未失配的窗口。 |
+| 成功查询且默认 `allowed=true` | 显示 `Codex · <比例> <10 单元进度条> · <重置时间>` | 仅采用字段完整、数值合法且账户作用域未失配的窗口。 |
 | 成功查询且默认 `allowed=false` | `Codex limit reached` | 不显示会误导许可状态的进度条。 |
 | 成功查询但默认 `allowed` 缺失 | `Codex status unknown · <主窗口和进度条>` | 许可状态在前；不从比例或重置时间推断允许。 |
 | 定期刷新或 Pi 结束一次 Agent 工作后刷新 | 用较新的成功快照替换旧值 | 请求必须限频；多个触发不得并发放大请求。 |

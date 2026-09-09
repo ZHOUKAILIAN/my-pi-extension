@@ -135,9 +135,9 @@ stateDiagram-v2
 | 状态 | 底栏 | 规则 |
 | --- | --- | --- |
 | `Hidden` | 清除 extension status | 无认证/网络/timer。 |
-| `Current` | `Codex 72% left [███████░░░] · resets Sep 16 10:41` | 只展示当前 scope 的默认 bucket 合法窗口。 |
+| `Current` | `Codex · 72% ███████░░░ · Sep 16 10:41` | C「胶囊额度」样式；只展示当前 scope 的默认 bucket 合法窗口。 |
 | `Limited` | `Codex limit reached` | 不显示会误导许可状态的进度条。 |
-| `Unknown` | `Codex status unknown · 72% left [███████░░░]` | 只展示默认窗口；不推断许可。 |
+| `Unknown` | `Codex status unknown · 72% ███████░░░` | 只展示默认窗口；不推断许可。 |
 | `Stale` | `Codex: stale <previous text>` | 仅 `now - fetchedAt < 10m` 且 scope fingerprint 相同。 |
 | `Unavailable` | `Codex: unavailable` | 不展示旧数值。 |
 
