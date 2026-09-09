@@ -44,6 +44,10 @@ function payload(accountId = 'acct-test') {
   };
 }
 
+function styledTheme() {
+  return { fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+}
+
 test('public entry does not expose auth scope extraction or account scope types', () => {
   assert.equal('extractCodexAuthScope' in publicEntry, false);
   assert.equal('CodexAuthScope' in publicEntry, false);
@@ -112,6 +116,38 @@ test('formats availability, progress, and reset details without a default label'
   assert.equal(formatUsageSnapshot(unknown), 'Codex status unknown · 50% █████░░░░░');
 });
 
+test('colors footer labels, status, and each window by semantic state', () => {
+  const snapshot = {
+    availability: 'allowed' as const,
+    windows: [
+      { remainingPercent: 72, resetsAt: 2000000000 },
+      { remainingPercent: 49 },
+      { remainingPercent: 19 },
+    ],
+    fetchedAt: 1000,
+  };
+  const formatted = formatUsageSnapshot(snapshot, styledTheme());
+  assert.match(formatted, /^<dim>Codex<\/dim> · <success>72% ███████░░░<\/success> · <dim>May \d+/u);
+  assert.match(formatted, /<warning>49% █████░░░░░<\/warning>/u);
+  assert.match(formatted, /<error>19% ██░░░░░░░░<\/error>/u);
+
+  const unknown = parseUsagePayload({ rate_limit: { primary_window: { used_percent: 50 } } }, 'acct-test');
+  assert.ok(unknown);
+  assert.equal(formatUsageSnapshot(unknown, styledTheme()), '<dim>Codex</dim> <warning>status unknown</warning> · <success>50% █████░░░░░</success>');
+
+  const limited = parseUsagePayload({ rate_limit: { allowed: false, primary_window: { used_percent: 0 } } }, 'acct-test');
+  assert.ok(limited);
+  assert.equal(formatUsageSnapshot(limited, styledTheme()), '<dim>Codex</dim> <error>limit reached</error>');
+});
+
+test('falls back to plain text when the footer theme is unavailable', () => {
+  const snapshot = parseUsagePayload({ rate_limit: { allowed: true, primary_window: { used_percent: 28 } } }, 'acct-test');
+  assert.ok(snapshot);
+  const plain = formatUsageSnapshot(snapshot);
+  assert.equal(formatUsageSnapshot(snapshot, { fg: () => { throw new Error('theme unavailable'); } }), plain);
+  assert.equal(formatUsageSnapshot(snapshot, undefined), plain);
+});
+
 test('marks a same-scope failed refresh stale without additional windows', async () => {
   let clock = 1_000_000;
   let fetchCalls = 0;
@@ -123,7 +159,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
       isUsingOAuth: () => true,
       getProviderAuth: async () => auth(),
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text), theme: styledTheme() },
   };
   const controller = new UsageController({
     now: () => clock,
@@ -138,7 +174,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.match(statuses.at(-1) ?? '', /^Codex · 72% ███████░░░ · /u);
+    assert.match(statuses.at(-1) ?? '', /^<dim>Codex<\/dim> · <success>72% ███████░░░<\/success> · <dim>/u);
 
     // The scope lease and usage interval are both one minute. Move only the
     // usage attempt clock so this test stays within the active scope lease.
@@ -146,7 +182,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.match(statuses.at(-1) ?? '', /^Codex: stale · 72% ███████░░░ · /u);
+    assert.match(statuses.at(-1) ?? '', /^<dim>Codex<\/dim><warning>: stale<\/warning> · <success>72% ███████░░░<\/success> · <dim>/u);
     assert.doesNotMatch(statuses.at(-1) ?? '', /model-x|a-first|z-last|5h|7d|left|resets|\[/u);
   } finally {
     controller.shutdown();

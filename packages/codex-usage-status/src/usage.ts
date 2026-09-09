@@ -52,6 +52,12 @@ export interface FetchUsageOptions {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
+type UsageThemeColor = 'success' | 'warning' | 'error' | 'dim';
+
+export interface UsageThemeLike {
+  fg(color: UsageThemeColor, text: string): string;
+}
+
 export interface UsageContextLike {
   readonly mode: string;
   readonly model: UsageModelLike | undefined;
@@ -59,7 +65,10 @@ export interface UsageContextLike {
     isUsingOAuth(model: UsageModelLike): boolean;
     getProviderAuth(provider: string): Promise<unknown>;
   };
-  readonly ui: { setStatus(key: string, text: string | undefined): void };
+  readonly ui: {
+    setStatus(key: string, text: string | undefined): void;
+    readonly theme?: UsageThemeLike;
+  };
 }
 
 export interface UsageModelLike {
@@ -263,21 +272,77 @@ function formatResetTime(seconds: number): string {
   return `${month} ${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
-function formatWindow(window: UsageWindow): string {
-  const reset = window.resetsAt === undefined ? '' : ` · ${formatResetTime(window.resetsAt)}`;
-  return `${window.remainingPercent}% ${formatProgressBar(window.remainingPercent)}${reset}`;
+function style(theme: UsageThemeLike | undefined, color: UsageThemeColor, text: string): string {
+  if (!theme) return text;
+  const styled = theme.fg(color, text);
+  if (typeof styled !== 'string') throw new Error('theme returned a non-string value');
+  return styled;
 }
 
-export function formatUsageSnapshot(snapshot: UsageDisplaySnapshot): string {
-  if (snapshot.availability === 'limited') return 'Codex limit reached';
-  const windows = snapshot.windows.map(formatWindow).join(' · ');
-  if (snapshot.availability === 'unknown') return windows.length === 0 ? 'Codex status unknown' : `Codex status unknown · ${windows}`;
-  return windows.length === 0 ? 'Codex' : `Codex · ${windows}`;
+function metricColor(remainingPercent: number): UsageThemeColor {
+  if (remainingPercent >= 50) return 'success';
+  if (remainingPercent >= 20) return 'warning';
+  return 'error';
 }
 
-function formatStaleSnapshot(snapshot: UsageDisplaySnapshot): string {
-  const previous = formatUsageSnapshot(snapshot).replace(/^Codex(?: ·)?\s*/u, '');
-  return `Codex: stale · ${previous}`;
+function formatWindow(window: UsageWindow, theme?: UsageThemeLike): string {
+  const metric = `${window.remainingPercent}% ${formatProgressBar(window.remainingPercent)}`;
+  const reset = window.resetsAt === undefined ? '' : ` · ${style(theme, 'dim', formatResetTime(window.resetsAt))}`;
+  return `${style(theme, metricColor(window.remainingPercent), metric)}${reset}`;
+}
+
+function formatSnapshotBody(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {
+  if (snapshot.availability === 'limited') return style(theme, 'error', 'limit reached');
+  const windows = snapshot.windows.map((window) => formatWindow(window, theme)).join(' · ');
+  if (snapshot.availability === 'unknown') {
+    const status = style(theme, 'warning', 'status unknown');
+    return windows.length === 0 ? status : `${status} · ${windows}`;
+  }
+  return windows;
+}
+
+function formatUsageSnapshotWithTheme(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {
+  const codex = style(theme, 'dim', 'Codex');
+  const body = formatSnapshotBody(snapshot, theme);
+  if (snapshot.availability === 'limited' || snapshot.availability === 'unknown') return `${codex} ${body}`;
+  return body.length === 0 ? codex : `${codex} · ${body}`;
+}
+
+export function formatUsageSnapshot(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {
+  try {
+    return formatUsageSnapshotWithTheme(snapshot, theme);
+  } catch {
+    return formatUsageSnapshotWithTheme(snapshot);
+  }
+}
+
+function formatStaleSnapshotWithTheme(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {
+  const previous = formatSnapshotBody(snapshot, theme);
+  return `${style(theme, 'dim', 'Codex')}${style(theme, 'warning', ': stale')} · ${previous}`;
+}
+
+function formatStaleSnapshot(snapshot: UsageDisplaySnapshot, theme?: UsageThemeLike): string {
+  try {
+    return formatStaleSnapshotWithTheme(snapshot, theme);
+  } catch {
+    return formatStaleSnapshotWithTheme(snapshot);
+  }
+}
+
+function formatUnavailable(theme?: UsageThemeLike): string {
+  try {
+    return `${style(theme, 'dim', 'Codex')}: unavailable`;
+  } catch {
+    return 'Codex: unavailable';
+  }
+}
+
+function getTheme(context: UsageContextLike | undefined): UsageThemeLike | undefined {
+  try {
+    return context?.ui.theme;
+  } catch {
+    return undefined;
+  }
 }
 
 function isEligible(context: UsageContextLike, model = context.model): boolean {
@@ -559,7 +624,7 @@ export class UsageController {
   }
 
   private renderUnavailable(): void {
-    this.context?.ui.setStatus('codex-usage-status', 'Codex: unavailable');
+    this.context?.ui.setStatus('codex-usage-status', formatUnavailable(getTheme(this.context)));
   }
 
   private renderUnavailableOrStale(): void {
@@ -568,7 +633,7 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.context?.ui.setStatus('codex-usage-status', formatStaleSnapshot(this.snapshot.display));
+    this.context?.ui.setStatus('codex-usage-status', formatStaleSnapshot(this.snapshot.display, getTheme(this.context)));
   }
 
   private render(): void {
@@ -581,9 +646,10 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
+    const theme = getTheme(this.context);
     this.context.ui.setStatus('codex-usage-status', this.usageFailure
-      ? formatStaleSnapshot(this.snapshot.display)
-      : formatUsageSnapshot(this.snapshot.display));
+      ? formatStaleSnapshot(this.snapshot.display, theme)
+      : formatUsageSnapshot(this.snapshot.display, theme));
   }
 }
 

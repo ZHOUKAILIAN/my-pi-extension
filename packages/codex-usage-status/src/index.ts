@@ -13,6 +13,7 @@ export type {
   UsageContextLike,
   UsageDisplaySnapshot,
   UsageModelLike,
+  UsageThemeLike,
   UsageWindow,
 } from './usage.ts';
 
