@@ -153,6 +153,90 @@ test('marks a same-scope failed refresh stale without additional windows', async
   }
 });
 
+test('keeps limited stale status without a progress bar after controller refresh failure', async () => {
+  let clock = 1_000_000;
+  let fetchCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => auth(),
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    now: () => clock,
+    fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new Error('temporary failure');
+      return new Response(JSON.stringify({
+        ...payload(),
+        rate_limit: { ...payload().rate_limit, allowed: false },
+      }), { status: 200 });
+    },
+  });
+
+  try {
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(statuses.at(-1), 'Codex limit reached');
+
+    (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(statuses.at(-1), 'Codex: stale · limit reached');
+    assert.doesNotMatch(statuses.at(-1) ?? '', /[█░]/u);
+  } finally {
+    controller.shutdown();
+  }
+});
+
+test('keeps unknown status and the primary C capsule metric after controller refresh failure', async () => {
+  let clock = 1_000_000;
+  let fetchCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => auth(),
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    now: () => clock,
+    fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new Error('temporary failure');
+      return new Response(JSON.stringify({
+        rate_limit: { primary_window: { used_percent: 28.4 } },
+      }), { status: 200 });
+    },
+  });
+
+  try {
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(statuses.at(-1), 'Codex status unknown · 72% ███████░░░');
+
+    (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(statuses.at(-1), 'Codex: stale · status unknown · 72% ███████░░░');
+    assert.match(statuses.at(-1) ?? '', /status unknown/u);
+    assert.match(statuses.at(-1) ?? '', /72% ███████░░░/u);
+  } finally {
+    controller.shutdown();
+  }
+});
+
 test('uses the fixed URL, manual redirects, and accepts only HTTP 200', async () => {
   const calls: Array<{ url: string; init: RequestInit }> = [];
   const result = await fetchUsageSnapshot(auth(), {
