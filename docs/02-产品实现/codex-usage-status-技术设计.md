@@ -77,11 +77,7 @@ interface UsageWireLimit {
 interface UsageWireResponse {
   account_id?: unknown;
   rate_limit?: UsageWireLimit;
-  additional_rate_limits?: Array<{
-    limit_name?: unknown;
-    metered_feature?: unknown;
-    rate_limit?: UsageWireLimit;
-  }>;
+  // additional_rate_limits is intentionally ignored and never parsed/projected.
 }
 ```
 
@@ -89,7 +85,6 @@ interface UsageWireResponse {
 
 ```typescript
 interface UsageWindow {
-  label: string;
   remainingPercent: number;
   windowDurationMins?: number;
   resetsAt?: number;
@@ -111,11 +106,10 @@ interface InternalScopedSnapshot {
 
 解析规则：
 
-1. 只读取默认 `rate_limit` 与 `additional_rate_limits[*].rate_limit`；不读取 app-server camelCase 投影、credits、upsell 或未知字段。
-2. 默认 bucket label 固定 `default`。额外 bucket label 仅可使用匹配 `/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,39}$/` 的 `limit_name`、否则同样校验 `metered_feature`、否则 `additional`；这会拒绝控制字符、ESC/OSC、Bidi、换行和超长值。它们按 label 的 Unicode 码位顺序稳定排序，同标签以原始索引排序。
-3. 每个 bucket 依次读取 primary、secondary。`used_percent` 必须为有限数值 `0..100`；`remainingPercent = Math.round(100 - usedPercent)`。`limit_window_seconds` 只接受正整数并换算分钟；`reset_at` 只接受在 `2000-01-01..2100-01-01` 的正整数 Unix 秒级时间。
-4. 只有默认 `rate_limit.allowed` 决定全局 `availability`；额外 bucket 的 `allowed` 不读取。`true` 是 `allowed`、`false` 是 `limited`，其他值是 `unknown`。
-5. 无任一合法窗口即解析失败。JWT 必须恰有三段、base64url payload 可解析为 plain object，且若 `exp` 存在必须是未过期的有限 Unix 秒；scope claim 不合法即失败。若响应有 `account_id`，它必须是非空字符串且与请求 scope 匹配；类型错误、空值或失配均丢弃整个响应。比较后立即丢弃账户标识。
+1. 只读取默认 `rate_limit`；忽略且不解析 `additional_rate_limits`，不读取 app-server camelCase 投影、credits、upsell 或未知字段。
+2. 默认 bucket 只依次读取 primary、secondary。`used_percent` 必须为有限数值 `0..100`；`remainingPercent = Math.round(100 - usedPercent)`。`limit_window_seconds` 只接受正整数并换算分钟；`reset_at` 只接受在 `2000-01-01..2100-01-01` 的正整数 Unix 秒级时间。
+3. 只有默认 `rate_limit.allowed` 决定全局 `availability`。`true` 是 `allowed`、`false` 是 `limited`，其他值是 `unknown`。
+4. 无任一合法默认窗口即解析失败。JWT 必须恰有三段、base64url payload 可解析为 plain object，且若 `exp` 存在必须是未过期的有限 Unix 秒；scope claim 不合法即失败。若响应有 `account_id`，它必须是非空字符串且与请求 scope 匹配；类型错误、空值或失配均丢弃整个响应。比较后立即丢弃账户标识。
 
 ## 4. 授权、快照与 UI 状态机
 
@@ -141,15 +135,15 @@ stateDiagram-v2
 | 状态 | 底栏 | 规则 |
 | --- | --- | --- |
 | `Hidden` | 清除 extension status | 无认证/网络/timer。 |
-| `Current` | `Codex: default 72% left · ... | model-x 45% left` | 当前 scope 的合法快照。 |
-| `Limited` | `Codex: limit reached · <all windows>` | 许可状态在前；仍展示默认及额外 bucket 的全部合法窗口，但比例不表达可用。 |
-| `Unknown` | `Codex: status unknown · <all windows>` | 许可状态在前；仍展示全部合法窗口，但不推断许可。 |
+| `Current` | `Codex 72% left [███████░░░] · resets Sep 16 10:41` | 只展示当前 scope 的默认 bucket 合法窗口。 |
+| `Limited` | `Codex limit reached` | 不显示会误导许可状态的进度条。 |
+| `Unknown` | `Codex status unknown · 72% left [███████░░░]` | 只展示默认窗口；不推断许可。 |
 | `Stale` | `Codex: stale <previous text>` | 仅 `now - fetchedAt < 10m` 且 scope fingerprint 相同。 |
 | `Unavailable` | `Codex: unavailable` | 不展示旧数值。 |
 
 每次成功 scope 确认授予 60 秒 scope lease，并安排 lease timer。lease timer 触发时先递增 generation、清除 snapshot 和 hard-expiry timer、显示 `unavailable`，再后台重校验；因此授权解析长期 pending 也不能使旧账户数据展示超过 lease。每次校验后都比较 fingerprint；缺失、变化或不匹配时同样清除。所有在途授权/HTTP 的晚到结果 generation 不一致时丢弃。成功 usage 快照另在 `fetchedAt + 10m` 安排 hard-expiry timer，触发时重新检查 age 与 scope 后清除旧比例；因此没有新请求结果也不会超过硬期限展示 stale。
 
-`setStatus()` 不提供 extension 可用宽度。格式必须把许可状态和比例放在前面、重置详情放在后面，让宿主截断时保留主要信息；扩展不得声称自行适配全局 footer 宽度。
+`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。`setStatus()` 不提供 extension 可用宽度。格式必须把许可状态、比例和进度条放在重置详情前，让宿主截断时保留主要信息；扩展不得声称自行适配全局 footer 宽度。
 
 ## 5. 失败、恢复与可运营性
 
@@ -164,7 +158,7 @@ stateDiagram-v2
 
 | 验证 | 证据 |
 | --- | --- |
-| 单元测试 | 默认/额外 bucket、标签排序及控制/ANSI/Bidi/超长拒绝、多窗口、非法/零窗口、剩余比例舍入、availability 冲突、非 200、3xx、超大/伪造 content-length、流式膨胀 body、畸形 DTO、JWT base64url/expiry、账户失配。 |
+| 单元测试 | 仅默认 bucket（额外 bucket 永不进入投影/UI）、主窗口、多窗口、10 单元进度条、非法/零窗口、剩余比例舍入、availability、非 200、3xx、超大/伪造 content-length、流式膨胀 body、畸形 DTO、JWT base64url/expiry、账户失配。 |
 | 时序测试 | 60 秒 scope lease（含认证永久 pending、换号/登出）、5 分钟 timer、60 秒 usage 限频、single-flight、pending refresh、hard expiry、模型切换/shutdown/reload 和晚到 promise 丢弃。 |
 | 安全回归 | 固定 URL、OAuth provider/API/baseUrl integrity gate 与 manual redirect；覆盖 `openai-codex.baseUrl` 或 API 的模型均不触发授权/网络。mock response 含账户或 token-like 字符串、headers 时，状态/UI DTO/持久化数据均不含它们。 |
 | 模式测试 | TUI 外不调用授权解析、网络或 timer。 |
