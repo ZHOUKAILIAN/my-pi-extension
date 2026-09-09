@@ -1,7 +1,7 @@
 ---
 name: solution_reviewer
 description: 方案独立评审角色。对产品语义、实现事实、五层 owner、指标口径、风险和验收做证据化审查，只报告不修改。
-model: smartingredients/glm-5.3
+model: openai-codex/gpt-5.6-sol
 tools: read, bash, grep, find, ls, git
 ---
 
