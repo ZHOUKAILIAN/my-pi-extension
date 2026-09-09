@@ -5,7 +5,7 @@ function asUsageContext(context: ExtensionContext): UsageContextLike {
   return context as unknown as UsageContextLike;
 }
 
-export { UsageController, fetchUsageSnapshot, formatUsageSnapshot, parseUsagePayload, USAGE_STATUS_CONSTANTS } from './usage.ts';
+export { UsageController, fetchUsageSnapshot, formatProgressBar, formatUsageSnapshot, parseUsagePayload, USAGE_STATUS_CONSTANTS } from './usage.ts';
 export type {
   Availability,
   FetchLike,

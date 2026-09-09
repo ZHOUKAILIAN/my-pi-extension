@@ -6,10 +6,8 @@ const USAGE_MIN_INTERVAL_MS = 60 * 1000;
 const USAGE_REFRESH_MS = 5 * 60 * 1000;
 const RESET_MIN_SECONDS = 946684800; // 2000-01-01
 const RESET_MAX_SECONDS = 4102444800; // 2100-01-01
-const SAFE_LABEL = /^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,39}$/;
 
 export interface UsageWindow {
-  readonly label: string;
   readonly remainingPercent: number;
   readonly windowDurationMins?: number;
   readonly resetsAt?: number;
@@ -35,16 +33,9 @@ interface UsageLimitWire {
   secondary_window?: UsageWindowWire;
 }
 
-interface UsageAdditionalLimitWire {
-  limit_name?: unknown;
-  metered_feature?: unknown;
-  rate_limit?: UsageLimitWire;
-}
-
 interface UsageResponseWire {
   account_id?: unknown;
   rate_limit?: UsageLimitWire;
-  additional_rate_limits?: UsageAdditionalLimitWire[];
 }
 
 interface ResolvedAuthScope {
@@ -145,7 +136,7 @@ function isValidResetAt(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= RESET_MIN_SECONDS && value <= RESET_MAX_SECONDS;
 }
 
-function parseWindow(label: string, value: unknown): UsageWindow | undefined {
+function parseWindow(value: unknown): UsageWindow | undefined {
   if (!isPlainObject(value)) return undefined;
   const usedPercent = value.used_percent;
   if (typeof usedPercent !== 'number' || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) return undefined;
@@ -155,25 +146,20 @@ function parseWindow(label: string, value: unknown): UsageWindow | undefined {
     : undefined;
   const resetsAt = isValidResetAt(value.reset_at) ? value.reset_at : undefined;
   return {
-    label,
     remainingPercent: Math.round(100 - usedPercent),
     ...(windowDurationMins === undefined ? {} : { windowDurationMins }),
     ...(resetsAt === undefined ? {} : { resetsAt }),
   };
 }
 
-function parseBucket(label: string, limit: unknown): UsageWindow[] {
+function parseBucket(limit: unknown): UsageWindow[] {
   if (!isPlainObject(limit)) return [];
   const windows: UsageWindow[] = [];
-  const primary = parseWindow(label, limit.primary_window);
-  const secondary = parseWindow(label, limit.secondary_window);
+  const primary = parseWindow(limit.primary_window);
+  const secondary = parseWindow(limit.secondary_window);
   if (primary) windows.push(primary);
   if (secondary) windows.push(secondary);
   return windows;
-}
-
-function safeLabel(value: unknown): value is string {
-  return typeof value === 'string' && SAFE_LABEL.test(value);
 }
 
 export function parseUsagePayload(payload: unknown, expectedAccountId: string, fetchedAt = Date.now()): UsageDisplaySnapshot | undefined {
@@ -183,25 +169,14 @@ export function parseUsagePayload(payload: unknown, expectedAccountId: string, f
 
   const defaultLimit = response.rate_limit;
   if (!isPlainObject(defaultLimit)) return undefined;
-  const defaultWindows = parseBucket('default', defaultLimit);
+  const defaultWindows = parseBucket(defaultLimit);
   if (defaultWindows.length === 0) return undefined;
-
-  const additional: Array<{ label: string; index: number; windows: UsageWindow[] }> = [];
-  if (Array.isArray(response.additional_rate_limits)) {
-    for (const [index, item] of response.additional_rate_limits.entries()) {
-      if (!isPlainObject(item) || !isPlainObject(item.rate_limit)) continue;
-      const label = safeLabel(item.limit_name) ? item.limit_name : safeLabel(item.metered_feature) ? item.metered_feature : 'additional';
-      const windows = parseBucket(label, item.rate_limit);
-      if (windows.length > 0) additional.push({ label, index, windows });
-    }
-  }
-  additional.sort((left, right) => left.label < right.label ? -1 : left.label > right.label ? 1 : left.index - right.index);
 
   const allowed = defaultLimit.allowed;
   const availability: Availability = allowed === true ? 'allowed' : allowed === false ? 'limited' : 'unknown';
   return {
     availability,
-    windows: [...defaultWindows, ...additional.flatMap((bucket) => bucket.windows)],
+    windows: defaultWindows,
     fetchedAt,
   };
 }
@@ -274,22 +249,37 @@ export async function fetchUsageSnapshot(authResult: unknown, options: FetchUsag
   }
 }
 
+export function formatProgressBar(remainingPercent: number): string {
+  const filled = Number.isFinite(remainingPercent)
+    ? Math.max(0, Math.min(10, Math.round(remainingPercent / 10)))
+    : 0;
+  return '█'.repeat(filled) + '░'.repeat(10 - filled);
+}
+
+function formatWindowDuration(minutes: number): string {
+  const rounded = Math.round(minutes);
+  return rounded % 1440 === 0 ? `${rounded / 1440}d` : rounded % 60 === 0 ? `${rounded / 60}h` : `${rounded}m`;
+}
+
+function formatResetTime(seconds: number): string {
+  const date = new Date(seconds * 1000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][date.getMonth()];
+  return `${month} ${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatWindow(window: UsageWindow): string {
+  const details: string[] = [];
+  if (window.windowDurationMins !== undefined) details.push(formatWindowDuration(window.windowDurationMins));
+  if (window.resetsAt !== undefined) details.push(`resets ${formatResetTime(window.resetsAt)}`);
+  return `${window.remainingPercent}% left [${formatProgressBar(window.remainingPercent)}]${details.length === 0 ? '' : ` · ${details.join(' · ')}`}`;
+}
+
 export function formatUsageSnapshot(snapshot: UsageDisplaySnapshot): string {
-  const availability = snapshot.availability === 'limited' ? 'limit reached' : snapshot.availability === 'unknown' ? 'status unknown' : undefined;
-  const windows = snapshot.windows.map((window) => {
-    const details: string[] = [];
-    if (window.windowDurationMins !== undefined) {
-      const minutes = Math.round(window.windowDurationMins);
-      details.push(minutes % 1440 === 0 ? `${minutes / 1440}d` : minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`);
-    }
-    if (window.resetsAt !== undefined) {
-      const date = new Date(window.resetsAt * 1000);
-      const pad = (value: number) => String(value).padStart(2, '0');
-      details.push(`${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`);
-    }
-    return `${window.label} ${window.remainingPercent}% left${details.length === 0 ? '' : ` (${details.join(', ')})`}`;
-  });
-  return `Codex: ${availability === undefined ? '' : `${availability} · `}${windows.join(' · ')}`;
+  if (snapshot.availability === 'limited') return 'Codex limit reached';
+  const windows = snapshot.windows.map(formatWindow).join(' · ');
+  if (snapshot.availability === 'unknown') return windows.length === 0 ? 'Codex status unknown' : `Codex status unknown · ${windows}`;
+  return windows.length === 0 ? 'Codex' : `Codex ${windows}`;
 }
 
 function isEligible(context: UsageContextLike, model = context.model): boolean {
@@ -580,7 +570,7 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.context?.ui.setStatus('codex-usage-status', `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex: '.length)}`);
+    this.context?.ui.setStatus('codex-usage-status', `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex'.length).trimStart()}`);
   }
 
   private render(): void {
@@ -594,7 +584,7 @@ export class UsageController {
       return;
     }
     this.context.ui.setStatus('codex-usage-status', this.usageFailure
-      ? `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex: '.length)}`
+      ? `Codex: stale · ${formatUsageSnapshot(this.snapshot.display).slice('Codex'.length).trimStart()}`
       : formatUsageSnapshot(this.snapshot.display));
   }
 }

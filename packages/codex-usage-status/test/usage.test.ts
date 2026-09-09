@@ -5,6 +5,7 @@ import {
   UsageController,
   USAGE_STATUS_CONSTANTS,
   fetchUsageSnapshot,
+  formatProgressBar,
   formatUsageSnapshot,
   parseUsagePayload,
 } from '../src/usage.ts';
@@ -34,6 +35,7 @@ function payload(accountId = 'acct-test') {
       secondary_window: { used_percent: 50, limit_window_seconds: 604800, reset_at: 2000000100 },
     },
     additional_rate_limits: [
+      { limit_name: 'GPT-5.3-Codex-Spark', rate_limit: { primary_window: { used_percent: 5 } } },
       { limit_name: '\u001b[31mbad', rate_limit: { primary_window: { used_percent: 10 } } },
       { metered_feature: 'model-x', rate_limit: { primary_window: { used_percent: 12, reset_at: 2000000200 } } },
       { limit_name: 'z-last', rate_limit: { primary_window: { used_percent: 75 } } },
@@ -48,21 +50,16 @@ test('public entry does not expose auth scope extraction or account scope types'
   assert.equal('InternalScopedSnapshot' in publicEntry, false);
 });
 
-test('projects only the supported wire DTO and sorts additional buckets', () => {
+test('projects only primary and secondary windows from the default rate limit', () => {
   const snapshot = parseUsagePayload(payload(), 'acct-test', 1234);
   assert.ok(snapshot);
   assert.equal(snapshot.availability, 'allowed');
-  assert.deepEqual(snapshot.windows.map((window) => [window.label, window.remainingPercent]), [
-    ['default', 72],
-    ['default', 50],
-    ['a-first', 99],
-    ['additional', 90],
-    ['model-x', 88],
-    ['z-last', 25],
-  ]);
+  assert.deepEqual(snapshot.windows.map((window) => window.remainingPercent), [72, 50]);
+  assert.equal('label' in snapshot.windows[0], false);
   assert.equal(snapshot.windows[0].windowDurationMins, 300);
   assert.equal(snapshot.windows[0].resetsAt, 2000000000);
   assert.equal(snapshot.fetchedAt, 1234);
+  assert.doesNotMatch(formatUsageSnapshot(snapshot), /GPT-5\.3-Codex-Spark|model-x|a-first|z-last/u);
 });
 
 test('availability is controlled only by default allowed', () => {
@@ -80,16 +77,80 @@ test('rejects invalid windows, response accounts, and JWT scopes', async () => {
   assert.equal(await fetchUsageSnapshot({ auth: { apiKey: 'not.jwt' } }, { fetch: async () => { throw new Error('must not fetch'); } }), undefined);
 });
 
-test('formats permit state before window details and never guesses missing details', () => {
-  const snapshot = parseUsagePayload({
+test('formats availability, progress, and reset details without a default label', () => {
+  assert.equal(formatProgressBar(0), '░░░░░░░░░░');
+  assert.equal(formatProgressBar(49), '█████░░░░░');
+  assert.equal(formatProgressBar(98), '██████████');
+  assert.equal(formatProgressBar(100), '██████████');
+
+  const allowed = parseUsagePayload({
+    rate_limit: {
+      allowed: true,
+      primary_window: { used_percent: 2, reset_at: 2000000000 },
+    },
+  }, 'acct-test', 1000);
+  assert.ok(allowed);
+  const reset = new Date(2000000000 * 1000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][reset.getMonth()];
+  assert.equal(formatUsageSnapshot(allowed), `Codex 98% left [██████████] · resets ${month} ${reset.getDate()} ${pad(reset.getHours())}:${pad(reset.getMinutes())}`);
+
+  const limited = parseUsagePayload({
     rate_limit: {
       allowed: false,
       primary_window: { used_percent: 0 },
       secondary_window: { used_percent: 100, limit_window_seconds: 60 },
     },
   }, 'acct-test', 1000);
-  assert.ok(snapshot);
-  assert.equal(formatUsageSnapshot(snapshot), 'Codex: limit reached · default 100% left · default 0% left (1m)');
+  assert.ok(limited);
+  assert.equal(formatUsageSnapshot(limited), 'Codex limit reached');
+
+  const unknown = parseUsagePayload({
+    rate_limit: { primary_window: { used_percent: 50 } },
+  }, 'acct-test', 1000);
+  assert.ok(unknown);
+  assert.equal(formatUsageSnapshot(unknown), 'Codex status unknown · 50% left [█████░░░░░]');
+});
+
+test('marks a same-scope failed refresh stale without additional windows', async () => {
+  let clock = 1_000_000;
+  let fetchCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => auth(),
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    now: () => clock,
+    fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls > 1) throw new Error('temporary failure');
+      return new Response(JSON.stringify(payload()), { status: 200 });
+    },
+  });
+
+  try {
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(statuses.at(-1) ?? '', /^Codex 72% left \[/u);
+
+    // The scope lease and usage interval are both one minute. Move only the
+    // usage attempt clock so this test stays within the active scope lease.
+    (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.match(statuses.at(-1) ?? '', /^Codex: stale · 72% left \[/u);
+    assert.doesNotMatch(statuses.at(-1) ?? '', /model-x|a-first|z-last/u);
+  } finally {
+    controller.shutdown();
+  }
 });
 
 test('uses the fixed URL, manual redirects, and accepts only HTTP 200', async () => {
@@ -153,7 +214,7 @@ test('expires the scope lease before revalidating', async () => {
   assert.equal(authCalls, 1);
   resolveAuth?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
 
   clock += USAGE_STATUS_CONSTANTS.scopeLeaseMs;
   for (const [id, timer] of [...timers]) {
@@ -163,7 +224,7 @@ test('expires the scope lease before revalidating', async () => {
   assert.equal(authCalls, 2);
   resolveAuth?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
 
   controller.shutdown();
 });
@@ -192,7 +253,7 @@ test('model_select clears a same-provider snapshot before revalidation', async (
   controller.handle(context);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
 
   controller.handle(context, context.model, true);
   assert.equal(statuses.at(-1), 'Codex: unavailable');
@@ -200,7 +261,7 @@ test('model_select clears a same-provider snapshot before revalidation', async (
   secondAuthResolve?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
   controller.shutdown();
 });
 
@@ -236,7 +297,7 @@ test('replays a pending scope refresh after leaving and returning while auth is 
   resolvers[1](auth());
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
   controller.shutdown();
 });
 
@@ -279,7 +340,7 @@ test('drops stale pending scope refreshes when leaving Codex before auth settles
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(authCalls, 2);
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
   controller.shutdown();
 });
 
@@ -314,7 +375,7 @@ test('replays a pending usage refresh after a model generation changes during fe
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fetchCalls, 2);
-  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
   controller.shutdown();
 });
 
