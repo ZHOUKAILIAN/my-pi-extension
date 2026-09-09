@@ -15,6 +15,7 @@
 - [Feature Extension 产品规范](扩展/feature-扩展.md)：`DECIDED`
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
 - [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`TODO`
+- [Codex Usage Status Extension](扩展/codex-usage-status-扩展.md)：`REVIEWING`
 
 ## L1 与 L2 的边界
 
