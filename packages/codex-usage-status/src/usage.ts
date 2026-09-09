@@ -383,6 +383,8 @@ export class UsageController {
     this.scopeAccountId = undefined;
     this.scopeLeaseExpiresAt = undefined;
     this.usageFailure = false;
+    this.pendingScopeRefresh = false;
+    this.pendingScopeFetchImmediately = false;
     this.pendingUsageRefresh = false;
     this.pendingUsageForce = false;
     this.generation += 1;

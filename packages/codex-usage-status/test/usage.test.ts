@@ -240,6 +240,49 @@ test('replays a pending scope refresh after leaving and returning while auth is 
   controller.shutdown();
 });
 
+test('drops stale pending scope refreshes when leaving Codex before auth settles', async () => {
+  const resolvers: Array<(value: unknown) => void> = [];
+  let authCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const codexModel = { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' };
+  const context = {
+    mode: 'tui',
+    model: codexModel,
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: () => {
+        authCalls += 1;
+        return new Promise((resolve) => { resolvers.push(resolve); });
+      },
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const otherModel = { ...codexModel, provider: 'other' };
+  const otherContext = { ...context, model: otherModel };
+  const controller = new UsageController({
+    fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
+  });
+
+  controller.handle(context);
+  controller.handle(context, codexModel, true);
+  controller.handle(otherContext, otherModel, true);
+  assert.equal(authCalls, 1);
+
+  resolvers[0](auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(authCalls, 1);
+
+  controller.handle(context, codexModel, true);
+  assert.equal(authCalls, 2);
+  resolvers[1](auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(authCalls, 2);
+  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  controller.shutdown();
+});
+
 test('replays a pending usage refresh after a model generation changes during fetch', async () => {
   let resolveFirstFetch: ((response: Response) => void) | undefined;
   let fetchCalls = 0;
