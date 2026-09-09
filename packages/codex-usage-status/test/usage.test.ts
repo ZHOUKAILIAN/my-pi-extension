@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as publicEntry from '../src/index.ts';
 import {
   UsageController,
   USAGE_STATUS_CONSTANTS,
-  extractCodexAuthScope,
   fetchUsageSnapshot,
   formatUsageSnapshot,
   parseUsagePayload,
@@ -42,6 +42,12 @@ function payload(accountId = 'acct-test') {
   };
 }
 
+test('public entry does not expose auth scope extraction or account scope types', () => {
+  assert.equal('extractCodexAuthScope' in publicEntry, false);
+  assert.equal('CodexAuthScope' in publicEntry, false);
+  assert.equal('InternalScopedSnapshot' in publicEntry, false);
+});
+
 test('projects only the supported wire DTO and sorts additional buckets', () => {
   const snapshot = parseUsagePayload(payload(), 'acct-test', 1234);
   assert.ok(snapshot);
@@ -66,13 +72,12 @@ test('availability is controlled only by default allowed', () => {
   assert.equal(unknown?.availability, 'unknown');
 });
 
-test('rejects invalid windows, response accounts, and JWT scopes', () => {
+test('rejects invalid windows, response accounts, and JWT scopes', async () => {
   assert.equal(parseUsagePayload({ rate_limit: { primary_window: { used_percent: 101 } } }, 'acct-test'), undefined);
   assert.equal(parseUsagePayload({ ...payload('other') }, 'acct-test'), undefined);
   assert.equal(parseUsagePayload({ rate_limit: { primary_window: { used_percent: 0 }, extra: 'ignored' } }, 'acct-test')?.windows.length, 1);
-  assert.equal(extractCodexAuthScope(auth()).accountId, 'acct-test');
-  assert.equal(extractCodexAuthScope({ auth: { apiKey: 'not.jwt' } }), undefined);
-  assert.equal(extractCodexAuthScope(auth('acct\nunsafe')), undefined);
+  assert.equal(await fetchUsageSnapshot(auth('acct\nunsafe'), { fetch: async () => { throw new Error('must not fetch'); } }), undefined);
+  assert.equal(await fetchUsageSnapshot({ auth: { apiKey: 'not.jwt' } }, { fetch: async () => { throw new Error('must not fetch'); } }), undefined);
 });
 
 test('formats permit state before window details and never guesses missing details', () => {
@@ -160,6 +165,113 @@ test('expires the scope lease before revalidating', async () => {
   await new Promise((resolve) => setImmediate(resolve));
   assert.match(statuses.at(-1) ?? '', /^Codex: /u);
 
+  controller.shutdown();
+});
+
+test('model_select clears a same-provider snapshot before revalidation', async () => {
+  let secondAuthResolve: ((value: unknown) => void) | undefined;
+  let authCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: () => {
+        authCalls += 1;
+        if (authCalls === 1) return Promise.resolve(auth());
+        return new Promise((resolve) => { secondAuthResolve = resolve; });
+      },
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
+  });
+
+  controller.handle(context);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+
+  controller.handle(context, context.model, true);
+  assert.equal(statuses.at(-1), 'Codex: unavailable');
+  assert.equal(authCalls, 2);
+  secondAuthResolve?.(auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  controller.shutdown();
+});
+
+test('replays a pending scope refresh after leaving and returning while auth is in flight', async () => {
+  const resolvers: Array<(value: unknown) => void> = [];
+  let authCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const codexModel = { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' };
+  const context = {
+    mode: 'tui',
+    model: codexModel,
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: () => {
+        authCalls += 1;
+        return new Promise((resolve) => { resolvers.push(resolve); });
+      },
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
+  });
+
+  controller.handle(context);
+  controller.handle({ ...context, model: { ...codexModel, provider: 'other' } }, { ...codexModel, provider: 'other' }, true);
+  controller.handle(context, codexModel, true);
+  assert.equal(authCalls, 1);
+  resolvers[0](auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(authCalls, 2);
+  resolvers[1](auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
+  controller.shutdown();
+});
+
+test('replays a pending usage refresh after a model generation changes during fetch', async () => {
+  let resolveFirstFetch: ((response: Response) => void) | undefined;
+  let fetchCalls = 0;
+  const statuses: Array<string | undefined> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => auth(),
+    },
+    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+  };
+  const controller = new UsageController({
+    fetch: async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) return new Promise((resolve) => { resolveFirstFetch = resolve; });
+      return new Response(JSON.stringify(payload()), { status: 200 });
+    },
+  });
+
+  controller.handle(context);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fetchCalls, 1);
+  controller.handle(context, context.model, true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(statuses.at(-1), 'Codex: unavailable');
+  resolveFirstFetch?.(new Response(JSON.stringify(payload()), { status: 200 }));
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fetchCalls, 2);
+  assert.match(statuses.at(-1) ?? '', /^Codex: /u);
   controller.shutdown();
 });
 

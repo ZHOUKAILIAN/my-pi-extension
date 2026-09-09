@@ -5,14 +5,11 @@ function asUsageContext(context: ExtensionContext): UsageContextLike {
   return context as unknown as UsageContextLike;
 }
 
-export { UsageController, extractCodexAuthScope, fetchUsageSnapshot, formatUsageSnapshot, parseUsagePayload, USAGE_STATUS_CONSTANTS } from './usage.ts';
+export { UsageController, fetchUsageSnapshot, formatUsageSnapshot, parseUsagePayload, USAGE_STATUS_CONSTANTS } from './usage.ts';
 export type {
   Availability,
-  CodexAuthScope,
   FetchLike,
   FetchUsageOptions,
-  InternalScopedSnapshot,
-  ProviderAuthResult,
   UsageContextLike,
   UsageDisplaySnapshot,
   UsageModelLike,
@@ -31,7 +28,7 @@ export default function codexUsageStatusExtension(pi: ExtensionAPI): void {
   });
 
   pi.on('model_select', (event, context) => {
-    controller.handle(asUsageContext(context), event.model as UsageModelLike);
+    controller.handle(asUsageContext(context), event.model as UsageModelLike, true);
   });
 
   pi.on('agent_settled', (_event, context) => {

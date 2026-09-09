@@ -23,11 +23,6 @@ export interface UsageDisplaySnapshot {
   readonly fetchedAt: number;
 }
 
-export interface InternalScopedSnapshot {
-  readonly display: UsageDisplaySnapshot;
-  readonly scopeFingerprint: string;
-}
-
 interface UsageWindowWire {
   used_percent?: unknown;
   limit_window_seconds?: unknown;
@@ -52,19 +47,10 @@ interface UsageResponseWire {
   additional_rate_limits?: UsageAdditionalLimitWire[];
 }
 
-export interface CodexAuthScope {
+interface ResolvedAuthScope {
   readonly accountId: string;
   readonly fingerprint: string;
-}
-
-interface ResolvedAuthScope extends CodexAuthScope {
   readonly bearerToken: string;
-}
-
-export interface ProviderAuthResult {
-  readonly auth?: {
-    readonly apiKey?: unknown;
-  };
 }
 
 export interface FetchUsageOptions {
@@ -153,12 +139,6 @@ function resolveCodexAuthScope(authResult: unknown, now = Date.now()): ResolvedA
   if (!isPlainObject(authClaim) || !isSafeAccountId(authClaim.chatgpt_account_id)) return undefined;
   const accountId = authClaim.chatgpt_account_id;
   return { accountId, fingerprint: fingerprintScope(accountId), bearerToken };
-}
-
-export function extractCodexAuthScope(authResult: unknown, now = Date.now()): CodexAuthScope | undefined {
-  const scope = resolveCodexAuthScope(authResult, now);
-  if (!scope) return undefined;
-  return { accountId: scope.accountId, fingerprint: scope.fingerprint };
 }
 
 function isValidResetAt(value: unknown): value is number {
@@ -328,7 +308,7 @@ export class UsageController {
   private readonly fetcher: FetchLike | undefined;
   private context: UsageContextLike | undefined;
   private activeModel: UsageModelLike | undefined;
-  private snapshot: InternalScopedSnapshot | undefined;
+  private snapshot: { readonly display: UsageDisplaySnapshot; readonly scopeFingerprint: string } | undefined;
   private scopeFingerprint: string | undefined;
   private scopeAccountId: string | undefined;
   private generation = 0;
@@ -337,7 +317,11 @@ export class UsageController {
   private hardExpiryTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
   private usageTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
   private scopeInFlight = false;
+  private pendingScopeRefresh = false;
+  private pendingScopeFetchImmediately = false;
   private usageInFlight = false;
+  private pendingUsageRefresh = false;
+  private pendingUsageForce = false;
   private lastUsageAttempt = 0;
   private usageFailure = false;
 
@@ -348,7 +332,11 @@ export class UsageController {
     this.fetcher = options.fetch;
   }
 
-  handle(context: UsageContextLike, modelOverride?: UsageModelLike): void {
+  handle(context: UsageContextLike, modelOverride?: UsageModelLike, forceRevalidate = false): void {
+    if (forceRevalidate) {
+      this.invalidate();
+      this.usageFailure = false;
+    }
     this.context = context;
     this.activeModel = modelOverride ?? context.model;
     this.expireLeaseIfNeeded();
@@ -357,17 +345,22 @@ export class UsageController {
       return;
     }
     if (!this.hasValidLease()) {
-      void this.confirmScope(true);
+      this.renderUnavailable();
+      this.requestScopeRefresh(true);
       return;
     }
     this.render();
-    if (this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) void this.fetchUsage(this.generation);
+    if (this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) this.requestUsage(this.generation);
   }
 
   shutdown(): void {
     this.context?.ui.setStatus('codex-usage-status', undefined);
     this.context = undefined;
     this.activeModel = undefined;
+    this.pendingScopeRefresh = false;
+    this.pendingScopeFetchImmediately = false;
+    this.pendingUsageRefresh = false;
+    this.pendingUsageForce = false;
     this.invalidate();
   }
 
@@ -390,6 +383,8 @@ export class UsageController {
     this.scopeAccountId = undefined;
     this.scopeLeaseExpiresAt = undefined;
     this.usageFailure = false;
+    this.pendingUsageRefresh = false;
+    this.pendingUsageForce = false;
     this.generation += 1;
   }
 
@@ -400,6 +395,45 @@ export class UsageController {
     this.scopeAccountId = undefined;
     this.scopeLeaseExpiresAt = undefined;
     this.generation += 1;
+  }
+
+  private requestScopeRefresh(fetchImmediately: boolean): void {
+    if (this.scopeInFlight) {
+      this.pendingScopeRefresh = true;
+      this.pendingScopeFetchImmediately ||= fetchImmediately;
+      return;
+    }
+    void this.confirmScope(fetchImmediately);
+  }
+
+  private drainPendingScopeRefresh(): void {
+    if (!this.pendingScopeRefresh || this.scopeInFlight) return;
+    if (!this.context || !isEligible(this.context, this.activeModel)) return;
+    const fetchImmediately = this.pendingScopeFetchImmediately;
+    this.pendingScopeRefresh = false;
+    this.pendingScopeFetchImmediately = false;
+    this.requestScopeRefresh(fetchImmediately);
+  }
+
+  private requestUsage(generation: number, auth?: unknown, force = false): void {
+    if (this.usageInFlight) {
+      this.pendingUsageRefresh = true;
+      this.pendingUsageForce ||= force;
+      return;
+    }
+    if (!force && this.now() - this.lastUsageAttempt < USAGE_MIN_INTERVAL_MS) return;
+    this.pendingUsageRefresh = false;
+    this.pendingUsageForce = false;
+    void this.fetchUsage(generation, auth);
+  }
+
+  private drainPendingUsageRefresh(): void {
+    if (!this.pendingUsageRefresh || this.usageInFlight) return;
+    if (!this.context || !this.scopeFingerprint || !this.hasValidLease() || !isEligible(this.context, this.activeModel)) return;
+    const force = this.pendingUsageForce;
+    this.pendingUsageRefresh = false;
+    this.pendingUsageForce = false;
+    this.requestUsage(this.generation, undefined, force);
   }
 
   private clearTimers(): void {
@@ -419,7 +453,7 @@ export class UsageController {
     this.scopeInFlight = true;
     try {
       const auth = await context.modelRegistry.getProviderAuth('openai-codex');
-      const scope = extractCodexAuthScope(auth, this.now());
+      const scope = resolveCodexAuthScope(auth, this.now());
       if (generation !== this.generation || context !== this.context || !isEligible(context, this.activeModel)) return;
       if (!scope) {
         this.invalidate();
@@ -434,13 +468,17 @@ export class UsageController {
       this.scopeAccountId = scope.accountId;
       this.setLease(generation);
       this.render();
-      if (fetchImmediately || !this.snapshot || this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) void this.fetchUsage(generation, auth);
+      if (fetchImmediately || !this.snapshot || this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) {
+        this.requestUsage(generation, auth, fetchImmediately);
+      }
     } catch {
       if (generation === this.generation && context === this.context) {
         this.renderUnavailableOrStale();
       }
     } finally {
       this.scopeInFlight = false;
+      this.drainPendingScopeRefresh();
+      this.drainPendingUsageRefresh();
     }
   }
 
@@ -451,12 +489,12 @@ export class UsageController {
       if (generation !== this.generation) return;
       this.invalidate();
       this.renderUnavailable();
-      void this.confirmScope(true);
+      this.requestScopeRefresh(true);
     }, SCOPE_LEASE_MS);
     if (this.usageTimer === undefined) {
       this.usageTimer = this.schedule?.(() => {
         this.usageTimer = undefined;
-        if (this.hasValidLease() && this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) void this.fetchUsage(this.generation);
+        if (this.hasValidLease() && this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) this.requestUsage(this.generation);
         if (this.hasValidLease()) this.setUsageTimer();
       }, USAGE_REFRESH_MS);
     }
@@ -466,13 +504,13 @@ export class UsageController {
     if (this.usageTimer !== undefined) this.cancel?.(this.usageTimer);
     this.usageTimer = this.schedule?.(() => {
       this.usageTimer = undefined;
-      if (this.hasValidLease() && this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) void this.fetchUsage(this.generation);
+      if (this.hasValidLease() && this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) this.requestUsage(this.generation);
       if (this.hasValidLease()) this.setUsageTimer();
     }, USAGE_REFRESH_MS);
   }
 
   private async fetchUsage(generation: number, auth?: unknown): Promise<void> {
-    if (this.usageInFlight || !this.context || !this.scopeFingerprint || !isEligible(this.context, this.activeModel)) return;
+    if (!this.context || !this.scopeFingerprint || !isEligible(this.context, this.activeModel)) return;
     const context = this.context;
     this.usageInFlight = true;
     this.lastUsageAttempt = this.now();
@@ -505,6 +543,7 @@ export class UsageController {
       }
     } finally {
       this.usageInFlight = false;
+      this.drainPendingUsageRefresh();
     }
   }
 
