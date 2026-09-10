@@ -5,9 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { ActiveWorkerRegistry, RunControlWal, RunControlWalStore, WorkerSidecar, WorkflowInteractionPort } from '../src/index.ts';
 
-const handle = (wal: RunControlWal, session: any, interaction: WorkflowInteractionPort) => ({
+const handle = (wal: RunControlWal, session: any, interaction: WorkflowInteractionPort, overrides: Record<string, unknown> = {}) => ({
   runId: 'fix-live', parentSessionId: 'parent', parentLeafId: 'leaf', nodeExecutionId: 'fix-live.investigate.1',
   workerId: 'worker-1', workerSessionId: 'child-1', attemptId: 'attempt-1', actualModel: { provider: 'p', id: 'm' },
+  ...overrides,
   status: 'streaming' as const, contextSupplementVersion: 0, session, wal, interaction,
 });
 
@@ -66,12 +67,14 @@ test('operation locks fail closed for a different host even when its pid is not 
 
 test('recovery attempts are capped at twenty per Run and parent rebind preserves run identity', () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-attempts-'));
-  const wal = RunControlWal.open('fix-attempts', { rootDir: root, parentSessionId: 'old', parentLeafId: 'old-leaf', cwd: process.cwd() });
+  const oldParentFile = join(root, 'old-parent.json');
+  const newParentFile = join(root, 'new-parent.json');
+  const wal = RunControlWal.open('fix-attempts', { rootDir: root, parentSessionId: 'old', parentLeafId: 'old-leaf', parentSessionFile: oldParentFile, cwd: process.cwd() });
   for (let attempt = 0; attempt < 20; attempt += 1) wal.beginWorker({ nodeExecutionId: `fix-attempts.review.${attempt}`, workerId: `w-${attempt}`, workerSessionId: `s-${attempt}` });
   assert.throws(() => wal.beginWorker({ nodeExecutionId: 'fix-attempts.review.21', workerId: 'w-21', workerSessionId: 's-21' }), (error: unknown) => (error as { code?: string }).code === 'WORKER_ATTEMPT_LIMIT');
   wal.releaseLease();
-  RunControlWal.rebindParent('fix-attempts', { rootDir: root, parentSessionId: 'new', parentLeafId: 'new-leaf', cwd: process.cwd(), confirmed: true });
-  const rebound = RunControlWal.open('fix-attempts', { rootDir: root, parentSessionId: 'new', parentLeafId: 'new-leaf', cwd: process.cwd() });
+  RunControlWal.rebindParent('fix-attempts', { rootDir: root, parentSessionId: 'new', parentLeafId: 'new-leaf', parentSessionFile: newParentFile, cwd: process.cwd(), confirmed: true });
+  const rebound = RunControlWal.open('fix-attempts', { rootDir: root, parentSessionId: 'new', parentLeafId: 'new-leaf', parentSessionFile: newParentFile, cwd: process.cwd() });
   assert.equal(rebound.runId, 'fix-attempts');
   assert.equal(rebound.records().at(-1)?.payload.kind, 'parent_rebind');
   rebound.releaseLease();
@@ -186,6 +189,26 @@ test('restore projects a pre-Child review identity from the durable startup reco
   wal.releaseLease();
 });
 
+test('model-call snapshots keep cumulative supplement versions after delivery consumption', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-snapshot-version-'));
+  const wal = RunControlWal.open('fix-snapshot-version', { rootDir: root });
+  const registry = new ActiveWorkerRegistry();
+  const port = new WorkflowInteractionPort(registry);
+  const session = { isStreaming: true, steer: async () => {}, prompt: async () => {} };
+  const worker = { ...handle(wal, session, port), runId: 'fix-snapshot-version' } as any;
+  registry.register(worker);
+  await port.submitSupplement({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, text: 'first' });
+  const first = await port.recordModelTurnStart(worker.runId, 1, 'call-1');
+  await port.recordModelCallCompleted(worker.runId, 'call-1');
+  await port.submitSupplement({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, text: 'second' });
+  const second = await port.recordModelTurnStart(worker.runId, 2, 'call-2');
+  assert.equal(first?.supplementVersion, 1);
+  assert.equal(second?.supplementVersion, 2);
+  assert.deepEqual(wal.records().filter((record) => record.type === 'worker' && record.payload.kind === 'model_call_snapshot').map((record) => record.payload.supplementVersion), [1, 2]);
+  registry.release(worker.runId);
+  wal.releaseLease();
+});
+
 test('model changes are applied only at turn_start, use the reported model, and have one terminal state', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-model-'));
   const wal = RunControlWal.open('fix-model', { rootDir: root });
@@ -195,7 +218,10 @@ test('model changes are applied only at turn_start, use the reported model, and 
   const worker = { ...handle(wal, session, undefined as any), runId: 'fix-live', wal } as any;
   const port = new WorkflowInteractionPort(registry, () => [{ ref: 'p/new', model: { provider: 'p', id: 'new', api: 'anthropic-messages', input: ['text'] } as any }]);
   registry.register(worker);
-  const result = await port.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, modelRef: 'p/new' });
+  const stale = await port.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: 'stale-session', expectedAttemptId: worker.attemptId, modelRef: 'p/new' });
+  assert.equal(stale.state, 'failed');
+  assert.match(stale.error ?? '', /session or attempt changed/);
+  const result = await port.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: worker.workerSessionId, expectedAttemptId: worker.attemptId, modelRef: 'p/new' });
   assert.equal(result.state, 'pending');
   await port.recordModelTurnStart(worker.runId, 1, 'child-1:turn:1');
   const changes = wal.records().filter((record) => record.type === 'worker' && record.payload.kind === 'model_change');
@@ -217,8 +243,8 @@ test('model requests fold by requestId and close creates only one terminal state
     { ref: 'p/b', model: { provider: 'p', id: 'b', api: 'anthropic-messages', input: ['text'] } as any },
   ]);
   registry.register(worker as any);
-  const a = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, modelRef: 'p/a' });
-  const b = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, modelRef: 'p/b' });
+  const a = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: worker.workerSessionId, expectedAttemptId: worker.attemptId, modelRef: 'p/a' });
+  const b = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: worker.workerSessionId, expectedAttemptId: worker.attemptId, modelRef: 'p/b' });
   await port.recordModelTurnStart('fix-live', 1, 'child-1:turn:1');
   const afterTurn = wal.records().filter((record) => record.type === 'worker' && record.payload.kind === 'model_change');
   for (const requestId of [a.requestId, b.requestId]) assert.equal(afterTurn.filter((record) => record.payload.requestId === requestId && ['applied', 'failed', 'not_applied'].includes(String(record.payload.state))).length, 1);

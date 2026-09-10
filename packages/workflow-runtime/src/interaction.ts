@@ -203,20 +203,24 @@ export class WorkflowInteractionPort {
       const records = worker.wal.records();
       const ids = pendingIds.filter((id) => records.some((record) => record.type === 'supplement' && record.payload.supplementId === id && record.payload.nodeExecutionId === worker.nodeExecutionId));
       this.pendingCalls.delete(runId);
-      const supplementVersion = ids.reduce((max, id) => {
+      const pendingVersion = ids.reduce((max, id) => {
         const record = records.find((item) => item.type === 'supplement' && item.payload.supplementId === id);
         return Math.max(max, typeof record?.payload.sequence === 'number' ? record.payload.sequence : 0);
       }, 0);
-      // The input snapshot is created at turn_start and is never reconstructed
-      // from newer WAL records when an artifact arrives.
-      const call = { ref: modelCallRef, supplementIds: ids, supplementVersion, contextRef: randomUUID() };
+      // The snapshot is cumulative: consuming the last supplement does not
+      // reset the next model call to version 0. A later call inherits the
+      // Worker/WAL version and advances only to a newer pending sequence.
+      const cumulativeVersion = Math.max(worker.contextSupplementVersion, worker.wal.getSupplementVersion(), pendingVersion);
+      const call = { ref: modelCallRef, supplementIds: ids, supplementVersion: cumulativeVersion, contextRef: randomUUID() };
+      worker.contextSupplementVersion = cumulativeVersion;
+      worker.wal.recordWorker({ kind: 'model_call_snapshot', nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, modelCallRef, supplementVersion: cumulativeVersion, contextRef: call.contextRef, turnIndex });
       this.activeCalls.set(runId, call);
       for (const supplementId of ids) {
         const record = records.find((item) => item.type === 'supplement' && item.payload.supplementId === supplementId);
-        if (record) worker.wal.recordDelivery({ submissionAttemptId: record.payload.submissionAttemptId, supplementId, sequence: record.payload.sequence, nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, state: 'model_call_started', modelCallRef, supplementVersion, contextRef: call.contextRef, turnIndex });
+        if (record) worker.wal.recordDelivery({ submissionAttemptId: record.payload.submissionAttemptId, supplementId, sequence: record.payload.sequence, nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, state: 'model_call_started', modelCallRef, supplementVersion: cumulativeVersion, contextRef: call.contextRef, turnIndex });
       }
       const appliedModel = this.applyPendingModelChanges(worker, modelCallRef);
-      return { modelCallRef, supplementVersion, contextRef: call.contextRef, ...(appliedModel ? { appliedModel } : {}) };
+      return { modelCallRef, supplementVersion: cumulativeVersion, contextRef: call.contextRef, ...(appliedModel ? { appliedModel } : {}) };
     });
   }
 
@@ -327,10 +331,13 @@ export class WorkflowInteractionPort {
     }
   }
 
-  async requestModelChange(input: { runId: string; expectedNodeExecutionId: string; modelRef: string }): Promise<ModelChangeResult> {
+  async requestModelChange(input: { runId: string; expectedNodeExecutionId: string; expectedWorkerSessionId: string; expectedAttemptId: string; modelRef: string }): Promise<ModelChangeResult> {
     return this.queue(input.runId).run(async () => {
-      const requestId = randomUUID(); const worker = this.registry.get(input.runId, input.expectedNodeExecutionId);
-      if (!worker || !worker.session.setModel) return { requestId, state: 'failed', error: 'current Worker changed or Child setModel is unavailable' };
+      const requestId = randomUUID();
+      const worker = this.registry.get(input.runId, input.expectedNodeExecutionId);
+      if (!worker || worker.workerSessionId !== input.expectedWorkerSessionId || worker.attemptId !== input.expectedAttemptId || !worker.session.setModel) {
+        return { requestId, state: 'failed', error: 'current Worker session or attempt changed; refusing model picker action' };
+      }
       const candidate = this.modelCandidates(worker).find((item) => item.ref === input.modelRef && (item.compatible?.(worker) ?? true));
       if (!candidate) return { requestId, state: 'failed', error: 'model is not scoped, authenticated, or compatible with this Worker' };
       const requestedModel = { provider: String(candidate.model.provider), id: String(candidate.model.id) };

@@ -3,6 +3,7 @@ type ExtensionCommandContext = ExtensionContext;
 import { CustomEditor } from '@earendil-works/pi-coding-agent';
 import { Text, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type {
   Artifact,
@@ -112,7 +113,7 @@ export class LiveFixRunManager {
     const parentSessionId = ctx.sessionManager.getSessionId?.() ?? process.env.PI_SESSION_ID ?? 'unknown-parent';
     const parentLeafId = ctx.sessionManager.getLeafId?.() ?? 'root';
     const rootDir = process.env.PI_CODING_AGENT_DIR;
-    const wal = RunControlWal.open(runId, { rootDir, parentSessionId, parentLeafId, cwd: ctx.cwd });
+    const wal = RunControlWal.open(runId, { rootDir, parentSessionId, parentLeafId, parentSessionFile: ctx.sessionManager.getSessionFile?.(), cwd: ctx.cwd });
     const sidecar = new WorkerSidecar(wal.runDir);
     this.sidecars.set(runId, sidecar);
     const modelCandidates = (): readonly ModelCandidate[] => liveModelCandidates(ctx).map((model) => ({
@@ -173,12 +174,12 @@ export class LiveFixRunManager {
     return this.interactions.get(input.runId)?.requestModelChange(input);
   }
   openStore(ctx: ExtensionContext, runId: string): RunControlWalStore {
-    const wal = RunControlWal.open(runId, { rootDir: process.env.PI_CODING_AGENT_DIR, parentSessionId: ctx.sessionManager.getSessionId(), parentLeafId: ctx.sessionManager.getLeafId() ?? 'root', cwd: ctx.cwd });
+    const wal = RunControlWal.open(runId, { rootDir: process.env.PI_CODING_AGENT_DIR, parentSessionId: ctx.sessionManager.getSessionId(), parentLeafId: ctx.sessionManager.getLeafId() ?? 'root', parentSessionFile: ctx.sessionManager.getSessionFile?.(), cwd: ctx.cwd });
     return new RunControlWalStore(wal);
   }
   latestStore(ctx: ExtensionContext): { store?: RunControlWalStore; checkpoint: Checkpoint; parentMatches: boolean } | undefined {
     const rootDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? process.cwd(), '.pi', 'agent');
-    const candidates: Array<{ runId: string; checkpoint: Checkpoint; parentMatches: boolean; store?: RunControlWalStore }> = [];
+    const candidates: Array<{ runId: string; checkpoint: Checkpoint; parentMatches: boolean; orphan: boolean; store?: RunControlWalStore }> = [];
     for (const runId of RunControlWal.list(rootDir).filter((id) => id.startsWith('fix-'))) {
       try {
         const records = readRunControlRecords(join(rootDir, 'workflow-runs', runId, 'control.wal'), runId);
@@ -191,13 +192,30 @@ export class LiveFixRunManager {
         if (parent.cwd !== ctx.cwd) continue;
         const parentMatches = parent.parentSessionId === ctx.sessionManager.getSessionId()
           && parent.parentLeafId === (ctx.sessionManager.getLeafId?.() ?? 'root');
+        // An orphan is not “a different session in the same cwd”. It is only a
+        // WAL whose original header parent file is provably gone and which has
+        // not already been rebound. Missing header metadata is fail-closed.
+        const originalParentFile = header.parentSessionFile;
+        const orphan = !rebind
+          && typeof originalParentFile === 'string'
+          && originalParentFile.length > 0
+          && !existsSync(originalParentFile);
         const store = parentMatches ? this.openStore(ctx, runId) : undefined;
-        candidates.push({ runId, checkpoint, parentMatches, store });
+        candidates.push({ runId, checkpoint, parentMatches, orphan, store });
       } catch { /* active, tombstoned or corrupt runs are not silently selected */ }
     }
-    candidates.sort((a, b) => a.checkpoint.at - b.checkpoint.at);
-    const selected = candidates.at(-1);
-    for (const candidate of candidates.slice(0, -1)) { try { candidate.store?.wal.releaseLease(); } catch {} }
+    // Exact parent + active leaf always wins. Session B remains untouched even
+    // when an orphan has a newer checkpoint or a lexically smaller runId.
+    const exact = candidates.filter((candidate) => candidate.parentMatches);
+    const orphanCandidates = candidates.filter((candidate) => candidate.orphan);
+    // Do not guess between multiple missing-parent Runs. A future UI picker can
+    // make that choice explicitly; today's synchronous discovery fails closed.
+    const pool = exact.length ? exact : (ctx.hasUI && orphanCandidates.length === 1 ? orphanCandidates : []);
+    pool.sort((a, b) => b.checkpoint.at - a.checkpoint.at || a.checkpoint.problem!.localeCompare(b.checkpoint.problem!) || a.runId.localeCompare(b.runId));
+    const selected = pool[0];
+    for (const candidate of candidates) {
+      if (candidate !== selected) { try { candidate.store?.wal.releaseLease(); } catch {} }
+    }
     return selected;
   }
   async shutdown() {
@@ -210,6 +228,7 @@ export class LiveFixRunManager {
       rootDir: process.env.PI_CODING_AGENT_DIR,
       parentSessionId: ctx.sessionManager.getSessionId(),
       parentLeafId: ctx.sessionManager.getLeafId() ?? 'root',
+      parentSessionFile: ctx.sessionManager.getSessionFile?.(),
       cwd: ctx.cwd,
     });
     try {
@@ -666,8 +685,19 @@ export async function continueRun(
       const restoredNodeExecutionId = runtime.getNodeExecutionId(nodeId);
       const logicalNodeExecutionId = restoredNodeExecutionId ?? runtime.createNodeExecutionId(nodeId);
       let recoveryAttempt = restoredNodeExecutionId ? (runtime.getRecoveryAttempt(nodeId) ?? 0) + 1 : 1;
-      const supplementRecords = prepared.live?.wal.records().filter((record) => record.type === 'supplement').map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text })) ?? [];
-      const liveCapsule = prepared.live && supplementRecords.length ? { supplementVersion: prepared.live.wal.getSupplementVersion(), supplements: supplementRecords } : {};
+      const liveRecords = prepared.live?.wal.records() ?? [];
+      const supplementRecords = liveRecords.filter((record) => record.type === 'supplement').map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text }));
+      const latestSnapshot = [...liveRecords].reverse().find((record) => record.type === 'worker' && record.payload.kind === 'model_call_snapshot');
+      const inheritedSupplementVersion = prepared.live ? Math.max(
+        prepared.live.wal.getSupplementVersion(),
+        typeof latestSnapshot?.payload.supplementVersion === 'number' ? latestSnapshot.payload.supplementVersion : 0,
+      ) : 0;
+      const liveCapsule = prepared.live ? {
+        supplementVersion: inheritedSupplementVersion,
+        ...(supplementRecords.length ? { supplements: supplementRecords } : {}),
+        ...(typeof latestSnapshot?.payload.contextRef === 'string' ? { supplementContextRef: latestSnapshot.payload.contextRef } : {}),
+        ...(typeof latestSnapshot?.payload.modelCallRef === 'string' ? { modelCallRef: latestSnapshot.payload.modelCallRef } : {}),
+      } : {};
       try {
         const result = await runtime.executeNode(prepared.definitions[nodeId], task, { nodeExecutionId: logicalNodeExecutionId, recoveryAttempt, context: { ...liveCapsule, ...capsule } });
         artifact = result.artifact;
@@ -692,10 +722,19 @@ export async function continueRun(
     // reviewer 顺序或当前 Child publication 改变上下文，且 Runtime 仍会为
     // 每个 reviewer 盖章独立的 nodeExecutionId/workerId。
     const liveRunCapsule = () => {
-      const records = prepared.live?.wal.records().filter((record) => record.type === 'supplement') ?? [];
-      return prepared.live && records.length
-        ? { supplementVersion: prepared.live.wal.getSupplementVersion(), supplements: records.map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text })) }
-        : {};
+      const allRecords = prepared.live?.wal.records() ?? [];
+      const records = allRecords.filter((record) => record.type === 'supplement');
+      const snapshot = [...allRecords].reverse().find((record) => record.type === 'worker' && record.payload.kind === 'model_call_snapshot');
+      if (!prepared.live) return {};
+      return {
+        supplementVersion: Math.max(
+          prepared.live.wal.getSupplementVersion(),
+          typeof snapshot?.payload.supplementVersion === 'number' ? snapshot.payload.supplementVersion : 0,
+        ),
+        ...(records.length ? { supplements: records.map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text })) } : {}),
+        ...(typeof snapshot?.payload.contextRef === 'string' ? { supplementContextRef: snapshot.payload.contextRef } : {}),
+        ...(typeof snapshot?.payload.modelCallRef === 'string' ? { modelCallRef: snapshot.payload.modelCallRef } : {}),
+      };
     };
     const runReviewChecked = async (
       reviewNodeId: string,
@@ -731,7 +770,9 @@ export async function continueRun(
 
     // 10. 主循环：按阶段分派直至 ACCEPTED。恢复时仅首轮消费 WAL 投影出的评审节点；
     // 同一调用内评审拒绝回流后，必须重新执行业务节点而不是重复评审。
-    let recoveredReviewNode = runtime.getActiveNodeId();
+    // Only an explicit unfinished reviewer attempt can select a reviewer
+    // recovery path. A historical activeNodeId/reviewCycleId is not a cursor.
+    let recoveredReviewNode = runtime.getActiveReviewAttempt() ? runtime.getActiveNodeId() : undefined;
     while (runtime.stage !== 'ACCEPTED') {
       const stage = runtime.stage;
       host.setWorkflowStatus(ctx, `fix ${stage}`);
@@ -1444,6 +1485,7 @@ export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandC
         rootDir: process.env.PI_CODING_AGENT_DIR,
         parentSessionId: ctx.sessionManager.getSessionId(),
         parentLeafId: ctx.sessionManager.getLeafId?.() ?? 'root',
+        parentSessionFile: ctx.sessionManager.getSessionFile?.(),
         cwd: ctx.cwd,
         confirmed: true,
       });
@@ -1514,29 +1556,89 @@ function authenticatedModelRefs(ctx: ExtensionContext): string[] {
   return liveModelCandidates(ctx).map((model) => `${model.provider}/${model.id}`);
 }
 
-class LiveWorkerEditor extends CustomEditor {
+export class LiveWorkerEditor extends CustomEditor {
   private readonly injectedKeybindings: { matches(data: string, action: string): boolean };
   private readonly activeWorker: () => boolean;
   private readonly onSelect: () => void;
   private readonly onCycle: (direction: 1 | -1) => void;
+  private readonly previous: any;
+  private readonly previousSubmit?: (text: string) => void;
+  private readonly previousChange?: (text: string) => void;
+  private readonly previousEscape?: () => void;
+  private readonly previousCtrlD?: () => void;
+  private readonly previousPasteImage?: () => void;
+  private readonly previousExtensionShortcut?: (data: string) => boolean;
 
-  constructor(tui: any, theme: any, keybindings: any, controls: { active: () => boolean; select: () => void; cycle: (direction: 1 | -1) => void }) {
+  constructor(tui: any, theme: any, keybindings: any, previousFactory: any, controls: { active: () => boolean; select: () => void; cycle: (direction: 1 | -1) => void }) {
     super(tui, theme, keybindings);
     this.injectedKeybindings = keybindings;
     this.activeWorker = controls.active;
     this.onSelect = controls.select;
     this.onCycle = controls.cycle;
+    // Compose the extension that owned the editor before us. Do not replace it
+    // with a second blank Pi editor: text, history, autocomplete and its own
+    // shortcuts continue to live on this delegated instance.
+    this.previous = previousFactory?.(tui, theme, keybindings);
+    this.previousSubmit = this.previous?.onSubmit;
+    this.previousChange = this.previous?.onChange;
+    this.previousEscape = this.previous?.onEscape;
+    this.previousCtrlD = this.previous?.onCtrlD;
+    this.previousPasteImage = this.previous?.onPasteImage;
+    this.previousExtensionShortcut = this.previous?.onExtensionShortcut;
+  }
+
+  private syncPreviousCallbacks() {
+    if (!this.previous) return;
+    this.previous.onSubmit = (text: string) => { this.previousSubmit?.(text); this.onSubmit?.(text); };
+    this.previous.onChange = (text: string) => { this.previousChange?.(text); this.onChange?.(text); };
+    // Pi 0.84.2 installs app handlers on the returned wrapper after the
+    // factory runs. Mirror them onto the delegated editor before dispatch.
+    if (this.previous.actionHandlers instanceof Map) {
+      for (const [action, handler] of this.actionHandlers) this.previous.actionHandlers.set(action, handler);
+    }
+    if ('onEscape' in this) this.previous.onEscape = () => { this.previousEscape?.(); this.onEscape?.(); };
+    if ('onCtrlD' in this) this.previous.onCtrlD = () => { this.previousCtrlD?.(); this.onCtrlD?.(); };
+    if ('onPasteImage' in this) this.previous.onPasteImage = () => { this.previousPasteImage?.(); this.onPasteImage?.(); };
+    if ('onExtensionShortcut' in this) this.previous.onExtensionShortcut = (data: string) => this.previousExtensionShortcut?.(data) === true || this.onExtensionShortcut?.(data) === true;
+  }
+
+  private delegateInput(data: string) {
+    this.syncPreviousCallbacks();
+    if (this.previous?.handleInput) this.previous.handleInput(data);
+    else super.handleInput(data);
   }
 
   handleInput(data: string) {
-    // Pi copies/replaces actionHandlers after this factory returns (0.84.2).
-    // Match the injected manager before super instead of registering handlers in
-    // the factory, so the Child control cannot be overwritten or leak to parent.
-    if (this.activeWorker() && this.injectedKeybindings.matches(data, 'app.model.select')) { this.onSelect(); return; }
-    if (this.activeWorker() && this.injectedKeybindings.matches(data, 'app.model.cycleForward')) { this.onCycle(1); return; }
-    if (this.activeWorker() && this.injectedKeybindings.matches(data, 'app.model.cycleBackward')) { this.onCycle(-1); return; }
-    super.handleInput(data);
+    const matches = (action: string) => this.injectedKeybindings.matches(data, action);
+    // Pi's explicit editor controls have priority over model actions. This is
+    // intentionally checked before Child picker keys so history, clipboard,
+    // interrupt, exit and other extension handlers cannot be hijacked.
+    const explicitEditorAction = ['tui.editor.historyPrevious', 'tui.editor.historyNext', 'app.clipboard.pasteImage', 'app.interrupt', 'app.exit'].some(matches);
+    if (!this.activeWorker() || explicitEditorAction) { this.delegateInput(data); return; }
+    if (matches('app.model.select') || matches('app.model.cycleForward') || matches('app.model.cycleBackward')) {
+      this.syncPreviousCallbacks();
+      if (this.previousExtensionShortcut?.(data) === true || this.onExtensionShortcut?.(data) === true) return;
+    }
+    if (matches('app.model.select')) { this.onSelect(); return; }
+    if (matches('app.model.cycleForward')) { this.onCycle(1); return; }
+    if (matches('app.model.cycleBackward')) { this.onCycle(-1); return; }
+    this.delegateInput(data);
   }
+
+  getText() { return this.previous?.getText ? this.previous.getText() : super.getText(); }
+  setText(text: string) { if (this.previous?.setText) this.previous.setText(text); else super.setText(text); }
+  render(width: number) { return this.previous?.render ? this.previous.render(width) : super.render(width); }
+  invalidate() { if (this.previous?.invalidate) this.previous.invalidate(); else super.invalidate(); }
+  getExpandedText() { return this.previous?.getExpandedText ? this.previous.getExpandedText() : this.getText(); }
+  getLines() { return this.previous?.getLines ? this.previous.getLines() : [this.getText()]; }
+  getCursor() { return this.previous?.getCursor ? this.previous.getCursor() : super.getCursor(); }
+  addToHistory(text: string) { if (this.previous?.addToHistory) this.previous.addToHistory(text); else super.addToHistory(text); }
+  setAutocompleteProvider(provider: any) { if (this.previous?.setAutocompleteProvider) this.previous.setAutocompleteProvider(provider); else super.setAutocompleteProvider(provider); }
+  setPaddingX(padding: number) { if (this.previous?.setPaddingX) this.previous.setPaddingX(padding); else super.setPaddingX(padding); }
+  getPaddingX() { return this.previous?.getPaddingX ? this.previous.getPaddingX() : super.getPaddingX(); }
+  setAutocompleteMaxVisible(max: number) { if (this.previous?.setAutocompleteMaxVisible) this.previous.setAutocompleteMaxVisible(max); else super.setAutocompleteMaxVisible(max); }
+  getAutocompleteMaxVisible() { return this.previous?.getAutocompleteMaxVisible ? this.previous.getAutocompleteMaxVisible() : super.getAutocompleteMaxVisible(); }
+  isShowingAutocomplete() { return this.previous?.isShowingAutocomplete ? this.previous.isShowingAutocomplete() : super.isShowingAutocomplete(); }
 }
 
 export function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRunManager, binding: LiveRunBinding): void {
@@ -1559,7 +1661,7 @@ export function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRun
     const next = candidates[(index + direction + candidates.length) % candidates.length];
     if (next) await workerInteractionModel(live, worker, next);
   };
-  ctx.ui.setEditorComponent((tui, theme, keybindings) => new LiveWorkerEditor(tui, theme, keybindings, {
+  ctx.ui.setEditorComponent((tui, theme, keybindings) => new LiveWorkerEditor(tui, theme, keybindings, binding.previousEditor, {
     active: () => live.activeFor(ctx) !== undefined,
     select: () => { void select(); },
     cycle: (direction) => { void cycle(direction); },
@@ -1637,7 +1739,7 @@ async function workerInteraction(live: LiveFixRunManager, runId: string, expecte
   return live.submitSupplement({ runId, expectedNodeExecutionId, text, images });
 }
 async function workerInteractionModel(live: LiveFixRunManager, worker: NonNullable<ReturnType<LiveFixRunManager['activeFor']>>, modelRef: string) {
-  return live.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, modelRef });
+  return live.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: worker.workerSessionId, expectedAttemptId: worker.attemptId, modelRef });
 }
 
 // 供测试与运行时壳使用的定义导出保留。

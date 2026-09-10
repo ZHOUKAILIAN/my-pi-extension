@@ -306,6 +306,6 @@ Sidecar 第一版最多 20 个 Worker attempt。含原文的 intermediate Worker
 
 GC 与 writer 使用同一外部 operation lock。扫描快照后、原子 tombstone/rename前必须在锁内重新核验 parent、Run终态、deadline、writer lease/epoch；活 owner或不确定状态一律不删。删除先把 Run 目录 rename到 root trash/tombstone并 fsync目录，再异步删除；恢复端在同一 lock下看到 tombstone必须拒绝。明确放弃在下一次扫描处理，删除失败记录并重试。默认值由 L3 拥有。
 
-非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, modelRef})` 和带 sequence/status 的事件流。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
+非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, expectedWorkerSessionId, expectedAttemptId, modelRef})` 和带 sequence/status 的事件流。模型 picker 的四元身份 fence（Run、Node Execution、Worker Session、Attempt）在队列内重检，目标变化时 fail-closed。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
 
 当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。当前 `/fix` command handler 同步等待整个 Run，Child Session 为内存态且不可从主输入反向控制；统一对话协作仍是未实现目标。第一版把 Run 改为 Extension 管理的后台任务：启动事实和首个 Worker 成功建立后 command handler 返回，`input` hook 在存在当前 Worker 时处理普通输入，避免进入主 Session pending queue；`session_shutdown` 只 best-effort停止接收新输入并清理任务；缺少终态时从已 fsync WAL恢复。第一版继续使用 SDK 承载，增加可寻址 Session registry、事件投影、输入/模型路由和持久化事实，不以 tmux 或新用户命令作为前置条件。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。

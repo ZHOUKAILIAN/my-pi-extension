@@ -32,6 +32,8 @@ export interface RunControlWalOptions {
   /** New runs bind their control log to this parent session context. */
   parentSessionId?: string;
   parentLeafId?: string;
+  /** Absolute parent session file used to distinguish a missing parent from a different active branch. */
+  parentSessionFile?: string;
   cwd?: string;
 }
 
@@ -115,7 +117,7 @@ export class RunControlWal {
   readonly leasePath: string;
   readonly instanceNonce: string;
   private readonly now: () => number;
-  private readonly headerBinding: { parentSessionId?: string; parentLeafId?: string; cwd?: string };
+  private readonly headerBinding: { parentSessionId?: string; parentLeafId?: string; parentSessionFile?: string; cwd?: string };
   private epoch = 0;
   private nextIndex = 0;
   private nextSupplementVersion = 1;
@@ -130,7 +132,7 @@ export class RunControlWal {
     this.leasePath = join(this.rootDir, 'workflow-runs', 'locks', `${safeRunPart(runId)}.lease.json`);
     this.instanceNonce = options.instanceNonce ?? randomUUID();
     this.now = options.now ?? (() => Date.now());
-    this.headerBinding = { parentSessionId: options.parentSessionId, parentLeafId: options.parentLeafId, cwd: options.cwd };
+    this.headerBinding = { parentSessionId: options.parentSessionId, parentLeafId: options.parentLeafId, parentSessionFile: options.parentSessionFile, cwd: options.cwd };
   }
 
   static open(runId: string, options: RunControlWalOptions = {}): RunControlWal {
@@ -150,6 +152,7 @@ export class RunControlWal {
           createdAt: new Date(wal.now()).toISOString(),
           ...(wal.headerBinding.parentSessionId !== undefined ? { parentSessionId: wal.headerBinding.parentSessionId } : {}),
           ...(wal.headerBinding.parentLeafId !== undefined ? { parentLeafId: wal.headerBinding.parentLeafId } : {}),
+          ...(wal.headerBinding.parentSessionFile !== undefined ? { parentSessionFile: wal.headerBinding.parentSessionFile } : {}),
           ...(wal.headerBinding.cwd !== undefined ? { cwd: wal.headerBinding.cwd } : {}),
         });
       }
@@ -205,7 +208,7 @@ export class RunControlWal {
     const effective = rebinding?.payload.to && typeof rebinding.payload.to === 'object'
       ? rebinding.payload.to as Record<string, unknown>
       : header.payload;
-    for (const field of ['parentSessionId', 'parentLeafId', 'cwd'] as const) {
+    for (const field of ['parentSessionId', 'parentLeafId', 'parentSessionFile', 'cwd'] as const) {
       const expected = this.headerBinding[field];
       if (expected !== undefined && effective[field] !== expected) throw new RunControlWalError('WAL_HEADER_BINDING_MISMATCH', `run ${this.runId} binding ${field} does not match the current parent context`);
     }
@@ -301,19 +304,19 @@ export class RunControlWal {
   markShutdown() { try { return this.append('shutdown', { status: 'interrupted_attempt' }); } catch { return undefined; } }
 
   /** Explicit, user-confirmed rebind to a new parent in the same cwd. The original header and runId remain intact. */
-  rebindParent(input: { parentSessionId: string; parentLeafId: string; cwd: string; confirmed: boolean }) {
+  rebindParent(input: { parentSessionId: string; parentLeafId: string; parentSessionFile?: string; cwd: string; confirmed: boolean }) {
     if (!input.confirmed) throw new RunControlWalError('PARENT_REBIND_CONFIRMATION_REQUIRED', 'parent rebind requires explicit user confirmation');
     return this.withOperationLock(() => {
       this.assertLease();
       const header = this.recordsUnlocked().find((record) => record.type === 'header');
       if (!header || typeof header.payload.cwd !== 'string' || header.payload.cwd !== input.cwd) throw new RunControlWalError('PARENT_REBIND_CWD_MISMATCH', 'parent rebind is allowed only in the original cwd');
       const previous = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to ?? header.payload;
-      return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
+      return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, ...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile } : {}), cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
     });
   }
 
   static rebindParent(runId: string, options: RunControlWalOptions & { parentSessionId: string; parentLeafId: string; cwd: string; confirmed: boolean }) {
-    const wal = RunControlWal.open(runId, { ...options, parentSessionId: undefined, parentLeafId: undefined, cwd: undefined });
+    const wal = RunControlWal.open(runId, { ...options, parentSessionId: undefined, parentLeafId: undefined, parentSessionFile: undefined, cwd: undefined });
     try { return wal.rebindParent(options); } finally { try { wal.releaseLease(); } catch { /* preserve for explicit recovery */ } }
   }
 
@@ -388,6 +391,15 @@ export class RunControlWalStore implements RunStore {
       ...(typeof started.record.payload.reviewerIndex === 'number' ? { reviewerIndex: started.record.payload.reviewerIndex } : {}),
       ...(typeof started.record.payload.reviewerWorkerId === 'string' || typeof started.record.payload.workerId === 'string' ? { reviewerWorkerId: String(started.record.payload.reviewerWorkerId ?? started.record.payload.workerId) } : {}),
       ...(started.record.payload.reviewerParticipant && typeof started.record.payload.reviewerParticipant === 'object' ? { reviewerParticipant: started.record.payload.reviewerParticipant as any } : {}),
+      ...(typeof started.record.payload.reviewCycleId === 'string' && typeof started.record.payload.reviewerIndex === 'number' && (typeof started.record.payload.reviewerWorkerId === 'string' || typeof started.record.payload.workerId === 'string') ? {
+        activeReviewAttempt: {
+          reviewerIndex: started.record.payload.reviewerIndex,
+          workerId: String(started.record.payload.reviewerWorkerId ?? started.record.payload.workerId),
+          cycleId: started.record.payload.reviewCycleId,
+          nodeExecutionId: executionId,
+          attempt: typeof started.record.payload.attempt === 'number' ? started.record.payload.attempt : (typeof started.record.payload.recoveryAttempt === 'number' ? started.record.payload.recoveryAttempt : 1),
+        },
+      } : {}),
     };
   }
 }
