@@ -169,6 +169,44 @@ flowchart TD
 | 技术字段 | `runId`、`nodeExecutionId`、candidate revision、错误码和事件 ID 默认不作为用户输入，作为详情、复制引用或调试信息保留 |
 | UI 状态 | UI 不复制 Run 状态、不修改 Artifact/Audit，不在本地形成第二套决定状态 |
 
+### 运行中统一对话适配
+
+该机制是目标 L2 设计，当前尚未实现；当前事实见[实现地图 drift](README.md#已知-l1--l2-drift)。tmux、独立窗口和子终端不属于产品依赖。
+
+```mermaid
+flowchart LR
+  editor[原对话输入 / 模型选择] --> adapter[Workflow Interaction Adapter]
+  adapter --> registry[Active Worker Registry]
+  registry --> session[Pi AgentSession]
+  session --> events[Session Events]
+  events --> adapter
+  adapter --> transcript[原对话中的 Worker 输出 / 工具摘要]
+  adapter --> supplement[Run 级用户补充记录]
+  supplement --> capsule[后续 Context Capsule 引用]
+```
+
+| 组件 | 目标责任 |
+| --- | --- |
+| Active Worker Registry | 以 `runId` / `nodeExecutionId` 定位当前 Worker Session 句柄、状态、实际模型、输入上下文版本和 close fence；不拥有 Run Stage |
+| Workflow Interaction Adapter | 把原输入框消息路由为当前 Session 的 `steer` / `prompt`，把当前 subagent picker 的选择路由为绑定 Worker 的模型变化 |
+| Event Projection | 订阅模型可见输出和 tool start/update/end，把原文写入受保护 UI sidecar，并以随机 opaque ref生成主对话展示；parent entry不含原文，不伪造隐藏推理 |
+| Run Control WAL | 串行持久化补充、close fence、checkpoint 和逐条投递事件；分配 Run 内连续序号，记录目标、模型调用引用和 Artifact 绑定，不用单一水位掩盖失败/跳过 |
+| Controller Fence | 原子比较 supplement sequence 与 Node close fence；fence 前的新输入使旧 Artifact 失效，直到新模型调用与绑定最新补充版本的 Artifact 完成 |
+
+输入路由必须遵守单一 owner：第一版同一 UI 最多发布一个可交互 Worker，其他并发 Worker 只投影状态。Controller 先关闭旧目标并写 close fence，再发布新目标；用户提交必须与目标/sequence 分配原子化，fence 后提交返回失败并保留编辑内容，不能因为异步切换自动改写。所有后续 Worker 默认按顺序获得同一 Run 的补充记录；每次 Node Artifact 绑定其实际输入上下文的 `supplementVersion`。
+
+Extension 自有 append-only Run Control WAL 是补充、投递事件、close fence 和 checkpoint 的唯一控制事实；它位于 Pi 本地 agent 状态目录，按 Run 隔离，目录 `0700`、文件 `0600`。每个 Run 还使用Run 目录之外、同一受保护 root `locks/` 下的短持有 operation lock、长持有 writer lease 和单调 `writerEpoch`。每次 append 从取得 operation lock 开始，把 lease/epoch 核验、单条完整 record append 和 file fsync 放在同一跨进程排他临界区，释放后才对调用方确认；takeover 同样先取得该 lock，再原子切换 lease并递增 epoch，因此不存在“核验后、append 前”被接管的窗口。lease 记录 host/process identity、extension instance nonce 和 epoch，每条 WAL record 都携带 epoch。活 owner、旧 reload callback 尚未释放或 owner 无法确定时，恢复/第二 Pi 进程 fail-closed；只有能证明原进程已结束，或用户在 UI 明确确认接管不确定 owner 后，才能隔离旧 lease并接管。追加记录使用稳定 event/supplement ID、checksum、`O_APPEND`，在确认 `recorded` 前完成文件 `fsync`；首次创建/重命名时同步父目录。无法达到该 durability boundary 时输入接收 fail-closed。父 Pi Session 当前 branch 只保存不含原文和内容派生 digest 的随机 opaque ID及粗粒度状态投影；Child Session JSONL 只是执行对话证据，不拥有 Run 状态。
+
+现有未完成 `workflow-run` parent checkpoint 只允许从当前 active branch 幂等导入：临时 WAL generation 完整写入并 fsync、原子 rename及目录 fsync成功前，旧 checkpoint 仍是唯一事实且不得启动 Worker；成功后 WAL header 记录 source entry/checksum，Runtime 只从 WAL 推进，不 dual-write。冲突、未知版本或导入失败 fail-closed。历史 parent entry 不重写且可能被 Pi export/share，但新补充原文/Child 输出不再写入。
+
+Run Control WAL 绑定 `parentSessionId`、开始时的 `parentLeafId` 和 cwd digest。恢复读取完整 WAL，不使用 compaction-aware context；父 Session/branch 存在时校验当前 active branch，父 Session 在首次持久化前崩溃丢失时只允许在同 cwd 经用户确认把未完成 Run 重新绑定到新 Session，并保留原 runId/父引用。投递采用 at-least-once：每条 `supplementId` 在 Worker 上下文中去重；无法证明消费时，只能自动交给同一逻辑 Node Execution 的恢复 attempt并明确展示/审计，跨 Node或待用户决定状态必须保留内容并由用户面向新接收者再次提交。
+
+模型选择由 Workflow UI 自有、无额外命令的 picker 承载，不调用或回滚主 Session 的内建 `/model`。Workflow 自定义 editor 使用注入的 keybindings manager 条件接管 `app.model.select`/cycle：有当前 Worker 时打开 Child picker，无 Worker 时委托原 editor；状态区持续显示当前接收者和 key hint。picker 打开时绑定 `nodeExecutionId`，确认时重新校验目标未变；候选来自 Pi scoped/available 且已认证模型，并由 Runtime 检查当前 Worker 所需工具/schema兼容性。项目 Node `model` 是默认模型，不是第一版候选 allowlist；若未来需要限制集合，必须扩展版本化 Policy schema。Child 注入独立 `SettingsManager.inMemory()`，避免旧 Pi `setModel()` 改写全局默认。
+
+模型选择生命周期为 `requested → pending → applied | not_applied | failed`：`setModel()` 成功只表示待生效；同一 Worker 使用新模型开始下一次模型调用并记录 `effectiveFromModelCallRef` 后才显示“已切换”。Worker 在调用前 close 时记录 `not_applied`，不得带到后续 Node或显示成功。切换不能误改主 Session。
+
+用户补充是运行事实，不是业务 Artifact 或 User Decision。Runtime 可以把它作为版本化 Context Capsule 输入交给 Worker，但 Worker 仍须重新提交满足合同的 Artifact，Controller 仍须执行 Guard 和 Acceptance。
+
 ### Pi TUI Review Panel
 
 Pi TUI 适配器使用原生 `ctx.ui.custom()` 和现有组件 `Markdown`、`SelectList`、`Container`、`DynamicBorder`。默认 Review Panel 只展示当前决定所需信息：
@@ -260,4 +298,14 @@ L2 测试除验证数据和状态正确外，还应验证：
 
 ## 当前实现选择
 
-当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。
+所有 host handler 必须把 fail-closed 变成返回值而不是异常：有交互 owner 时，input handler 顶层捕获全部错误、best-effort 恢复原编辑文本并始终返回 `handled`，绝不让补充落入父 Agent；可取消的 `session_before_tree/switch/fork` handler 顶层捕获错误并返回 `{ cancel: true }`。真实 ExtensionRunner 吞异常的行为必须进入故障注入测试。
+
+交互 Registry 以 `(parentSessionId, parentLeafId, runId)` 为 owner key。活跃 Run 期间再次 `/fix` 直接拒绝并显示当前任务；`session_before_tree`、`session_before_switch`、`session_before_fork` 第一版 fail-closed 取消操作，直到 Run settled或已写可恢复 paused checkpoint。`/new`、`/resume` 和 extension command 都不能只依赖 `input` hook，必须在各自 handler/lifecycle event 单独检查 owner。`session_before_tree/switch/fork` 等可取消事件使用真正 fail-closed。`/reload`、退出和信号没有可取消的 before hook：`session_shutdown` 只做 best-effort 关闭输入、完成已经开始的 WAL commit并清理句柄，不能承诺阻止宿主退出；恢复时若 durable WAL 缺少 close/settled 终态，就确定性推断为 interrupted attempt并展示可恢复状态，未经用户确认不自动推进。父分支变化后旧 Registry 不得继续接收输入。
+
+Sidecar 第一版最多 20 个 Worker attempt。含原文的 intermediate Worker/UI sidecar在 Run settled 30 天后到期；没有 live lease 的 unfinished Run 从最后一个 durable event起保留 30 天并持续提示恢复/放弃；parent 缺失的 settled Run 从首次观察起最多再保留 7 天，取更早删除期限。最终用户报告和粗粒度状态仍保留在父对话；过期 intermediate详情显示“已按本地保留策略清理”。
+
+GC 与 writer 使用同一外部 operation lock。扫描快照后、原子 tombstone/rename前必须在锁内重新核验 parent、Run终态、deadline、writer lease/epoch；活 owner或不确定状态一律不删。删除先把 Run 目录 rename到 root trash/tombstone并 fsync目录，再异步删除；恢复端在同一 lock下看到 tombstone必须拒绝。明确放弃在下一次扫描处理，删除失败记录并重试。默认值由 L3 拥有。
+
+非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, modelRef})` 和带 sequence/status 的事件流。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
+
+当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。当前 `/fix` command handler 同步等待整个 Run，Child Session 为内存态且不可从主输入反向控制；统一对话协作仍是未实现目标。第一版把 Run 改为 Extension 管理的后台任务：启动事实和首个 Worker 成功建立后 command handler 返回，`input` hook 在存在当前 Worker 时处理普通输入，避免进入主 Session pending queue；`session_shutdown` 只 best-effort停止接收新输入并清理任务；缺少终态时从已 fsync WAL恢复。第一版继续使用 SDK 承载，增加可寻址 Session registry、事件投影、输入/模型路由和持久化事实，不以 tmux 或新用户命令作为前置条件。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。

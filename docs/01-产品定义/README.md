@@ -6,15 +6,16 @@
 
 ### Core
 
-- [Workflow Governance Runtime 产品定义](领域术语.md)：权威产品语义源
+- [Workflow Governance Runtime 产品定义](领域术语.md)：`DECIDED`，共享运行中协作契约已采纳
 - [产品上下文摘要](产品上下文摘要.md)：由权威定义压缩而来，供 Agent/Runtime 注入；仍属于 L1
 - [策略治理工作流运行时 ADR](架构决策/0001-策略治理工作流运行时.md)：已采纳的产品级架构边界
+- [统一对话中的活跃 Worker 协作 ADR](架构决策/0002-统一对话中的活跃Worker协作.md)：`DECIDED`，定义单一输入、补充信息和当前 Worker 模型切换
 
 ### Extensions
 
 - [Feature Extension 产品规范](扩展/feature-扩展.md)：`DECIDED`
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
-- [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`TODO`
+- [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`DECIDED`
 
 ## L1 与 L2 的边界
 

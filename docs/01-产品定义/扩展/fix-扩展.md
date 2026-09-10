@@ -13,10 +13,19 @@
 | 怎么用 | `/fix <现象描述>`；用户不必先判断是 Bug / 配置 / 数据 / 需求问题 |
 | 目标 | 完成**可验证的处置**，不是让表面报错消失 |
 | 三项保证 | ① 根因有因果证据（不修表面）② 处置有影响面与回归验证（不引入回归）③ 人工最终验收（不自动接受） |
+| 执行中怎样协作 | 原对话自动展示当前 subagent；用户直接在同一输入框补充信息，并通过当前 subagent 模型选择器切换模型 |
 
 一次 Run 必须形成：问题确认 → 根因分层 → 按时间闭合的因果证据链 → 影响面分析 → 处置结果 → 原始现象验证 → 回归/兼容验证 → 面向用户的最终处置报告。
 
 Fix 拥有 `/fix` 命令和 Fix Workflow Definition；调查方法由 Skill 与 Project Knowledge 提供，Core Runtime 不拥有 Fix 的具体流程与业务验收标准。
+
+## 执行中协作
+
+`/fix <问题描述>` 是普通用户唯一需要记忆的 Fix 入口。Run 主动执行期间，原对话持续展示当前 subagent；用户直接使用同一输入框补充信息，并在同一对话使用当前 subagent 的模型选择器。Fix 不增加“接入/介入模式”、tmux/窗口切换、内部 ID 或普通用户控制命令。
+
+Fix 只拥有这条入口特有旅程。当前活跃 Worker、补充信息、严格 close fence、模型选择、安全与审计的共享语义由 [Core 产品定义](../领域术语.md)拥有；展示、输入和选择器行为由 [Workflow UI 规范](workflow-ui-扩展.md)拥有。无论用户怎样补充或换模型，Worker 仍须提交符合合同的新 Artifact，Controller 仍须执行 Guard 和 Acceptance。
+
+瞬时模型错误由 Runtime 按策略处理；连续失败需要换模型时仍在原对话完成。停止/取消不属于本能力第一版新增范围。目标普通交互旅程不依赖当前实现中的 `/fix review` 或 `runId`；这些差异在 L2 drift 中记录。
 
 ## 流程与门禁
 
@@ -245,7 +254,9 @@ run_started → investigation_review_passed → resolution_completed → verific
 
 ## Pi Session 恢复
 
-Fix 不注册自己的 `/resume`。Pi 原生 `/resume` 选择并恢复历史 session；用户选到之前处理该问题的 session 后，Fix 在该 session 内发现未完成 checkpoint，经用户确认后从 checkpoint 继续。不新建 `runId`、不从 `INTAKE` 重来、不跨 session 搜索。
+Fix 不注册自己的 `/resume`。正常情况仍由 Pi 原生 `/resume` 恢复原父 Session：Fix 在该 Session 的当前分支发现未完成 checkpoint，经用户确认后继续，不新建 `runId`、不从 `INTAKE` 重来。唯一例外是父 Session 在首次落盘前崩溃：Fix 可以在同一 cwd 向用户展示本地已耐久的未完成 Run，只有用户确认后才把原 runId 重新绑定到当前 Session，不自动跨项目或静默恢复。目标普通交互旅程从启动到最终验收不依赖 `/fix review`、`runId` 或其他诊断命令；当前实现仍保留这些路径的事实见 L2 drift。
+
+恢复后必须重建当前活跃 Worker 的交互路由和补充信息生命周期。同一逻辑 Node Execution 的替代 Worker可以自动重投未完成补充，但必须明确展示并审计新的 Worker Session；跨 Node、待用户决定或 close fence 后的文本不能自动改投，也不能因为原 Worker Session 无法恢复就声称已被模型调用使用。
 
 ## 非目标与 L2 交接
 
