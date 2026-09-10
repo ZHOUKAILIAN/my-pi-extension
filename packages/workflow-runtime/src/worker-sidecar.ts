@@ -18,11 +18,16 @@ export interface WorkerProjection {
 export class WorkerSidecar {
   readonly path: string;
   readonly runDir: string;
-  constructor(runDir: string) {
+  constructor(runDir: string, create = true) {
     this.runDir = runDir;
-    mkdirSync(runDir, { recursive: true, mode: 0o700 });
-    chmodSync(runDir, 0o700);
+    if (create) {
+      mkdirSync(runDir, { recursive: true, mode: 0o700 });
+      chmodSync(runDir, 0o700);
+    } else if (!existsSync(runDir)) throw new Error('worker sidecar directory is unavailable');
     this.path = join(runDir, 'ui-sidecar.jsonl');
+  }
+  static openExisting(runDir: string): WorkerSidecar | undefined {
+    try { return new WorkerSidecar(runDir, false); } catch { return undefined; }
   }
   append(projection: WorkerProjection) {
     const fd = openSync(this.path, 'a', 0o600);
@@ -38,7 +43,7 @@ export class WorkerSidecar {
       if (!line.trim()) continue;
       try {
         const value = JSON.parse(line) as WorkerProjection;
-        if (value.ref === ref) return value;
+        if (value.ref === ref && value.runId && value.nodeId && (value.eventKind === 'visible_text' || value.eventKind === 'tool_start')) return value;
       } catch {
         // A partial sidecar tail is not a control record. Do not expose it.
         return undefined;

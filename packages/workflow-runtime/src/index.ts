@@ -23,6 +23,7 @@ import {
   type PendingDecisionKind,
   type ReviewPolicy,
   type ReviewCycleRecord,
+  type ReviewParticipant,
   type RunStore,
   type Stage,
   type UserDecisionArtifact,
@@ -308,7 +309,7 @@ export class WorkflowRuntime {
    *  与政策摘要，防止降级策略或篡改账本绕过 quorum。未配置时以记账记录自身为准（通用 Runtime 语义）。 */
   private reviewPolicyFor?: (reviewArtifactKind: Artifact['kind']) => ReviewPolicy | undefined;
   private activeNodeId?: string;
-  private currentExecution?: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number };
+  private currentExecution?: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number; reviewerIndex?: number; reviewCycleId?: string; reviewerParticipant?: ReviewParticipant };
   private candidateRevision?: string;
   private reviewCycleId?: string;
   /** 评审周期账本：runReview 每次记账一条，随 checkpoint 持久化/恢复。
@@ -840,6 +841,11 @@ export class WorkflowRuntime {
     }
     if (this.candidateRevision !== undefined) checkpoint.candidateRevision = this.candidateRevision;
     if (this.reviewCycleId !== undefined) checkpoint.reviewCycleId = this.reviewCycleId;
+    if (this.currentExecution?.reviewerIndex !== undefined) {
+      checkpoint.reviewerIndex = this.currentExecution.reviewerIndex;
+      checkpoint.reviewerParticipant = this.currentExecution.reviewerParticipant;
+      checkpoint.reviewerWorkerId = this.currentExecution.workerId;
+    }
     // 评审周期账本有记录才写，无记录不写，legacy checkpoint 形状保持不变。
     if (this.reviewCycles.length) checkpoint.reviewCycles = this.reviewCycles;
     // BLOCKED checkpoint 记录解除目标阶段：跨 session 恢复时据此回到现场（不得默认回 INVESTIGATING）。
@@ -949,7 +955,7 @@ export class WorkflowRuntime {
   async executeNode(
     node: NodeDefinition,
     task: unknown,
-    opts: { context?: Capsule; nodeExecutionId?: string; recoveryAttempt?: number } = {},
+    opts: { context?: Capsule | (() => Capsule); nodeExecutionId?: string; recoveryAttempt?: number; reviewerIndex?: number; reviewCycleId?: string; reviewerParticipant?: ReviewParticipant } = {},
   ): Promise<{ artifact: Artifact; execution: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number } }> {
     const nodeExecutionId = opts.nodeExecutionId ?? this.createNodeExecutionId(node.id);
     const recoveryAttempt = opts.recoveryAttempt ?? 1;
@@ -971,17 +977,21 @@ export class WorkflowRuntime {
         policyDigest: this.policyDigest,
         sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
         activeNodeId: node.id, nodeExecutionId, logicalNodeExecutionId: nodeExecutionId, recoveryAttempt,
+        ...(opts.reviewCycleId !== undefined ? { reviewCycleId: opts.reviewCycleId } : {}),
+        ...(opts.reviewerIndex !== undefined ? { reviewerIndex: opts.reviewerIndex, reviewerParticipant: opts.reviewerParticipant, reviewerWorkerId: workerId } : {}),
       });
     }
     // Keep the identity in memory while the Worker runs. If it fails, the catch
     // below persists this exact identity so recovery can reuse it.
-    this.currentExecution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt };
+    this.currentExecution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt, reviewerIndex: opts.reviewerIndex, reviewCycleId: opts.reviewCycleId, reviewerParticipant: opts.reviewerParticipant };
     this.activeNodeId = node.id;
     // sourceVersion 是运行时可选择绑定的来源标记（如外部源/模型快照）。未绑定时用 'baseline'
     // 作为信封完整性的 fallback 盖章：信封合同要求非空 sourceVersion，fallback 只保证信封可写、
     // 绝不把 'baseline' 当作已验证/可接受的来源事实——受控终局（ACCEPTED）恢复要求 checkpoint
     // 顶层携带 bound sourceVersion，fallback 串无法满足 v2 终局来源验证。
     const srcVersion = this.sourceVersion ?? 'baseline';
+    const suppliedContext = opts.context;
+    const resolvedContext = typeof suppliedContext === 'function' ? suppliedContext() : suppliedContext;
     const capsule = {
       runId: this.runId,
       nodeExecutionId,
@@ -989,8 +999,10 @@ export class WorkflowRuntime {
       sourceVersion: srcVersion,
       requiresArtifactConclusion: this.definition.requiresArtifactConclusion === true,
       recoveryAttempt,
+      ...(opts.reviewCycleId !== undefined ? { reviewCycleId: opts.reviewCycleId } : {}),
+      ...(opts.reviewerIndex !== undefined ? { reviewerIndex: opts.reviewerIndex, reviewerParticipant: opts.reviewerParticipant } : {}),
       ...(node.id === 'verify' ? { requiresRepositoryChange: this.dispositionRequiresRepositoryChange() } : {}),
-      ...opts.context,
+      ...resolvedContext,
     };
     if (!node.worker) throw new WorkflowRuntimeError('NODE_WORKER_REQUIRED', 'node worker required');
     let raw: Artifact;
@@ -1002,6 +1014,8 @@ export class WorkflowRuntime {
         problem: this.problem, started: true, workflowVersion: this.definitionVersion ?? this.definition.sourceVersion,
         policyDigest: this.policyDigest, sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
         activeNodeId: node.id, nodeExecutionId, logicalNodeExecutionId: nodeExecutionId, recoveryAttempt,
+        ...(opts.reviewCycleId !== undefined ? { reviewCycleId: opts.reviewCycleId } : {}),
+        ...(opts.reviewerIndex !== undefined ? { reviewerIndex: opts.reviewerIndex, reviewerParticipant: opts.reviewerParticipant, reviewerWorkerId: workerId } : {}),
         artifacts: this.artifacts.length ? this.artifacts : undefined,
       });
       throw error;
@@ -1070,6 +1084,14 @@ export class WorkflowRuntime {
       this.recordEvent('artifact_rejected', { code: error.code, message: error.message, nodeId: node.id });
       throw error;
     }
+    // Review provenance is attached before the artifact enters the durable artifact list. A
+    // reviewer crash therefore leaves the completed earlier participants identifiable and
+    // recoverable without starting the cycle from participant #1 again.
+    if (typeof opts.reviewCycleId === 'string') {
+      const review = stamped as Record<string, unknown>;
+      review.reviewCycleId = opts.reviewCycleId;
+      if (typeof opts.context === 'object' && typeof opts.context.reviewedNodeId === 'string') review.reviewedNodeId = opts.context.reviewedNodeId;
+    }
     this.artifacts = [...this.artifacts, stamped];
     this.activeNodeId = node.id;
     const execution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt };
@@ -1089,9 +1111,13 @@ export class WorkflowRuntime {
     reviewNodeId: string,
     reviewers: NodeDefinition[],
     policy: ReviewPolicy,
-    opts: { reviewedNodeId: string; reviewArtifactKind: Artifact['kind']; eventType?: 'investigation_review_completed' | 'change_review_completed'; context?: Capsule },
+    opts: { reviewedNodeId: string; reviewArtifactKind: Artifact['kind']; eventType?: 'investigation_review_completed' | 'change_review_completed'; context?: Capsule | (() => Capsule) },
   ): Promise<{ reviewNodeId: string; reviewCycleId: string; approvals: number; requiredApprovals: number; passed: boolean; reviewArtifacts: Artifact[]; reviewerWorkerIds: string[]; ratedArtifacts: { artifactId: string; workerId: string; accepted: boolean }[] }> {
-    const reviewCycleId = `${this.runId}.review.${this.clock()}.${++this.reviewSeq}`;
+    const recoveredReviewExecution = this.currentExecution?.nodeId === reviewNodeId
+      && this.currentExecution.reviewCycleId !== undefined
+      ? this.currentExecution
+      : undefined;
+    const reviewCycleId = recoveredReviewExecution?.reviewCycleId ?? `${this.runId}.review.${this.clock()}.${++this.reviewSeq}`;
     this.reviewCycleId = reviewCycleId;
     // 语义节点绑定：已知 reviewNodeId 必须能产出本评审 kind（防“verify 节点冒充评审”、“已知节点
     // 提交跨 kind 产物”），已知 reviewedNodeId 必须能产出被评审的业务 kind（评审必须指向合法的
@@ -1124,8 +1150,9 @@ export class WorkflowRuntime {
     }
     // 独立性：排除上下文指定的 worker、policy.excludeNodes 对应节点已执行的 worker，
     // 以及被评审节点（reviewedNodeId）自身已执行的 worker——评审者不得与被评审节点同 worker。
+    const reviewContext = typeof opts.context === 'function' ? opts.context() : opts.context;
     const excluded = new Set<string>([
-      ...((opts.context?.excludeWorkerIds as string[] | undefined) ?? []),
+      ...((reviewContext?.excludeWorkerIds as string[] | undefined) ?? []),
       ...policy.excludeNodes.flatMap((nodeId) => this.nodeWorkerIds[nodeId] ?? []),
       ...(this.nodeWorkerIds[opts.reviewedNodeId] ?? []),
     ]);
@@ -1153,14 +1180,37 @@ export class WorkflowRuntime {
         throw new ReviewPolicyError('REVIEWER_NOT_INDEPENDENT', `reviewer ${reviewer.id} uses worker ${workerId} which is not independent`);
       }
     }
-    const reviewArtifacts: Artifact[] = [];
-    const reviewerWorkerIds: string[] = [];
-    const ratedArtifacts: { artifactId: string; workerId: string; accepted: boolean }[] = [];
-    const recoveredReviewExecution = this.currentExecution?.nodeId === reviewNodeId ? this.currentExecution : undefined;
+    const reviewArtifacts: Artifact[] = this.artifacts.filter((artifact) => {
+      const value = artifact as Record<string, unknown>;
+      return artifact.kind === opts.reviewArtifactKind && value.reviewCycleId === reviewCycleId && value.reviewedNodeId === opts.reviewedNodeId;
+    });
+    const reviewerWorkerIds: string[] = reviewArtifacts
+      .map((artifact) => (artifact as Record<string, unknown>).workerId)
+      .filter((id): id is string => typeof id === 'string');
+    const ratedArtifacts: { artifactId: string; workerId: string; accepted: boolean }[] = reviewArtifacts.map((artifact) => ({
+      artifactId: (artifact.id as string | undefined) ?? artifact.kind,
+      workerId: String((artifact as Record<string, unknown>).workerId),
+      accepted: satisfiesReview(policy, artifact),
+    }));
+    const reviewerStart = recoveredReviewExecution?.reviewerIndex ?? 0;
+    if (recoveredReviewExecution && reviewerStart >= reviewers.length) {
+      throw new ReviewPolicyError('REVIEWER_RECOVERY_INDEX_INVALID', `reviewer index ${reviewerStart} is outside the current review policy`);
+    }
     for (const [reviewerIndex, reviewer] of reviewers.entries()) {
+      if (reviewerIndex < reviewerStart) continue;
+      if (reviewerIndex === reviewerStart && recoveredReviewExecution) {
+        const expectedWorkerId = reviewer.worker?.workerId;
+        if (expectedWorkerId !== recoveredReviewExecution.workerId) {
+          throw new ReviewPolicyError('REVIEWER_RECOVERY_IDENTITY_MISMATCH', `recovered reviewer ${recoveredReviewExecution.workerId} is not reviewer ${reviewerIndex + 1}`);
+        }
+      }
+      const reviewerContext = typeof opts.context === 'function' ? opts.context() : (opts.context ?? {});
       const { artifact, execution } = await this.executeNode(reviewer, `review audit task: ${opts.reviewedNodeId}`, {
-        ...(reviewerIndex === 0 && recoveredReviewExecution ? { nodeExecutionId: recoveredReviewExecution.nodeExecutionId, recoveryAttempt: recoveredReviewExecution.attempt + 1 } : {}),
-        context: { ...opts.context, reviewedNodeId: opts.reviewedNodeId, reviewCycleId },
+        ...(reviewerIndex === reviewerStart && recoveredReviewExecution ? { nodeExecutionId: recoveredReviewExecution.nodeExecutionId, recoveryAttempt: recoveredReviewExecution.attempt + 1 } : {}),
+        reviewerIndex,
+        reviewCycleId,
+        reviewerParticipant: policy.reviewers[reviewerIndex],
+        context: { ...reviewerContext, reviewedNodeId: opts.reviewedNodeId, reviewCycleId },
       });
       if (artifact.kind !== opts.reviewArtifactKind) {
         throw new ReviewPolicyError('WRONG_REVIEW_ARTIFACT_KIND', `expected ${opts.reviewArtifactKind} got ${artifact.kind}`);
@@ -1873,10 +1923,14 @@ export class WorkflowRuntime {
         runtime.currentExecution = {
           nodeId: checkpoint.activeNodeId,
           nodeExecutionId: checkpoint.logicalNodeExecutionId ?? checkpoint.nodeExecutionId,
-          workerId: 'recovered',
+          workerId: checkpoint.reviewerWorkerId ?? 'recovered',
           attempt: checkpoint.recoveryAttempt ?? 1,
+          reviewerIndex: checkpoint.reviewerIndex,
+          reviewCycleId: checkpoint.reviewCycleId,
+          reviewerParticipant: checkpoint.reviewerParticipant,
         };
       }
+      if (checkpoint.reviewCycleId !== undefined) runtime.reviewCycleId = checkpoint.reviewCycleId;
       if (checkpoint.candidateRevision !== undefined) {
         runtime.candidateRevision = checkpoint.candidateRevision;
       } else {

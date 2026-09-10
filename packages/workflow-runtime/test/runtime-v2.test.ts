@@ -132,6 +132,52 @@ test('runReview passes with required quorum of independent reviewers', async () 
   assert.ok(events.some((event) => event.eventType === 'investigation_review_completed'));
 });
 
+test('review recovery resumes the crashed reviewer participant, not reviewer #1', async () => {
+  const { entries, store } = makeStore();
+  const firstRuntime = new WorkflowRuntime(makeDefinition(), store, 'run-1', () => 10, () => `id-${Date.now()}`, { definitionVersion: 'v1' });
+  await firstRuntime.executeNode({ id: 'investigate', worker: bareWorker(() => ({ kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] })) }, {});
+  let reviewerOneCalls = 0;
+  let reviewerTwoCalls = 0;
+  const reviewArtifact = (workerId: string) => ({
+    id: workerId,
+    kind: 'investigation_review' as const,
+    rootCauseConclusion: 'confirmed', evidenceSufficiency: 'sufficient' as const, gaps: [],
+    conclusion: { status: 'accepted' as const, summary: 'ok' },
+  });
+  const reviewerOne: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-1', execute: async () => { reviewerOneCalls += 1; return reviewArtifact('reviewer-1'); } } };
+  const reviewerTwo: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-2', execute: async () => { reviewerTwoCalls += 1; if (reviewerTwoCalls === 1) throw new Error('reviewer #2 crashed'); return reviewArtifact('reviewer-2'); } } };
+  const policy = { reviewers: [{ model: 'inherit' }, { model: 'inherit' }], mode: 'parallel' as const, requiredApprovals: 2, requireIndependentWorker: true, excludeNodes: ['investigate'], onRejected: 'return_to_investigation' };
+  await assert.rejects(firstRuntime.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' }));
+  const failed = entries.at(-1)!.data;
+  assert.equal(failed.reviewerIndex, 1);
+  assert.equal(failed.reviewerWorkerId, 'reviewer-2');
+  assert.equal(failed.reviewCycleId !== undefined, true);
+  assert.equal(failed.logicalNodeExecutionId, failed.nodeExecutionId);
+  assert.equal(failed.recoveryAttempt, 1);
+
+  const recovered = WorkflowRuntime.restore(makeDefinition(), store, 'run-1');
+  const result = await recovered.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' });
+  assert.equal(result.passed, true);
+  assert.equal(reviewerOneCalls, 1, 'reviewer #1 must not be rerun');
+  assert.equal(reviewerTwoCalls, 2, 'reviewer #2 is retried with the same logical execution');
+  assert.deepEqual(result.reviewerWorkerIds, ['reviewer-1', 'reviewer-2']);
+});
+
+test('runReview resolves a fresh capsule for each reviewer participant', async () => {
+  const { store } = makeStore();
+  const runtime = new WorkflowRuntime(makeDefinition(), store, 'run-capsule', () => 20, () => `id-${Date.now()}`);
+  await runtime.executeNode({ id: 'investigate', worker: bareWorker(() => ({ kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] })) }, {});
+  const seen: number[] = [];
+  let version = 1;
+  const reviewer = (workerId: string): NodeDefinition => ({ id: 'investigation_review', worker: { workerId, execute: async (_node, _task, capsule) => {
+    seen.push(Number(capsule.supplementVersion));
+    version = 2;
+    return { kind: 'investigation_review', rootCauseConclusion: 'confirmed', evidenceSufficiency: 'sufficient', gaps: [], conclusion: { status: 'accepted', summary: 'ok' } };
+  } } });
+  await runtime.runReview('investigation_review', [reviewer('reviewer-1'), reviewer('reviewer-2')], { reviewers: [{}, {}], mode: 'parallel', requiredApprovals: 2, requireIndependentWorker: true, excludeNodes: ['investigate'], onRejected: 'return_to_investigation' }, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review', context: () => ({ supplementVersion: version }) });
+  assert.deepEqual(seen, [1, 2]);
+});
+
 // 4. runReview 独立性违反
 test('runReview rejects a reviewer whose worker already executed the reviewed node', async () => {
   const { store } = makeStore();

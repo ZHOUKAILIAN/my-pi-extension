@@ -41,17 +41,63 @@ export class RunControlWalError extends Error {
 }
 
 const defaultRoot = () => process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? process.cwd(), '.pi', 'agent');
-const safePart = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, '_');
+export const safeRunPart = (value: string) => value.replace(/[^a-zA-Z0-9._-]/g, '_');
 const canonical = (value: unknown) => JSON.stringify(value);
-const checksumFor = (record: Omit<RunControlRecord, 'checksum'>) => createHash('sha256').update(canonical(record)).digest('hex');
+export const checksumFor = (record: Omit<RunControlRecord, 'checksum'>) => createHash('sha256').update(canonical(record)).digest('hex');
+export const runTombstonePath = (rootDir: string, runId: string) => join(rootDir, 'workflow-runs', `.tombstone-${safeRunPart(runId)}.json`);
 const fsyncFile = (path: string) => { const fd = openSync(path, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } };
 const fsyncDirectory = (path: string) => { const fd = openSync(path, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } };
 const writeJsonDurably = (path: string, value: unknown) => { writeFileSync(path, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 }); chmodSync(path, 0o600); fsyncFile(path); };
 const currentHost = () => hostname();
+
+/** Authoritative committed-record parser shared with RunGarbageCollector. */
+export const readRunControlRecords = (path: string, runId: string): RunControlRecord[] => {
+  if (!existsSync(path)) return [];
+  const records: RunControlRecord[] = [];
+  let expectedIndex = 0;
+  const lines = readFileSync(path, 'utf8').split('\n');
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex]!;
+    if (!line.trim()) continue;
+    if (lineIndex === lines.length - 1) throw new RunControlWalError('WAL_CORRUPT', `run ${runId} control WAL ends without a commit newline`);
+    let record: RunControlRecord;
+    try { record = JSON.parse(line) as RunControlRecord; } catch { throw new RunControlWalError('WAL_CORRUPT', `run ${runId} control WAL contains internal corruption`); }
+    const { checksum, ...body } = record;
+    if (record.runId !== runId || record.index !== expectedIndex || checksum !== checksumFor(body)) throw new RunControlWalError('WAL_CORRUPT', `run ${runId} control WAL contains a corrupted committed record`);
+    records.push(record); expectedIndex += 1;
+  }
+  return records;
+};
 const pidIsAlive = (host: string, pid: number) => {
   if (host !== currentHost() || !Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+};
+
+/** Shared per-run operation-lock protocol. GC uses this without constructing a
+ * WAL, so it cannot recreate a run directory while the lock is held. */
+export const withRunOperationLock = <T>(rootDir: string, runId: string, instanceNonce: string, now: () => number, fn: () => T): T => {
+  const lockPath = join(rootDir, 'workflow-runs', 'locks', `${safeRunPart(runId)}.lock`);
+  mkdirSync(dirname(lockPath), { recursive: true, mode: 0o700 });
+  let acquired = false;
+  try {
+    mkdirSync(lockPath, { mode: 0o700 }); acquired = true; chmodSync(lockPath, 0o700);
+    writeJsonDurably(join(lockPath, 'owner.json'), { pid: process.pid, host: hostname(), instanceNonce, acquiredAt: new Date(now()).toISOString() });
+    return fn();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+      const ownerPath = join(lockPath, 'owner.json');
+      let owner: { host?: string; pid?: number } | undefined;
+      try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { host?: string; pid?: number }; } catch { /* publisher may not have finished */ }
+      if (!owner || owner.host !== currentHost() || pidIsAlive(String(owner.host), Number(owner.pid))) throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${runId} operation lock is held or its owner is uncertain`);
+      try { unlinkSync(ownerPath); rmdirSync(lockPath); } catch { throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${runId} operation lock could not be safely reclaimed`); }
+      return withRunOperationLock(rootDir, runId, instanceNonce, now, fn);
+    }
+    if (error instanceof RunControlWalError) throw error;
+    throw new RunControlWalError('WAL_IO_FAILED', `run ${runId} operation lock failed: ${String(error)}`);
+  } finally {
+    if (acquired && existsSync(lockPath)) { try { unlinkSync(join(lockPath, 'owner.json')); } catch {} try { rmdirSync(lockPath); } catch {} }
+  }
 };
 
 /**
@@ -78,10 +124,10 @@ export class RunControlWal {
   private constructor(runId: string, options: RunControlWalOptions = {}) {
     this.runId = runId;
     this.rootDir = options.rootDir ?? defaultRoot();
-    this.runDir = join(this.rootDir, 'workflow-runs', safePart(runId));
+    this.runDir = join(this.rootDir, 'workflow-runs', safeRunPart(runId));
     this.walPath = join(this.runDir, 'control.wal');
-    this.lockPath = join(this.rootDir, 'workflow-runs', 'locks', `${safePart(runId)}.lock`);
-    this.leasePath = join(this.rootDir, 'workflow-runs', 'locks', `${safePart(runId)}.lease.json`);
+    this.lockPath = join(this.rootDir, 'workflow-runs', 'locks', `${safeRunPart(runId)}.lock`);
+    this.leasePath = join(this.rootDir, 'workflow-runs', 'locks', `${safeRunPart(runId)}.lease.json`);
     this.instanceNonce = options.instanceNonce ?? randomUUID();
     this.now = options.now ?? (() => Date.now());
     this.headerBinding = { parentSessionId: options.parentSessionId, parentLeafId: options.parentLeafId, cwd: options.cwd };
@@ -89,8 +135,11 @@ export class RunControlWal {
 
   static open(runId: string, options: RunControlWalOptions = {}): RunControlWal {
     const wal = new RunControlWal(runId, options);
+    if (existsSync(runTombstonePath(wal.rootDir, runId))) throw new RunControlWalError('RUN_TOMBSTONED', `run ${runId} has a durable garbage-collection tombstone`);
     wal.ensureLayout();
     wal.withOperationLock(() => {
+      if (existsSync(runTombstonePath(wal.rootDir, runId))) throw new RunControlWalError('RUN_TOMBSTONED', `run ${runId} has a durable garbage-collection tombstone`);
+      wal.ensureRunDirectory();
       wal.replayLocked();
       if (existsSync(wal.walPath)) wal.validateHeaderBindingLocked();
       wal.acquireLeaseLocked(options.takeOverConfirmed === true);
@@ -117,32 +166,17 @@ export class RunControlWal {
   private ensureLayout() {
     const workflowDir = join(this.rootDir, 'workflow-runs');
     const locksDir = join(workflowDir, 'locks');
-    for (const dir of [this.rootDir, workflowDir, locksDir, this.runDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700); }
+    for (const dir of [this.rootDir, workflowDir, locksDir]) { mkdirSync(dir, { recursive: true, mode: 0o700 }); chmodSync(dir, 0o700); }
   }
+  private ensureRunDirectory() { mkdirSync(this.runDir, { recursive: true, mode: 0o700 }); chmodSync(this.runDir, 0o700); }
 
   private withOperationLock<T>(fn: () => T): T {
     this.ensureLayout();
-    let acquired = false;
-    try {
-      mkdirSync(this.lockPath, { mode: 0o700 });
-      acquired = true;
-      chmodSync(this.lockPath, 0o700);
-      writeJsonDurably(join(this.lockPath, 'owner.json'), { pid: process.pid, host: hostname(), instanceNonce: this.instanceNonce, acquiredAt: new Date(this.now()).toISOString() });
+    return withRunOperationLock(this.rootDir, this.runId, this.instanceNonce, this.now, () => {
+      if (existsSync(runTombstonePath(this.rootDir, this.runId))) throw new RunControlWalError('RUN_TOMBSTONED', `run ${this.runId} has a durable garbage-collection tombstone`);
+      this.ensureRunDirectory();
       return fn();
-    } catch (error) {
-      if (error instanceof RunControlWalError) throw error;
-      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
-        const ownerPath = join(this.lockPath, 'owner.json');
-        let owner: { host?: string; pid?: number } | undefined;
-        try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { host?: string; pid?: number }; } catch { /* publisher may not have finished */ }
-        if (!owner || owner.host !== currentHost() || pidIsAlive(String(owner.host), Number(owner.pid))) throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${this.runId} operation lock is held or its owner is uncertain`);
-        try { unlinkSync(ownerPath); rmdirSync(this.lockPath); } catch { throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${this.runId} operation lock could not be safely reclaimed`); }
-        return this.withOperationLock(fn);
-      }
-      throw new RunControlWalError('WAL_IO_FAILED', `run ${this.runId} operation lock failed: ${String(error)}`);
-    } finally {
-      if (acquired && existsSync(this.lockPath)) { try { unlinkSync(join(this.lockPath, 'owner.json')); } catch { /* best effort */ } try { rmdirSync(this.lockPath); } catch { /* preserve uncertainty */ } }
-    }
+    });
   }
 
   private readLease(): Lease | undefined {
@@ -258,7 +292,7 @@ export class RunControlWal {
       const attempts = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'session_started').length;
       if (attempts >= 20) throw new RunControlWalError('WORKER_ATTEMPT_LIMIT', `run ${this.runId} exceeded the 20 recovery-attempt limit`);
       this.closed = false;
-      return this.appendLocked('worker', { ...payload, kind: 'session_started', recoveryAttempt: attempts + 1, runAttempt: attempts + 1 });
+      return this.appendLocked('worker', { ...payload, kind: 'session_started', recoveryAttempt: typeof payload.recoveryAttempt === 'number' ? payload.recoveryAttempt : attempts + 1, runAttempt: attempts + 1 });
     });
   }
   recordWorker(payload: Record<string, unknown>) { return this.append('worker', payload); }
@@ -287,23 +321,7 @@ export class RunControlWal {
     return RunGarbageCollector.collect(rootDir, { now, retentionMs: retentionDays * 86400000, orphanDeadlineMs: orphanDays * 86400000 });
   }
 
-  private recordsUnlocked(): RunControlRecord[] {
-    if (!existsSync(this.walPath)) return [];
-    const records: RunControlRecord[] = [];
-    let expectedIndex = 0;
-    const lines = readFileSync(this.walPath, 'utf8').split('\n');
-    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-      const line = lines[lineIndex]!;
-      if (!line.trim()) continue;
-      if (lineIndex === lines.length - 1) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL ends without a commit newline`);
-      let record: RunControlRecord;
-      try { record = JSON.parse(line) as RunControlRecord; } catch { throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains internal corruption`); }
-      const { checksum, ...body } = record;
-      if (record.runId !== this.runId || record.index !== expectedIndex || checksum !== checksumFor(body)) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains a corrupted committed record`);
-      records.push(record); expectedIndex += 1;
-    }
-    return records;
-  }
+  private recordsUnlocked(): RunControlRecord[] { return readRunControlRecords(this.walPath, this.runId); }
 
   records() { return this.withOperationLock(() => { this.assertLease(); return this.recordsUnlocked(); }); }
   isClosed() { return this.closed; }
@@ -366,6 +384,10 @@ export class RunControlWalStore implements RunStore {
       nodeExecutionId: executionId,
       logicalNodeExecutionId: executionId,
       recoveryAttempt: typeof started.record.payload.recoveryAttempt === 'number' ? started.record.payload.recoveryAttempt : checkpoint.recoveryAttempt,
+      ...(typeof started.record.payload.reviewCycleId === 'string' ? { reviewCycleId: started.record.payload.reviewCycleId } : {}),
+      ...(typeof started.record.payload.reviewerIndex === 'number' ? { reviewerIndex: started.record.payload.reviewerIndex } : {}),
+      ...(typeof started.record.payload.reviewerWorkerId === 'string' || typeof started.record.payload.workerId === 'string' ? { reviewerWorkerId: String(started.record.payload.reviewerWorkerId ?? started.record.payload.workerId) } : {}),
+      ...(started.record.payload.reviewerParticipant && typeof started.record.payload.reviewerParticipant === 'object' ? { reviewerParticipant: started.record.payload.reviewerParticipant as any } : {}),
     };
   }
 }

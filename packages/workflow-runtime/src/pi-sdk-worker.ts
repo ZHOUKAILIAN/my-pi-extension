@@ -242,12 +242,12 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     let durableWorkerSessionId: string | undefined;
     let durableAttemptId: string | undefined;
     if (live) {
-      const execution = capsule as { nodeExecutionId: string; workerId: string; recoveryAttempt?: number };
+      const execution = capsule as { nodeExecutionId: string; workerId: string; recoveryAttempt?: number; reviewCycleId?: string; reviewerIndex?: number; reviewerParticipant?: unknown };
       durableWorkerSessionId = randomUUID();
       durableAttemptId = randomUUID();
       // Establish logical identity and attempt before creating the Child. A
       // crash in createAgentSession therefore restores the same node attempt.
-      live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId: durableWorkerSessionId, attemptId: durableAttemptId, recoveryAttempt: execution.recoveryAttempt ?? 1, startup: true });
+      live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId: durableWorkerSessionId, attemptId: durableAttemptId, recoveryAttempt: execution.recoveryAttempt ?? 1, reviewCycleId: execution.reviewCycleId, reviewerIndex: execution.reviewerIndex, reviewerParticipant: execution.reviewerParticipant, logicalNodeExecutionId: execution.nodeExecutionId, attempt: execution.recoveryAttempt ?? 1, startup: true });
     }
     if (live) {
       const sessionDir = live.sidecarDir ?? join(live.wal.runDir, 'workers');
@@ -332,13 +332,15 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         if (liveHandle && event.type === 'agent_start') liveHandle.status = 'streaming';
         if (liveHandle && event.type === 'turn_start') {
           const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
-          const modelCallRef = `${liveHandle.workerSessionId}:turn:${turnIndex}`;
-          void live!.interaction.recordModelTurnStart(liveHandle.runId, turnIndex, modelCallRef);
-          const actual = (session as WorkerSessionLike).model;
-          if (actual) {
-            liveHandle.actualModel = { provider: String(actual.provider), id: String(actual.id) };
-            this.options.onProgress?.({ type: 'model_applied', model: liveHandle.actualModel, modelCallRef });
-          }
+          const suppliedRef = (event as WorkerEvent & { modelCallRef?: unknown }).modelCallRef;
+          const modelCallRef = typeof suppliedRef === 'string' && suppliedRef.length > 0 ? suppliedRef : `${liveHandle.workerSessionId}:turn:${turnIndex}`;
+          void live!.interaction.recordModelTurnStart(liveHandle.runId, turnIndex, modelCallRef).then((turn) => {
+            const actual = (session as WorkerSessionLike).model;
+            if (actual) liveHandle!.actualModel = { provider: String(actual.provider), id: String(actual.id) };
+            // This progress event is a state transition, not a snapshot of the
+            // model on every turn. Do not claim model_applied without a request.
+            if (turn?.appliedModel) this.options.onProgress?.({ type: 'model_applied', model: turn.appliedModel, modelCallRef });
+          });
         }
         if (liveHandle && event.type === 'agent_settled') liveHandle.status = 'idle';
         if (event.type === 'tool_execution_start') {
@@ -361,7 +363,9 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         }
         if (liveHandle && event.type === 'turn_end' && event.message?.role === 'assistant' && !event.message.errorMessage) {
           const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
-          void live!.interaction.recordModelCallCompleted(liveHandle.runId, `${liveHandle.workerSessionId}:turn:${turnIndex}`);
+          const suppliedRef = (event as WorkerEvent & { modelCallRef?: unknown }).modelCallRef;
+          const modelCallRef = typeof suppliedRef === 'string' && suppliedRef.length > 0 ? suppliedRef : `${liveHandle.workerSessionId}:turn:${turnIndex}`;
+          void live!.interaction.recordModelCallCompleted(liveHandle.runId, modelCallRef);
         }
         if (event.type === 'agent_end') {
           const assistant = Array.isArray(event.messages)

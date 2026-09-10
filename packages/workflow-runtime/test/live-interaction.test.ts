@@ -145,6 +145,35 @@ test('turn_start binds the queued supplement; a late or unrelated message_end re
   wal.releaseLease();
 });
 
+test('an artifact completed on turn 1 is never rebound to a later supplement after a failed steer', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-causal-order-'));
+  const wal = RunControlWal.open('fix-live', { rootDir: root });
+  const registry = new ActiveWorkerRegistry();
+  let failSteer = false;
+  const session = {
+    isStreaming: true,
+    model: { provider: 'p', id: 'm' },
+    steer: async (text: string) => { if (failSteer) throw new Error(`steer failed: ${text}`); },
+    prompt: async () => {},
+  };
+  const port = new WorkflowInteractionPort(registry);
+  const worker = handle(wal, session, port);
+  registry.register(worker as any);
+  const first = await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, text: 'first fact' });
+  await port.recordModelTurnStart('fix-live', 1, 'child-1:turn:1');
+  const firstArtifact = await port.bindArtifact('fix-live', { kind: 'investigation', route: 'local_fix', rootCause: 'first', evidence: ['trace'] });
+  await port.recordModelCallCompleted('fix-live', 'child-1:turn:1');
+  failSteer = true;
+  const second = await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, text: 'second fact' });
+  assert.equal(second.state, 'delivery_failed');
+  const bound = wal.records().filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound');
+  assert.equal(bound.length, 1);
+  assert.equal(bound[0]!.payload.supplementId, first.supplementId);
+  assert.equal(bound[0]!.payload.artifactRevisionId, (firstArtifact as any).artifactRevisionId);
+  await assert.rejects(port.closeWorker('fix-live'), /lack a completed model call/);
+  wal.releaseLease();
+});
+
 test('restore projects a pre-Child review identity from the durable startup record', () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-review-startup-'));
   const wal = RunControlWal.open('fix-review-startup', { rootDir: root });
@@ -177,6 +206,28 @@ test('model changes are applied only at turn_start, use the reported model, and 
   wal.releaseLease();
 });
 
+test('model requests fold by requestId and close creates only one terminal state per request', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-model-fold-'));
+  const wal = RunControlWal.open('fix-live', { rootDir: root });
+  const registry = new ActiveWorkerRegistry();
+  const session: any = { model: { provider: 'p', id: 'old' }, isStreaming: false, steer: async () => {}, prompt: async () => {}, setModel: async (model: any) => { session.model = model; } };
+  const worker = handle(wal, session, undefined as any);
+  const port = new WorkflowInteractionPort(registry, () => [
+    { ref: 'p/a', model: { provider: 'p', id: 'a', api: 'anthropic-messages', input: ['text'] } as any },
+    { ref: 'p/b', model: { provider: 'p', id: 'b', api: 'anthropic-messages', input: ['text'] } as any },
+  ]);
+  registry.register(worker as any);
+  const a = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, modelRef: 'p/a' });
+  const b = await port.requestModelChange({ runId: 'fix-live', expectedNodeExecutionId: worker.nodeExecutionId, modelRef: 'p/b' });
+  await port.recordModelTurnStart('fix-live', 1, 'child-1:turn:1');
+  const afterTurn = wal.records().filter((record) => record.type === 'worker' && record.payload.kind === 'model_change');
+  for (const requestId of [a.requestId, b.requestId]) assert.equal(afterTurn.filter((record) => record.payload.requestId === requestId && ['applied', 'failed', 'not_applied'].includes(String(record.payload.state))).length, 1);
+  await port.closeWorker('fix-live');
+  const afterClose = wal.records().filter((record) => record.type === 'worker' && record.payload.kind === 'model_change');
+  assert.equal(afterClose.filter((record) => record.payload.state === 'not_applied').length, 0);
+  wal.releaseLease();
+});
+
 test('a starting owner intercepts without committing a sequence and a publication gap stores only edited content', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-publication-gap-'));
   const wal = RunControlWal.open('fix-live', { rootDir: root });
@@ -197,6 +248,16 @@ test('a starting owner intercepts without committing a sequence and a publicatio
   wal.releaseLease();
 });
 
+test('sidecar refs survive a renderer reload and retain Unicode text', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-sidecar-reload-'));
+  const wal = RunControlWal.open('fix-sidecar', { rootDir: root });
+  const sidecar = new WorkerSidecar(wal.runDir);
+  sidecar.append({ ref: 'opaque-ref', runId: 'fix-sidecar', nodeId: 'investigate', eventKind: 'visible_text', text: '修复 ✅ café', occurredAt: new Date().toISOString() });
+  const reloaded = WorkerSidecar.openExisting(wal.runDir);
+  assert.equal(reloaded?.get('opaque-ref')?.text, '修复 ✅ café');
+  wal.releaseLease();
+});
+
 test('GC uses terminal Run state and tombstone rename rather than constructor-time sidecar unlink', () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-gc-'));
   const wal = RunControlWal.open('fix-gc', { rootDir: root });
@@ -206,6 +267,7 @@ test('GC uses terminal Run state and tombstone rename rather than constructor-ti
   wal.releaseLease();
   assert.equal(WorkerSidecar.gc(root, Date.now(), 0, 0), 1);
   assert.deepEqual(RunControlWal.list(root), []);
+  assert.throws(() => RunControlWal.open('fix-gc', { rootDir: root }), (error: unknown) => (error as { code?: string }).code === 'RUN_TOMBSTONED');
 });
 
 test('a new Node reopens the WAL target without reusing the old Worker', () => {
