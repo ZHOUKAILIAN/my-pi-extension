@@ -970,7 +970,7 @@ export class WorkflowRuntime {
   async executeNode(
     node: NodeDefinition,
     task: unknown,
-    opts: { context?: Capsule | (() => Capsule); nodeExecutionId?: string; recoveryAttempt?: number; reviewerIndex?: number; reviewCycleId?: string; reviewerParticipant?: ReviewParticipant } = {},
+    opts: { context?: Capsule | (() => Capsule); nodeExecutionId?: string; recoveryAttempt?: number; reviewerIndex?: number; reviewCycleId?: string; reviewerParticipant?: ReviewParticipant; /** Review participants commit Artifact + cursor in runReview's single durable checkpoint. */ deferReviewCheckpoint?: boolean } = {},
   ): Promise<{ artifact: Artifact; execution: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number } }> {
     const nodeExecutionId = opts.nodeExecutionId ?? this.createNodeExecutionId(node.id);
     const recoveryAttempt = opts.recoveryAttempt ?? 1;
@@ -1125,20 +1125,16 @@ export class WorkflowRuntime {
       { artifactId: stamped.id ?? stamped.kind, kind: stamped.kind },
       { nodeId: node.id, nodeExecutionId, workerId, candidateRevision: this.candidateRevision },
     );
-    // A reviewer Artifact is a recovery fact before the whole review has a
-    // transition checkpoint. Persist it immediately so a crash after
-    // session_settled cannot make the next resume rerun a completed voter.
-    if (opts.reviewCycleId !== undefined && opts.reviewerIndex !== undefined) {
-      this.store.saveCheckpoint({
-        schemaVersion: 1, runId: this.runId, stage: this.stage, at: this.clock(), id: this.idGen(),
-        problem: this.problem, started: true, workflowVersion: this.definitionVersion ?? this.definition.sourceVersion,
-        policyDigest: this.policyDigest, sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
-        activeNodeId: node.id, nodeExecutionId, logicalNodeExecutionId: nodeExecutionId, recoveryAttempt,
-        reviewCycleId: opts.reviewCycleId, reviewerIndex: opts.reviewerIndex, reviewerParticipant: opts.reviewerParticipant, reviewerWorkerId: workerId,
-        artifacts: this.artifacts,
-        ...(this.reviewCycles.length ? { reviewCycles: this.reviewCycles } : {}),
-        ...(this.reviewProgress ? { reviewProgress: this.reviewProgress } : {}),
-      });
+    // Review participants use a deferred commit: runReview appends exactly one
+    // durable checkpoint containing this Artifact, the next-participant cursor,
+    // and the cleared activeReviewAttempt. Keeping a write here would create
+    // the executeNode -> runReview persistence window that can lose the cursor
+    // or force a completed reviewer to run again after recovery.
+    if (opts.reviewCycleId !== undefined && opts.reviewerIndex !== undefined && !opts.deferReviewCheckpoint) {
+      throw new WorkflowRuntimeError(
+        'REVIEW_CHECKPOINT_COMMIT_REQUIRED',
+        'review participant persistence must be committed by runReview with its cursor',
+      );
     }
     return { artifact: stamped, execution };
   }
@@ -1269,6 +1265,7 @@ export class WorkflowRuntime {
         reviewerIndex,
         reviewCycleId,
         reviewerParticipant: policy.reviewers[reviewerIndex],
+        deferReviewCheckpoint: true,
         context: { ...reviewerContext, reviewedNodeId: opts.reviewedNodeId, reviewCycleId },
       });
       if (artifact.kind !== opts.reviewArtifactKind) {
@@ -1277,9 +1274,11 @@ export class WorkflowRuntime {
       reviewArtifacts.push(artifact);
       reviewerWorkerIds.push(execution.workerId);
       ratedArtifacts.push({ artifactId: (artifact.id as string | undefined) ?? artifact.kind, workerId: execution.workerId, accepted: satisfiesReview(policy, artifact) });
-      // This is a participant-level WAL checkpoint. The Artifact was already
-      // persisted by executeNode; this second record persists the cycle cursor
-      // so recovery knows exactly which reviewer is next.
+      // Participant commit boundary: one durable checkpoint/WAL record contains
+      // the newly stamped Artifact and the cursor. activeReviewAttempt was
+      // cleared by executeNode after the Worker settled, and is deliberately
+      // absent from this same record. Recovery therefore either sees neither
+      // fact, or sees both facts; it never reconstructs a completed reviewer.
       this.reviewProgress = {
         cycleId: reviewCycleId, reviewNodeId, reviewArtifactKind: opts.reviewArtifactKind, reviewedNodeId: opts.reviewedNodeId,
         requiredApprovals: policy.requiredApprovals, reviewerWorkerIds: [...reviewerWorkerIds],

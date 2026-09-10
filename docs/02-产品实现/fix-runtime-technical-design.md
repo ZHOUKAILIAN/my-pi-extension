@@ -1,7 +1,7 @@
 # Fix Runtime 技术设计（L2 目标设计与当前实现）
 
 - 层级：第二层（L2）
-- 状态：`DECIDED`（§6.1 运行中统一对话机制已实现；真实 provider/长时 TUI 与进程级崩溃回放仍未验证）
+- 状态：`DECIDED`（§6.1 运行中统一对话机制已实现；上轮锁定 Pi `0.84.2` 的 provider CLI smoke 成功；长时 TUI/PTY picker 与进程级崩溃回放仍未验证）
 - 上游：[Fix Extension 产品规范](../01-产品定义/扩展/fix-扩展.md)
 
 > L1 定义 Fix 必须保证什么；本文定义 Runtime 怎样把这些保证落成可执行的 Stage、Node、Policy、Artifact、Guard、验证和恢复机制。源码与测试仍是当前运行事实；尚未实现的目标在文中明确标注。
@@ -842,7 +842,7 @@ Pi 原生 `/resume` 负责选择并恢复历史 session。Fix 不注册自己的
 
 ### 6.1 执行中统一对话协作（机制已实现，运行验证未完成）
 
-`PiSdkWorkerExecutor.execute()` 仍在每个 Node attempt 创建 `SessionManager.inMemory()`，Session 在 Node 完成后释放；但执行期间由 `ActiveWorkerRegistry` 暴露受控 handle，`WorkflowInteractionPort` 可将输入路由到当前 Child 的 `steer()` / `prompt()`，模型 picker 也只作用于该 Child。外层重试创建的是同一逻辑 Node 的新 attempt，不冒充恢复原 Worker Session。自动化覆盖 Pi 0.84.2 ExtensionRunner、队列重入、生命周期 fail-closed 和模型/输入身份 fence；真实 provider、长时 TUI/PTY 和进程级崩溃 replay 仍未验证。
+`PiSdkWorkerExecutor.execute()` 仍在每个 Node attempt 创建 `SessionManager.inMemory()`，Session 在 Node 完成后释放；但执行期间由 `ActiveWorkerRegistry` 暴露受控 handle，`WorkflowInteractionPort` 可将输入路由到当前 Child 的 `steer()` / `prompt()`，模型 picker 也只作用于该 Child。外层重试创建的是同一逻辑 Node 的新 attempt，不冒充恢复原 Worker Session。评审 participant 完成时，Runtime 在同一个 durable checkpoint/WAL record 中写入 Artifact、`reviewProgress.nextReviewerIndex`/quorum 事实并清除 `activeReviewAttempt`；恢复从已提交 cursor 继续，不重跑已完成 Reviewer。自动化覆盖该边界、Pi 0.84.2 ExtensionRunner、队列重入、生命周期 fail-closed 和模型/输入身份 fence；上轮 provider CLI smoke 已成功，但长时 TUI/PTY 和进程级崩溃 replay 仍未验证。
 
 实现保持 Workflow 控制权不变：`/fix` 持久化启动事实并建立首个 Worker 后由 Extension 管理运行句柄；`input` hook 在存在当前 Worker 时处理普通输入，避免进入主 Session pending queue。Worker 事件原文写入受保护 UI sidecar，parent entry 只写 opaque ref 并由 renderer 投影回原对话，不触发主 Agent 推理；`session_shutdown` best-effort 停止接收新输入并清理后台任务；控制恢复依赖此前已 fsync 的 WAL，而不假设 shutdown 一定完成保存：
 
@@ -913,7 +913,7 @@ Extension 自有 Run Control WAL 是补充原文、投递事件、close fence �
 
 进程内 `submitSupplement` 与 `closeWorker` 还在同一互斥区按追加顺序线性化，sequence 分配和记录写入不可分离。`close_fence` record 一旦追加并 fsync，后续提交只能生成 rejected attempt，不得再分配 sequence；崩溃恢复按校验通过的最后完整 record 重放，截断尾部半写记录。
 
-WAL 绑定 `parentSessionId`、`parentLeafId`、parent session file 和 cwd digest。正常恢复校验完整 active branch，不用 `getEntries()` sibling tree或 `buildContextEntries()` compaction view重建控制事实；若父 Session 文件已明确不存在，只能在同 cwd 向用户展示原 Run 并经确认后重绑新 Session；同 cwd 的其他 Session 不得自动接管，非 UI host 对 orphan fail-closed。状态只追加、不覆盖：提交先生成 `submissionAttemptId`；只有在 close fence 前完成 WAL commit 才分配 `supplementId` 和连续 sequence 并追加 `recorded`。fence 后追加不含 supplementId/sequence 的 `rejected_after_fence` UI 事实并保存待重试文本，不能造成版本跳号。`recorded` 表示 Run WAL 已耐久接收；`enqueue_accepted` 只表示 Pi prompt preflight/queue 接受，不等于模型已看到；后续绑定该 supplement 的模型调用产生终态 assistant message后追加 `model_call_completed`；每次 `turn_start` 另追加不可变 `model_call_snapshot`，以 WAL/Worker 的单调最大值持久化累计 `supplementVersion`、`modelCallRef` 和 opaque `contextRef`，因此消费 pending supplement 后版本不会回退；新 Artifact revision 的 `supplementVersion`/`supplementContextRef` 覆盖该连续序列后追加 `artifact_bound`。失败追加新事件保留历史。
+WAL 绑定 `parentSessionId`、`parentLeafId`、parent session file 和 cwd digest。正常恢复校验完整 active branch，不用 `getEntries()` sibling tree或 `buildContextEntries()` compaction view重建控制事实；只有 header 明确 `parentSessionFileExists=false`、原 parent file 仍不可发现且 cwd 相同，才在 UI 明确确认后允许把 Run rebind 到不同的新 Session ID；header 显示过已有文件的 Run、其他仍存在 Session 的 Run 和非 UI host 对 orphan 均 fail-closed。状态只追加、不覆盖：提交先生成 `submissionAttemptId`；只有在 close fence 前完成 WAL commit 才分配 `supplementId` 和连续 sequence 并追加 `recorded`。fence 后追加不含 supplementId/sequence 的 `rejected_after_fence` UI 事实并保存待重试文本，不能造成版本跳号。`recorded` 表示 Run WAL 已耐久接收；`enqueue_accepted` 只表示 Pi prompt preflight/queue 接受，不等于模型已看到；后续绑定该 supplement 的模型调用产生终态 assistant message后追加 `model_call_completed`；每次 `turn_start` 另追加不可变 `model_call_snapshot`，以 WAL/Worker 的单调最大值持久化累计 `supplementVersion`、`modelCallRef` 和 opaque `contextRef`，因此消费 pending supplement 后版本不会回退；新 Artifact revision 的 `supplementVersion`/`supplementContextRef` 覆盖该连续序列后追加 `artifact_bound`。失败追加新事件保留历史。
 
 旧 `workflow-run` parent entry 迁移遵守单一切换点：只从当前 active branch 选择一个通过旧 schema 校验的最新未完成 checkpoint，以 `(parentSessionId, sourceEntryId, runId, sourceChecksum)` 为导入键；先写临时 WAL generation、校验并 fsync 文件，再原子 rename/fsync 目录。rename 完成前旧 entry 仍是唯一事实且不得启动 Worker；完成后 WAL header 记录 `migrated_from`，Runtime 只从 WAL 推进，不再 dual-write或从 parent entry恢复。相同导入键重复执行直接复用，source 冲突、未知版本或导入失败均 fail-closed。历史 parent entry 不重写，可能继续被 Pi export/share；迁移 UI 必须提示这是 legacy Session 数据边界，但新补充原文和 Child 输出不再写入 parent entry。
 
@@ -1267,7 +1267,7 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 ### TODO 跟踪
 
 - [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_ARTIFACT_KINDS` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
-- [x] **统一对话 Worker 协作机制（第一版）**：后台 Run、Active Worker Registry、Extension Run Control WAL、原输入框补充生命周期/close fence、Child 专用模型 picker 和恢复机制已实现；真实 provider、长时 Pi TUI/PTY 与进程级 crash replay E2E 仍待验证，不得以自动化测试替代
+- [x] **统一对话 Worker 协作机制（第一版）**：后台 Run、Active Worker Registry、Extension Run Control WAL、原输入框补充生命周期/close fence、Child 专用模型 picker 和恢复机制已实现；participant 单 checkpoint 恢复和 no-file 不同 Session ID rebind 已有自动化证据。上轮锁定 Pi `0.84.2` 的 provider CLI smoke 成功；长时 Pi TUI/PTY picker 与进程级 crash replay E2E 仍未做，不得以 smoke 或自动化测试替代
 - [ ] **5 步公开漏斗合入（第一版）**：合入 `feat/fix-metrics-cloudflare` 分支（§7.7 公共漏斗、公开 API 与低样本保护）
 - [ ] **L2 §7.1–7.6 文档收敛（第一版）**：标注为已归档目标，或以 L2 内容重写归档件（原件已丢失，见 README drift 表）；仅 §7.7 保持第一版活跃目标设计
 - [ ] **最终处置报告完整模板（后续优化）**：扩展 `investigation` / `verification` / `disposition` 合同字段并重写渲染；方案与评审见归档评审件《2026-08-29-fix-报告重构-方案与评审》

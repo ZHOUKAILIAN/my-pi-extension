@@ -204,15 +204,16 @@ export class LiveFixRunManager {
         const parentMatches = parent.parentSessionId === currentSessionId
           && typeof parent.parentLeafId === 'string'
           && (parent.parentLeafId === currentLeafId || activeBranchIds.has(parent.parentLeafId));
-        // A no-file run can only be offered back to the same logical parent
-        // session. In particular, a missing file must not make a newer run in
-        // another still-existing session look like an orphan candidate.
+        // A no-file run may be offered for an explicit UI-confirmed rebind
+        // even when the current Session ID differs. This exception is narrow:
+        // the header must say the parent file did not exist at first persist,
+        // the original path must still be undiscoverable, and the cwd must
+        // already match. A header that claimed an existing file is never
+        // treated as an orphan merely because that file is missing now.
         const originalParentFile = header.parentSessionFile;
-        const headerFileMissing = header.parentSessionFileExists === false
-          || (typeof originalParentFile === 'string' && originalParentFile.length > 0 && !existsSync(originalParentFile));
-        const orphan = !rebind
-          && headerFileMissing
-          && header.parentSessionId === currentSessionId;
+        const noDiscoverableParentFile = header.parentSessionFileExists === false
+          && (typeof originalParentFile !== 'string' || originalParentFile.length === 0 || !existsSync(originalParentFile));
+        const orphan = !rebind && noDiscoverableParentFile;
         const store = parentMatches ? this.openStore(ctx, runId) : undefined;
         candidates.push({ runId, checkpoint, parentMatches, orphan, store });
       } catch { /* active, tombstoned or corrupt runs are not silently selected */ }
@@ -1487,7 +1488,11 @@ export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandC
   const liveCandidate = live && !injected ? live.latestStore(ctx) : undefined;
   const checkpoint = liveCandidate?.checkpoint ?? store.latestUncompleted();
   if (!checkpoint || !checkpoint.problem) { try { liveCandidate?.store?.wal.releaseLease(); } catch { /* best effort */ } return; }
-  if (!ctx.hasUI || !(await ctx.ui.confirm('恢复 fix 工作流', `${checkpoint.problem}\n当前阶段：${checkpoint.stage}`))) { try { liveCandidate?.store?.wal.releaseLease(); } catch { /* best effort */ } return; }
+  const recoveryTitle = liveCandidate && !liveCandidate.parentMatches ? '恢复并重新绑定 fix 工作流' : '恢复 fix 工作流';
+  const recoveryDetail = liveCandidate && !liveCandidate.parentMatches
+    ? `${checkpoint.problem}\n当前阶段：${checkpoint.stage}\n原父 Session 文件不可发现，将在当前会话中重新绑定。`
+    : `${checkpoint.problem}\n当前阶段：${checkpoint.stage}`;
+  if (!ctx.hasUI || !(await ctx.ui.confirm(recoveryTitle, recoveryDetail))) { try { liveCandidate?.store?.wal.releaseLease(); } catch { /* best effort */ } return; }
   try { liveCandidate?.store?.wal.releaseLease(); } catch { /* reacquire through the binding below */ }
   // A WAL whose original parent is gone is recoverable only after this same
   // ordinary resume confirmation. The runId stays internal; it is never a

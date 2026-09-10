@@ -80,7 +80,7 @@ type WorkflowNodeDefinition = {
 
 ## Node Execution 生命周期
 
-以下生命周期是当前 L2 执行机制；源码和测试覆盖 Worker 创建、Artifact 校验、participant 级评审 checkpoint、迁移和有限重试。真实 provider 长时运行与进程级崩溃仍需独立验证：
+以下生命周期是当前 L2 执行机制；源码和测试覆盖 Worker 创建、participant 的 Artifact+cursor 单 checkpoint、迁移和有限重试。上轮锁定 Pi 0.84.2 的 provider CLI smoke 成功；长时 provider/TUI 运行、PTY picker 和进程级崩溃仍需独立验证：
 
 ```mermaid
 flowchart TD
@@ -171,7 +171,7 @@ flowchart TD
 
 ### 运行中统一对话适配
 
-该机制已实现为 Extension 内的适配层；它不是独立进程或 OS sandbox，tmux、独立窗口和子终端也不属于产品依赖。自动化覆盖交互队列和 Pi 0.84.2 ExtensionRunner，但真实 provider 长时 TUI、PTY picker 稳定性和进程级崩溃恢复仍属于未验证边界。
+该机制已实现为 Extension 内的适配层；它不是独立进程或 OS sandbox，tmux、独立窗口和子终端也不属于产品依赖。上轮已在锁定的 Pi 0.84.2 上完成 provider CLI smoke；自动化覆盖交互队列和 ExtensionRunner，但真实 provider 长时 TUI、PTY picker 稳定性和进程级崩溃恢复仍属于未验证边界。
 
 ```mermaid
 flowchart LR
@@ -199,7 +199,7 @@ Extension 自有 append-only Run Control WAL 是补充、投递事件、close fe
 
 现有未完成 `workflow-run` parent checkpoint 只允许从当前 active branch 幂等导入：临时 WAL generation 完整写入并 fsync、原子 rename及目录 fsync成功前，旧 checkpoint 仍是唯一事实且不得启动 Worker；成功后 WAL header 记录 source entry/checksum，Runtime 只从 WAL 推进，不 dual-write。冲突、未知版本或导入失败 fail-closed。历史 parent entry 不重写且可能被 Pi export/share，但新补充原文/Child 输出不再写入。
 
-Run Control WAL 绑定 `parentSessionId`、开始时的 `parentLeafId` 和 cwd digest。恢复读取完整 WAL，不使用 compaction-aware context；父 Session/branch 存在时校验当前 active branch，父 Session 在首次持久化前崩溃丢失时只允许在同 cwd 经用户确认把未完成 Run 重新绑定到新 Session，并保留原 runId/父引用。投递采用 at-least-once：每条 `supplementId` 在 Worker 上下文中去重；无法证明消费时，只能自动交给同一逻辑 Node Execution 的恢复 attempt并明确展示/审计，跨 Node或待用户决定状态必须保留内容并由用户面向新接收者再次提交。
+Run Control WAL 绑定 `parentSessionId`、开始时的 `parentLeafId` 和 cwd digest。恢复读取完整 WAL，不使用 compaction-aware context；只有 header 明确 `parentSessionFileExists=false` 且原 parent file 不可发现时，才在同 cwd 经 UI 明确确认把未完成 Run 重新绑定到不同的新 Session，并保留原 runId/父引用；header 曾显示已有文件的 Run、其他仍存在 Session 的 Run 和无 UI 场景不进入该 orphan rebind 路径。投递采用 at-least-once：每条 `supplementId` 在 Worker 上下文中去重；无法证明消费时，只能自动交给同一逻辑 Node Execution 的恢复 attempt并明确展示/审计，跨 Node或待用户决定状态必须保留内容并由用户面向新接收者再次提交。
 
 模型选择由 Workflow UI 自有、无额外命令的 picker 承载，不调用或回滚主 Session 的内建 `/model`。Workflow 自定义 editor 使用注入的 keybindings manager 条件接管 `app.model.select`/cycle：有当前 Worker 时打开 Child picker，无 Worker 时委托原 editor；状态区持续显示当前接收者和 key hint。picker 打开时绑定 `nodeExecutionId`，确认时重新校验目标未变；候选来自 Pi scoped/available 且已认证模型，并由 Runtime 检查当前 Worker 所需工具/schema兼容性。项目 Node `model` 是默认模型，不是第一版候选 allowlist；若未来需要限制集合，必须扩展版本化 Policy schema。Child 注入独立 `SettingsManager.inMemory()`，避免旧 Pi `setModel()` 改写全局默认。
 
@@ -308,4 +308,4 @@ GC 与 writer 使用同一外部 operation lock。扫描快照后、原子 tombs
 
 非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, expectedWorkerSessionId, expectedAttemptId, modelRef})` 和带 sequence/status 的事件流。模型 picker 的四元身份 fence（Run、Node Execution、Worker Session、Attempt）在队列内重检，目标变化时 fail-closed。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
 
-当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试、WAL 和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。`LiveFixRunManager` 在 Node 执行期间维护可寻址 Registry，主输入通过 `WorkflowInteractionPort` 进入当前 Child，模型 picker 只改变当前 Worker 且以 Run/Node/Session/Attempt fence 校验；Worker 完成后句柄仍会释放，不能把它描述成独立后台进程。`session_shutdown` 只 best-effort停止接收并完成已开始的 WAL commit，缺少终态时由 WAL 恢复为可确认的 interrupted attempt。当前自动测试已覆盖这些机制；真实 provider、长时 TUI/PTY 和进程级 crash replay 尚未通过。
+当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试、WAL 和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。评审 participant 完成使用同一 durable checkpoint 写 Artifact、quorum cursor 并清除 active attempt，恢复保留已完成 participant。`LiveFixRunManager` 在 Node 执行期间维护可寻址 Registry，主输入通过 `WorkflowInteractionPort` 进入当前 Child，模型 picker 只改变当前 Worker 且以 Run/Node/Session/Attempt fence 校验；Worker 完成后句柄仍会释放，不能把它描述成独立后台进程。`session_shutdown` 只 best-effort停止接收并完成已开始的 WAL commit，缺少终态时由 WAL 恢复为可确认的 interrupted attempt。上轮 provider CLI smoke 成功；真实 provider 长时 TUI/PTY 和进程级 crash replay 尚未通过。

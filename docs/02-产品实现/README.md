@@ -32,7 +32,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 - Runtime 通过 Pi SDK 创建独立 `AgentSession` 承载 Worker Session；这隔离对话历史，但不等同于进程、文件系统或 OS sandbox。
 - 当前 Worker Session 仍由 `PiSdkWorkerExecutor.execute()` 创建并在 Node 完成后释放；Extension 通过 `ActiveWorkerRegistry` 在执行期间寻址当前 Child，并用 `WorkflowInteractionPort` 路由输入、模型切换和事件。Child 运行句柄不是独立进程，WAL 才是 Run 控制事实；真实 TUI 长时间运行、宿主退出时序和跨进程崩溃回放尚未被 provider E2E 证明。
 - 实时交互已实现：输入按 Run/Node/Session/Attempt 复核，补充在 WAL 中分配 sequence；`turn_start` 建立累计 supplement snapshot，`turn_end` 与 `bindArtifact` 在同一队列线性化，`prompt`/`steer` 的等待在队列外执行以允许 Pi 回调重入；close fence 后 fail-closed。`PiSessionRunStore` 在 Pi API 可用时使用完整 `getBranch`，只投影当前 active branch；Run Control WAL 的 `loadLast()` 另按 Child lifecycle 折叠恢复。
-- Parent 恢复允许 header leaf 是当前 session active branch 的 ancestor/member；header 保存 parent session file path/existence。首次落盘时 parent file 不存在的同一 parent identity 可在用户确认后 rebind；仍存在的其他 session 不会被扫描选择。
+- Parent 恢复允许 header leaf 是当前 session active branch 的 ancestor/member；header 保存 parent session file path/existence。仅当 header 明确 `parentSessionFileExists=false`、原 parent file 仍不可发现且 cwd 相同时，UI 才会展示 Run 并在明确确认后允许以不同的新 Session ID rebind；header 曾显示已有文件的 Run、其他仍存在 Session 的 Run 和无 UI 场景均不进入 no-file orphan 接管。
 - Controller 拥有状态迁移、Artifact 合同校验、有限重试、checkpoint 恢复和 `traceId` 审计；Worker 不能授权下一状态。
 - v2 流水线以 `fixDefinitionV2`（8 阶段 `INTAKE`→`INVESTIGATING`→`DISPOSITION`→`IMPLEMENTING`→`VERIFYING`→`WAITING_FOR_USER`→`ACCEPTED`，`BLOCKED` 侧支）驱动：`prepareRun`/`continueRun` 在 `packages/fix/src/extension-v2.ts`，Worker 经 `executeNode` 盖章归档，评审经 `runReview`（quorum + 独立 Worker 身份），人工验收经 `collectDecision` + `evaluateAcceptance` + `decide`，项目级 `.pi/workflow.json` 策略经 `loadEffectivePolicy`，`/fix review` 提供评审命令，`session_start(resume)` 提供恢复。
 - 无仓库变更路径（`disposition.requiresRepositoryChange === false`）：常规处置直接 `DISPOSITION`→`VERIFYING`，不经过 `IMPLEMENTING` 与 `change_review`；处置等待（`dispositionType` 为 `wait_decision`/`external_action`）先停 `WAITING_FOR_USER`（`pendingDecisionKind` 区分 `disposition_decision`/`external_action_completion`），用户决定/外部动作完成后由 `continue_disposition` 回 `DISPOSITION`（重落地处置）或 `VERIFYING`（外部动作完成证据）。
@@ -62,7 +62,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 | 未覆盖项可“明确披露且不影响接受决定”时允许通过 | `FIX_VERIFICATION_REQUIREMENT.allowUnverified: false`，存在 unverified 即拒绝（更保守；策略可配置） | 保持保守默认，如需放宽按风险等级调整策略 | 无需修改（严于 L1 下限，合规） |
 | Fix 业务提交合同（每 Node 的 `submissionContract` 文本、`submit_artifact` 的 per-kind schema 绑定与 fallback 语义）是 Fix Extension 拥有的业务逻辑 | 仍在通用 `packages/workflow-runtime` 的 `pi-sdk-worker.ts`（per-kind schema 本体已由 contracts 单一定义表派生并导出，但 `submissionContract` 文本与 schema 绑定/fallback 的消费点仍在 shared Runtime） | 后续迭代：与 Fix 门禁 owner 重构同一专项，将 `submissionContract`/节点绑定迁回 `packages/fix` 或改为 WorkflowDefinition 显式 hook；当前如实记录 owner drift，不声称已迁回 | 第一版（待重构；与 Fix 门禁同一重构专项） |
 | Feature 有 L1 产品规范 | 尚无 Feature package 或 Workflow Definition | 实现前先以 L1 规范作为输入完成 L2 设计 | Feature 专项（非 Fix 第一版；启动前应先完成 Fix owner 重构） |
-| 执行中统一对话协作：原对话补充、当前 Worker 展示、Child picker、close fence 和后续 Worker 继承 | `LiveFixRunManager`、`ActiveWorkerRegistry`、`WorkflowInteractionPort`、Run Control WAL、`LiveWorkerEditor` 已实现；编辑器代理同步 delegated editor 的 focus/CURSOR_MARKER，并保留原 editor 优先级。`/fix review` 仍保留为等待/诊断兼容入口 | 已有自动化回归（真实 0.84.2 ExtensionRunner、prompt 回调重入、WAL lifecycle、branch/orphan、GC fault injection）；仍缺真实 provider + 长时 TUI/PTY 和真实进程崩溃证据，不能把自动测试等同于生产 TUI 已验证 | 第一版（机制已实现，运营验证未完成） |
+| 执行中统一对话协作：原对话补充、当前 Worker 展示、Child picker、close fence 和后续 Worker 继承 | `LiveFixRunManager`、`ActiveWorkerRegistry`、`WorkflowInteractionPort`、Run Control WAL、`LiveWorkerEditor` 已实现；participant 恢复已修复为 Artifact + review cursor + 清除 active attempt 的单 checkpoint 提交；no-file orphan 仅在 header 明确无 parent file、原路径不可发现、同 cwd 且 UI 明确确认时允许不同新 Session ID rebind。`/fix review` 仍保留为等待/诊断兼容入口 | 上轮已锁定 Pi `0.84.2`，provider CLI smoke 成功；本轮自动化补了 participant 边界故障注入、no-file 不同 Session ID 和 Focus/CURSOR_MARKER。长时 TUI/PTY picker E2E、真实进程崩溃回放仍未做，不能把 smoke 或自动化等同于完整生产 E2E | 第一版（机制已实现，运营验证未完成） |
 | Context / Capability Isolation 分层治理 | 当前主要是 Session、tools、skills scope | 继续验证文件系统、网络和 shell 的真实边界 | 持续验证 |
 | L1 指标收敛为 5 步公开漏斗（第一版），完整指标体系与完整事件表已声明归档 | `fix-runtime-technical-design.md` §7.1–7.6 仍以目标设计承载已归档的完整指标体系（完整事件枚举、质量指标、自动化准入），与 §7.7（第一版公共漏斗）并存；5 步漏斗与公开 API 已在 `feat/fix-metrics-cloudflare` 分支（独立 worktree）实现，待合入；原归档件《2026-08-28-fix-automation-evolution-metrics.md》在本地清理中丢失、未进入 Git 历史，内容留存于 L2 §7.1–7.6 | 第一版（文档）：§7.1–7.6 标注为已归档目标或裁剪至重写归档件（以 L2 内容为基础），仅 §7.7 为第一版活跃目标设计；metrics 分支合入后更新实现状态 | 第一版（文档 + 分支合入） |
 
@@ -92,9 +92,9 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 
 | 范围 | 当前事实 | 未覆盖 |
 | --- | --- | --- |
-| 自动化 | `npm test` 已覆盖 0.84.2 ExtensionRunner fail-closed lifecycle、prompt/steer 交互重入、WAL session fold、participant 级 quorum 恢复、active-branch/orphan parent 恢复、delegated editor focus/CURSOR_MARKER、parent_rebind GC 与 trash 重试 | 不替代真实 provider、长时间 TUI、终端尺寸变化和进程级崩溃/恢复 |
-| TUI | `LiveWorkerEditor` 使用 Pi 0.84.2 keybinding、Focusable 和 cursor marker 合同；无 Worker 时委托原 editor，有 Worker 时只接管模型 picker 键 | 尚无稳定的真实 PTY picker E2E 证据 |
-| Provider | 当前仓库没有可提交的真实凭证或 provider fixture；真实 provider 运行不能在 CI/本地默认测试中声称通过 | 需要临时 fixture、隔离 agent dir、PTY 和用户明确提供的认证条件；测试产物不得进 Git |
+| 自动化 | `npm test` 已覆盖 participant 单 checkpoint/quorum 恢复、active-branch/no-file parent 恢复、delegated editor focus/CURSOR_MARKER、0.84.2 ExtensionRunner fail-closed lifecycle、prompt/steer 交互重入和 GC fault injection | 自动化不替代长时 TUI、PTY picker 或进程级崩溃/恢复 |
+| Provider | 上轮在锁定的 Pi `0.84.2` 上完成 provider CLI smoke；该结果只证明 CLI 接缝可运行 | 长时 TUI/PTY picker E2E 和完整真实 provider 工作流尚未做；默认测试不携带真实凭证，不能据此声称完整 provider E2E |
+| TUI | `LiveWorkerEditor` 使用 Pi 0.84.2 keybinding、Focusable 和 cursor marker 合同；无 Worker 时委托原 editor，有 Worker 时只接管模型 picker 键 | 尚无长时间 TUI 稳定性或真实 PTY picker E2E 证据 |
 
 ## 验证入口
 

@@ -315,6 +315,11 @@ export class RunControlWal {
       this.assertLease();
       const header = this.recordsUnlocked().find((record) => record.type === 'header');
       if (!header || typeof header.payload.cwd !== 'string' || header.payload.cwd !== input.cwd) throw new RunControlWalError('PARENT_REBIND_CWD_MISMATCH', 'parent rebind is allowed only in the original cwd');
+      const originalParentFile = header.payload.parentSessionFile;
+      if (header.payload.parentSessionFileExists !== false
+        || (typeof originalParentFile === 'string' && originalParentFile.length > 0 && existsSync(originalParentFile))) {
+        throw new RunControlWalError('PARENT_REBIND_NOT_ORPHAN', 'parent rebind requires a header with no discoverable original parent file');
+      }
       const previous = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to ?? header.payload;
       return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, ...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile, parentSessionFileExists: existsSync(input.parentSessionFile) } : { parentSessionFileExists: false }), cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
     });

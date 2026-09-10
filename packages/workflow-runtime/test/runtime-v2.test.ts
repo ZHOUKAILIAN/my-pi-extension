@@ -132,8 +132,21 @@ test('runReview passes with required quorum of independent reviewers', async () 
   assert.ok(events.some((event) => event.eventType === 'investigation_review_completed'));
 });
 
-test('review recovery resumes the crashed reviewer participant, not reviewer #1', async () => {
-  const { entries, store } = makeStore();
+test('review recovery keeps a durably committed reviewer and resumes the next participant after a checkpoint fault', async () => {
+  const entries: { customType: string; data: Record<string, unknown> }[] = [];
+  let crashAfterReviewerOneCommit = true;
+  const store = new PiSessionRunStore(
+    { getEntries: () => entries },
+    (type: string, data: unknown) => {
+      entries.push({ customType: type, data: data as Record<string, unknown> });
+      const checkpoint = data as Record<string, unknown>;
+      const progress = checkpoint.reviewProgress as { nextReviewerIndex?: number } | undefined;
+      if (crashAfterReviewerOneCommit && progress?.nextReviewerIndex === 1) {
+        crashAfterReviewerOneCommit = false;
+        throw new Error('crash after reviewer #1 participant commit');
+      }
+    },
+  );
   const firstRuntime = new WorkflowRuntime(makeDefinition(), store, 'run-1', () => 10, () => `id-${Date.now()}`, { definitionVersion: 'v1' });
   await firstRuntime.executeNode({ id: 'investigate', worker: bareWorker(() => ({ kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] })) }, {});
   let reviewerOneCalls = 0;
@@ -145,21 +158,20 @@ test('review recovery resumes the crashed reviewer participant, not reviewer #1'
     conclusion: { status: 'accepted' as const, summary: 'ok' },
   });
   const reviewerOne: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-1', execute: async () => { reviewerOneCalls += 1; return reviewArtifact('reviewer-1'); } } };
-  const reviewerTwo: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-2', execute: async () => { reviewerTwoCalls += 1; if (reviewerTwoCalls === 1) throw new Error('reviewer #2 crashed'); return reviewArtifact('reviewer-2'); } } };
+  const reviewerTwo: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-2', execute: async () => { reviewerTwoCalls += 1; return reviewArtifact('reviewer-2'); } } };
   const policy = { reviewers: [{ model: 'inherit' }, { model: 'inherit' }], mode: 'parallel' as const, requiredApprovals: 2, requireIndependentWorker: true, excludeNodes: ['investigate'], onRejected: 'return_to_investigation' };
   await assert.rejects(firstRuntime.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' }));
-  const failed = entries.at(-1)!.data;
-  assert.equal(failed.reviewerIndex, 1);
-  assert.equal(failed.reviewerWorkerId, 'reviewer-2');
-  assert.equal(failed.reviewCycleId !== undefined, true);
-  assert.equal(failed.logicalNodeExecutionId, failed.nodeExecutionId);
-  assert.equal(failed.recoveryAttempt, 1);
+  const committed = entries.at(-1)!.data;
+  assert.equal((committed.reviewProgress as { nextReviewerIndex: number }).nextReviewerIndex, 1);
+  assert.equal((committed.reviewProgress as { approvals: number }).approvals, 1);
+  assert.equal((committed.artifacts as unknown[]).filter((artifact) => (artifact as { kind?: string }).kind === 'investigation_review').length, 1);
+  assert.equal(committed.activeReviewAttempt, undefined);
 
   const recovered = WorkflowRuntime.restore(makeDefinition(), store, 'run-1');
   const result = await recovered.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' });
   assert.equal(result.passed, true);
   assert.equal(reviewerOneCalls, 1, 'reviewer #1 must not be rerun');
-  assert.equal(reviewerTwoCalls, 2, 'reviewer #2 is retried with the same logical execution');
+  assert.equal(reviewerTwoCalls, 1, 'reviewer #2 continues from the committed cursor');
   assert.deepEqual(result.reviewerWorkerIds, ['reviewer-1', 'reviewer-2']);
 });
 
