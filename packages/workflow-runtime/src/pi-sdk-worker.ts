@@ -30,7 +30,8 @@ export type WorkerProgress =
   /** 未知 node.id 无法绑定 per-kind schema（ARTIFACT_JSON_SCHEMAS 无对应 kind）时退回
    *  最小宽松 schema（只声明 kind），结构校验完全交给 execute 内权威层兜底；发本事件
    *  保证该降级在进度流中可见，不会被静默吞掉。 */
-  | { type: 'schema_fallback'; nodeId: string };
+  | { type: 'schema_fallback'; nodeId: string }
+  | { type: 'model_applied'; model: { provider: string; id: string }; modelCallRef: string };
 
 export class WorkerArtifactSubmissionError extends Error {
   readonly code: string;
@@ -238,12 +239,22 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     const live = this.options.live;
     let sessionManager = SessionManager.inMemory();
     let recoveredSessionFile: string | undefined;
+    let durableWorkerSessionId: string | undefined;
+    let durableAttemptId: string | undefined;
+    if (live) {
+      const execution = capsule as { nodeExecutionId: string; workerId: string; recoveryAttempt?: number };
+      durableWorkerSessionId = randomUUID();
+      durableAttemptId = randomUUID();
+      // Establish logical identity and attempt before creating the Child. A
+      // crash in createAgentSession therefore restores the same node attempt.
+      live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId: durableWorkerSessionId, attemptId: durableAttemptId, recoveryAttempt: execution.recoveryAttempt ?? 1, startup: true });
+    }
     if (live) {
       const sessionDir = live.sidecarDir ?? join(live.wal.runDir, 'workers');
       mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
       chmodSync(sessionDir, 0o700);
       const execution = capsule as { nodeExecutionId?: string };
-      const prior = live.wal.records().reverse().find((record) => record.type === 'worker' && record.payload.kind === 'session_started' && record.payload.nodeExecutionId === execution.nodeExecutionId && typeof record.payload.sessionFile === 'string');
+      const prior = live.wal.records().reverse().find((record) => record.type === 'worker' && ['session_started', 'session_published'].includes(String(record.payload.kind)) && record.payload.nodeExecutionId === execution.nodeExecutionId && typeof record.payload.sessionFile === 'string');
       if (prior && existsSync(String(prior.payload.sessionFile))) {
         recoveredSessionFile = String(prior.payload.sessionFile);
         sessionManager = SessionManager.open(recoveredSessionFile, sessionDir, this.options.cwd ?? process.cwd());
@@ -267,7 +278,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     if (live) {
       const execution = capsule as { runId: string; nodeExecutionId: string; workerId: string; recoveryAttempt?: number };
       const model = (this.options.model ?? (session as WorkerSessionLike).model) as WorkerModel | undefined;
-      const workerSessionId = String((session as WorkerSessionLike).sessionId ?? randomUUID());
+      const workerSessionId = durableWorkerSessionId ?? String((session as WorkerSessionLike).sessionId ?? randomUUID());
       liveHandle = {
         runId: execution.runId,
         parentSessionId: live.parentSessionId,
@@ -275,7 +286,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         nodeExecutionId: execution.nodeExecutionId,
         workerId: execution.workerId,
         workerSessionId,
-        attemptId: randomUUID(),
+        attemptId: durableAttemptId ?? randomUUID(),
         recoveryAttempt: execution.recoveryAttempt ?? 1,
         actualModel: { provider: String(model?.provider ?? 'unknown'), id: String(model?.id ?? 'unknown') },
         status: 'starting',
@@ -285,7 +296,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       };
       try {
         live.registry.register(liveHandle);
-        live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId, attemptId: liveHandle.attemptId, recoveryAttempt: liveHandle.recoveryAttempt, sessionFile: sessionManager.getSessionFile?.(), ...(recoveredSessionFile ? { recoveredFromSessionFile: recoveredSessionFile } : {}) });
+        live.wal.recordWorker({ kind: 'session_published', nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId, sessionFile: sessionManager.getSessionFile?.(), piSessionId: (session as WorkerSessionLike).sessionId, ...(recoveredSessionFile ? { recoveredFromSessionFile: recoveredSessionFile } : {}) });
         await live.interaction.reconcileWorker(liveHandle);
       } catch (error) {
         live.registry.unregisterWorker(liveHandle.runId, liveHandle.workerSessionId);
@@ -318,16 +329,15 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       : '';
     const unsubscribe = workerSession.subscribe?.((rawEvent: unknown) => {
         const event = rawEvent as WorkerEvent;
-        if (liveHandle && event.type === 'agent_start') {
-          liveHandle.status = 'streaming';
-          const modelCallRef = `${liveHandle.workerSessionId}:${Date.now()}`;
-          const pending = liveHandle.wal.records().find((record) => record.type === 'worker' && record.payload.kind === 'model_change' && record.payload.state === 'pending');
-          if (pending) {
-            if (pending.payload.actualModel && typeof pending.payload.actualModel === 'object') {
-              const model = pending.payload.actualModel as { provider?: unknown; id?: unknown };
-              if (typeof model.provider === 'string' && typeof model.id === 'string') liveHandle.actualModel = { provider: model.provider, id: model.id };
-            }
-            liveHandle.wal.recordWorker({ ...pending.payload, state: 'applied', effectiveFromModelCallRef: modelCallRef });
+        if (liveHandle && event.type === 'agent_start') liveHandle.status = 'streaming';
+        if (liveHandle && event.type === 'turn_start') {
+          const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
+          const modelCallRef = `${liveHandle.workerSessionId}:turn:${turnIndex}`;
+          void live!.interaction.recordModelTurnStart(liveHandle.runId, turnIndex, modelCallRef);
+          const actual = (session as WorkerSessionLike).model;
+          if (actual) {
+            liveHandle.actualModel = { provider: String(actual.provider), id: String(actual.id) };
+            this.options.onProgress?.({ type: 'model_applied', model: liveHandle.actualModel, modelCallRef });
           }
         }
         if (liveHandle && event.type === 'agent_settled') liveHandle.status = 'idle';
@@ -341,7 +351,6 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           streamedText += event.assistantMessageEvent.delta ?? '';
         }
         if (event.type === 'message_end' && event.message?.role === 'assistant') {
-          if (liveHandle && !event.message.errorMessage) void live!.interaction.recordModelCallCompleted(liveHandle.runId, `${liveHandle.workerSessionId}:${Date.now()}`);
           modelStopReason = event.message.stopReason;
           modelErrorMessage = event.message.errorMessage;
           const text = textFromContent(event.message.content);
@@ -349,6 +358,10 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
             lastAssistantText = text;
             this.options.onProgress?.({ type: 'text', text });
           }
+        }
+        if (liveHandle && event.type === 'turn_end') {
+          const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
+          void live!.interaction.recordModelCallCompleted(liveHandle.runId, `${liveHandle.workerSessionId}:turn:${turnIndex}`);
         }
         if (event.type === 'agent_end') {
           const assistant = Array.isArray(event.messages)

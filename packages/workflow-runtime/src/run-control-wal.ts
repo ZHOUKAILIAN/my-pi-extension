@@ -1,7 +1,8 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, chmodSync, writeFileSync, unlinkSync, rmdirSync, truncateSync, renameSync, statSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, chmodSync, writeFileSync, unlinkSync, rmdirSync, truncateSync, renameSync } from 'node:fs';
 import { createHash, randomUUID } from 'node:crypto';
 import { hostname } from 'node:os';
 import { dirname, join } from 'node:path';
+import { RunGarbageCollector } from './run-gc.ts';
 import type { Checkpoint, RunStore } from '@pi/workflow-contracts';
 
 export type WalRecordType = 'header' | 'supplement' | 'delivery' | 'close_fence' | 'checkpoint' | 'worker' | 'legacy_migrated' | 'shutdown';
@@ -46,8 +47,9 @@ const checksumFor = (record: Omit<RunControlRecord, 'checksum'>) => createHash('
 const fsyncFile = (path: string) => { const fd = openSync(path, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } };
 const fsyncDirectory = (path: string) => { const fd = openSync(path, 'r'); try { fsyncSync(fd); } finally { closeSync(fd); } };
 const writeJsonDurably = (path: string, value: unknown) => { writeFileSync(path, JSON.stringify(value), { encoding: 'utf8', mode: 0o600 }); chmodSync(path, 0o600); fsyncFile(path); };
-const pidIsAlive = (pid: number) => {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
+const currentHost = () => hostname();
+const pidIsAlive = (host: string, pid: number) => {
+  if (host !== currentHost() || !Number.isInteger(pid) || pid <= 0) return false;
   try { process.kill(pid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
 };
@@ -131,9 +133,9 @@ export class RunControlWal {
       if (error instanceof RunControlWalError) throw error;
       if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
         const ownerPath = join(this.lockPath, 'owner.json');
-        let owner: { pid?: number } | undefined;
-        try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number }; } catch { /* publisher may not have finished */ }
-        if (!owner || pidIsAlive(Number(owner.pid))) throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${this.runId} operation lock is held or its owner is uncertain`);
+        let owner: { host?: string; pid?: number } | undefined;
+        try { owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { host?: string; pid?: number }; } catch { /* publisher may not have finished */ }
+        if (!owner || owner.host !== currentHost() || pidIsAlive(String(owner.host), Number(owner.pid))) throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${this.runId} operation lock is held or its owner is uncertain`);
         try { unlinkSync(ownerPath); rmdirSync(this.lockPath); } catch { throw new RunControlWalError('OPERATION_LOCK_BUSY', `run ${this.runId} operation lock could not be safely reclaimed`); }
         return this.withOperationLock(fn);
       }
@@ -152,8 +154,8 @@ export class RunControlWal {
   private acquireLeaseLocked(force: boolean) {
     const existing = this.readLease();
     if (existing && existing.instanceNonce !== this.instanceNonce) {
-      if (!force && pidIsAlive(existing.pid)) throw new RunControlWalError('WRITER_LEASE_ACTIVE', `run ${this.runId} has an active or uncertain writer lease`);
-      if (!force && !pidIsAlive(existing.pid)) { /* a provably dead owner is safe to replace */ }
+      if (!force && (existing.host !== currentHost() || pidIsAlive(existing.host, existing.pid))) throw new RunControlWalError('WRITER_LEASE_ACTIVE', `run ${this.runId} has an active or uncertain writer lease`);
+      if (!force && existing.host === currentHost() && !pidIsAlive(existing.host, existing.pid)) { /* a provably dead owner is safe to replace */ }
       else if (!force) throw new RunControlWalError('WRITER_OWNER_UNCERTAIN', `run ${this.runId} writer owner cannot be proven dead`);
     }
     // Never derive a new epoch from a replay after writing the takeover lease.
@@ -165,9 +167,13 @@ export class RunControlWal {
   private validateHeaderBindingLocked() {
     const header = this.recordsUnlocked().find((record) => record.type === 'header');
     if (!header) throw new RunControlWalError('WAL_HEADER_MISSING', `run ${this.runId} control WAL has no header`);
+    const rebinding = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1);
+    const effective = rebinding?.payload.to && typeof rebinding.payload.to === 'object'
+      ? rebinding.payload.to as Record<string, unknown>
+      : header.payload;
     for (const field of ['parentSessionId', 'parentLeafId', 'cwd'] as const) {
       const expected = this.headerBinding[field];
-      if (expected !== undefined && header.payload[field] !== expected) throw new RunControlWalError('WAL_HEADER_BINDING_MISMATCH', `run ${this.runId} header ${field} does not match the current parent context`);
+      if (expected !== undefined && effective[field] !== expected) throw new RunControlWalError('WAL_HEADER_BINDING_MISMATCH', `run ${this.runId} binding ${field} does not match the current parent context`);
     }
   }
 
@@ -196,6 +202,7 @@ export class RunControlWal {
         throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains internal corruption`);
       }
       const { checksum, ...body } = record;
+      if (!hasNewline) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL ends without a commit newline`);
       if (checksum !== checksumFor(body) || record.runId !== this.runId || record.index !== this.nextIndex) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains a corrupted committed record`);
       validBytes += lineBytes;
       this.nextIndex += 1;
@@ -247,10 +254,11 @@ export class RunControlWal {
     return this.withOperationLock(() => {
       this.assertLease();
       const nodeExecutionId = payload.nodeExecutionId;
-      const attempts = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'session_started' && record.payload.nodeExecutionId === nodeExecutionId).length;
-      if (attempts >= 20) throw new RunControlWalError('WORKER_ATTEMPT_LIMIT', `node ${String(nodeExecutionId)} exceeded the 20 recovery-attempt limit`);
+      if (typeof nodeExecutionId !== 'string' || !nodeExecutionId.trim()) throw new RunControlWalError('WORKER_IDENTITY_REQUIRED', 'worker startup requires a logical nodeExecutionId');
+      const attempts = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'session_started').length;
+      if (attempts >= 20) throw new RunControlWalError('WORKER_ATTEMPT_LIMIT', `run ${this.runId} exceeded the 20 recovery-attempt limit`);
       this.closed = false;
-      return this.appendLocked('worker', { ...payload, kind: 'session_started', recoveryAttempt: attempts + 1 });
+      return this.appendLocked('worker', { ...payload, kind: 'session_started', recoveryAttempt: attempts + 1, runAttempt: attempts + 1 });
     });
   }
   recordWorker(payload: Record<string, unknown>) { return this.append('worker', payload); }
@@ -258,18 +266,41 @@ export class RunControlWal {
   closeFence(payload: Record<string, unknown> = {}) { return this.withOperationLock(() => this.closed ? this.recordsUnlocked().find((record) => record.type === 'close_fence') : this.appendLocked('close_fence', payload)); }
   markShutdown() { try { return this.append('shutdown', { status: 'interrupted_attempt' }); } catch { return undefined; } }
 
+  /** Explicit, user-confirmed rebind to a new parent in the same cwd. The original header and runId remain intact. */
+  rebindParent(input: { parentSessionId: string; parentLeafId: string; cwd: string; confirmed: boolean }) {
+    if (!input.confirmed) throw new RunControlWalError('PARENT_REBIND_CONFIRMATION_REQUIRED', 'parent rebind requires explicit user confirmation');
+    return this.withOperationLock(() => {
+      this.assertLease();
+      const header = this.recordsUnlocked().find((record) => record.type === 'header');
+      if (!header || typeof header.payload.cwd !== 'string' || header.payload.cwd !== input.cwd) throw new RunControlWalError('PARENT_REBIND_CWD_MISMATCH', 'parent rebind is allowed only in the original cwd');
+      const previous = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to ?? header.payload;
+      return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
+    });
+  }
+
+  static rebindParent(runId: string, options: RunControlWalOptions & { parentSessionId: string; parentLeafId: string; cwd: string; confirmed: boolean }) {
+    const wal = RunControlWal.open(runId, { ...options, parentSessionId: undefined, parentLeafId: undefined, cwd: undefined });
+    try { return wal.rebindParent(options); } finally { try { wal.releaseLease(); } catch { /* preserve for explicit recovery */ } }
+  }
+
+  static gc(rootDir = defaultRoot(), now = Date.now(), retentionDays = 30, orphanDays = 7) {
+    return RunGarbageCollector.collect(rootDir, { now, retentionMs: retentionDays * 86400000, orphanDeadlineMs: orphanDays * 86400000 });
+  }
+
   private recordsUnlocked(): RunControlRecord[] {
     if (!existsSync(this.walPath)) return [];
     const records: RunControlRecord[] = [];
     let expectedIndex = 0;
-    for (const line of readFileSync(this.walPath, 'utf8').split('\n')) {
+    const lines = readFileSync(this.walPath, 'utf8').split('\n');
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      const line = lines[lineIndex]!;
       if (!line.trim()) continue;
-      try {
-        const record = JSON.parse(line) as RunControlRecord;
-        const { checksum, ...body } = record;
-        if (record.runId !== this.runId || record.index !== expectedIndex || checksum !== checksumFor(body)) break;
-        records.push(record); expectedIndex += 1;
-      } catch { break; }
+      if (lineIndex === lines.length - 1) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL ends without a commit newline`);
+      let record: RunControlRecord;
+      try { record = JSON.parse(line) as RunControlRecord; } catch { throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains internal corruption`); }
+      const { checksum, ...body } = record;
+      if (record.runId !== this.runId || record.index !== expectedIndex || checksum !== checksumFor(body)) throw new RunControlWalError('WAL_CORRUPT', `run ${this.runId} control WAL contains a corrupted committed record`);
+      records.push(record); expectedIndex += 1;
     }
     return records;
   }
@@ -318,37 +349,5 @@ export class RunControlWalStore implements RunStore {
   loadLast(runId: string) {
     if (runId !== this.wal.runId) return undefined;
     return this.wal.records().map((record) => record.type === 'checkpoint' ? record.payload.checkpoint : undefined).filter((value): value is Checkpoint => !!value && typeof value === 'object' && (value as Checkpoint).runId === runId).at(-1);
-  }
-}
-
-/** Protected sidecar for display-only worker projections; it never enters LLM context. */
-export interface WorkerProjection { ref: string; runId: string; nodeId: string; eventKind: 'visible_text' | 'tool_start'; text?: string; toolName?: string; args?: unknown; occurredAt: string; }
-export class WorkerSidecar {
-  readonly path: string;
-  readonly runDir: string;
-  constructor(runDir: string) {
-    this.runDir = runDir;
-    mkdirSync(runDir, { recursive: true, mode: 0o700 }); chmodSync(runDir, 0o700);
-    this.path = join(runDir, 'ui-sidecar.jsonl');
-  }
-  append(projection: WorkerProjection) { const fd = openSync(this.path, 'a', 0o600); try { writeFileSync(fd, `${JSON.stringify(projection)}\n`, { encoding: 'utf8' }); fsyncSync(fd); } finally { closeSync(fd); } chmodSync(this.path, 0o600); }
-  get(ref: string): WorkerProjection | undefined {
-    if (!existsSync(this.path)) return undefined;
-    for (const line of readFileSync(this.path, 'utf8').split('\n').reverse()) { if (!line.trim()) continue; try { const value = JSON.parse(line) as WorkerProjection; if (value.ref === ref) return value; } catch { return undefined; } }
-    return undefined;
-  }
-  static gc(rootDir = defaultRoot(), now = Date.now(), retentionDays = 30, orphanDays = 7) {
-    const root = join(rootDir, 'workflow-runs'); if (!existsSync(root)) return 0;
-    let removed = 0;
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() || entry.name === 'locks') continue;
-      const dir = join(root, entry.name); const sidecar = join(dir, 'ui-sidecar.jsonl');
-      if (!existsSync(sidecar)) continue;
-      const age = now - statSync(sidecar).mtimeMs;
-      const wal = join(dir, 'control.wal');
-      const isOrphan = !existsSync(wal);
-      if ((isOrphan && age > orphanDays * 86400000) || (!isOrphan && age > retentionDays * 86400000)) { try { unlinkSync(sidecar); removed += 1; } catch { /* best effort GC */ } }
-    }
-    return removed;
   }
 }

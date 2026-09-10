@@ -37,6 +37,8 @@ export * from '@pi/workflow-contracts';
 export * from './pi-session-store.ts';
 export * from './pi-sdk-worker.ts';
 export * from './run-control-wal.ts';
+export * from './run-gc.ts';
+export * from './worker-sidecar.ts';
 export * from './interaction.ts';
 
 // checkpoint 中的业务事实只允许由 Worker 信封携带（executeNode 盖章）。
@@ -783,6 +785,7 @@ export class WorkflowRuntime {
       // run_started 一次性语义的持久化标记：首个 Node 执行即记录（即使该 Node 在 Worker 提交前失败，
       // 恢复后也不能对同一 runId 再次发出启动事件）。无值不写，legacy checkpoint 形状不变。
       ...(this.ranAnyNode ? { started: true } : {}),
+      ...(this.stage === 'ACCEPTED' ? { gcDeadline: this.clock() } : {}),
     };
     // 等待种类：进入 WAITING_FOR_USER 时把 Extension 声明的 pendingDecisionKind 随 checkpoint 落盘
     //（只写有值，无声明 / legacy 形状不写）；离开 WAITING_FOR_USER（继续 / 打回 / 拒绝等一切转出）
@@ -947,6 +950,9 @@ export class WorkflowRuntime {
     task: unknown,
     opts: { context?: Capsule; nodeExecutionId?: string; recoveryAttempt?: number } = {},
   ): Promise<{ artifact: Artifact; execution: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number } }> {
+    const nodeExecutionId = opts.nodeExecutionId ?? this.createNodeExecutionId(node.id);
+    const recoveryAttempt = opts.recoveryAttempt ?? 1;
+    const workerId = node.worker?.workerId ?? 'worker';
     if (!this.ranAnyNode) {
       this.recordEvent('run_started');
       this.ranAnyNode = true;
@@ -963,11 +969,9 @@ export class WorkflowRuntime {
         workflowVersion: this.definitionVersion ?? this.definition.sourceVersion,
         policyDigest: this.policyDigest,
         sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
+        activeNodeId: node.id, nodeExecutionId, logicalNodeExecutionId: nodeExecutionId, recoveryAttempt,
       });
     }
-    const nodeExecutionId = opts.nodeExecutionId ?? this.createNodeExecutionId(node.id);
-    const recoveryAttempt = opts.recoveryAttempt ?? 1;
-    const workerId = node.worker?.workerId ?? 'worker';
     // Keep the identity in memory while the Worker runs. If it fails, the catch
     // below persists this exact identity so recovery can reuse it.
     this.currentExecution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt };

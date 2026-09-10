@@ -135,7 +135,7 @@ export interface Checkpoint { schemaVersion?:1; runId:string; stage:Stage; at:nu
   // 本记录：由 Runtime.decide 路径产生的唯一记录，包含 producer/source 来源事实，不允许任意字符串相等
   // 作为唯一证明）。只有 decide() 委托路径由 Runtime 盖章写入；legacy resume()/gate 决策不附加本记录
   //（未 opt-in 的 legacy checkpoint 保持原形状，不被声称为 runtime:decide 产出）。
-  decisionRecord?:DecisionRecord; }
+  decisionRecord?:DecisionRecord; /** terminal timestamp used by durable Run GC; never inferred from UI sidecars */ gcDeadline?:number; }
 
 /** Runtime 决策记录：decide()/决策路径由 Runtime 盖章写入 checkpoint 的唯一来源事实，
  *  与业务 Artifact 字段分离（producer/source 指向决策产生路径，不混入业务载荷）。

@@ -3,7 +3,7 @@ import type { AgentSession, ExtensionContext } from '@earendil-works/pi-coding-a
 import { RunControlWal, RunControlWalError } from './run-control-wal.ts';
 
 export type WorkerStatus = 'starting' | 'streaming' | 'idle' | 'settled' | 'failed';
-export type SupplementState = 'recorded' | 'enqueue_accepted' | 'model_call_completed' | 'artifact_bound' | 'delivery_failed' | 'rejected_after_fence' | 'redelivered';
+export type SupplementState = 'recorded' | 'enqueue_accepted' | 'model_call_started' | 'model_call_completed' | 'artifact_bound' | 'delivery_failed' | 'rejected_after_fence' | 'redelivered';
 export type ModelChangeState = 'requested' | 'pending' | 'applied' | 'not_applied' | 'failed';
 export type WorkerModel = Parameters<AgentSession['setModel']>[0];
 
@@ -149,6 +149,7 @@ export class WorkflowInteractionPort {
   private readonly modelCandidates: (worker: ActiveWorkerHandle) => readonly ModelCandidate[];
   private readonly queues = new Map<string, SerialQueue>();
   private readonly pendingCalls = new Map<string, string[]>();
+  private readonly activeCalls = new Map<string, { ref: string; supplementIds: string[] }>();
   private readonly pendingArtifacts = new Map<string, { supplementId: string; sequence: number; artifactRevisionId: string; nodeExecutionId: string; workerSessionId: string }>();
   private readonly artifactRevisions = new Map<string, string>();
   constructor(registry: ActiveWorkerRegistry, modelCandidates: (worker: ActiveWorkerHandle) => readonly ModelCandidate[] = () => []) { this.registry = registry; this.modelCandidates = modelCandidates; }
@@ -159,16 +160,22 @@ export class WorkflowInteractionPort {
     return this.queue(input.runId).run(async () => {
       const owner = this.registry.owner(input.runId);
       if (!owner || owner.nodeExecutionId !== input.expectedNodeExecutionId) return { submissionAttemptId, state: 'delivery_failed', error: 'no unique Run owner for this node execution' };
+      // A starting owner is only an interception fence. It must not consume a
+      // supplement sequence before a Child is durably published.
+      if (owner.status === 'starting') return { submissionAttemptId, state: 'delivery_failed', error: 'Worker is starting; text was retained by the editor' };
+      const current = this.registry.get(input.runId, input.expectedNodeExecutionId);
+      if (!current) {
+        // A publication gap retains only the edited content. It is not a
+        // supplement and therefore cannot create a false sequence or binding.
+        try { owner.wal.recordDelivery({ submissionAttemptId, state: 'delivery_failed', nodeExecutionId: owner.nodeExecutionId, workerSessionId: owner.workerSessionId ?? 'unpublished', text: input.text, error: 'Worker publication gap; retained editor content' }); }
+        catch { /* the UI still retains the input */ }
+        return { submissionAttemptId, state: 'delivery_failed', error: 'Worker publication gap; text retained' };
+      }
       let recorded;
-      try { recorded = owner.wal.recordSupplement({ submissionAttemptId, nodeExecutionId: owner.nodeExecutionId, workerSessionId: owner.workerSessionId ?? 'unpublished', text: input.text }); }
+      try { recorded = owner.wal.recordSupplement({ submissionAttemptId, nodeExecutionId: current.nodeExecutionId, workerSessionId: current.workerSessionId, text: input.text }); }
       catch (error) { return { submissionAttemptId, state: 'delivery_failed', error: error instanceof Error ? error.message : String(error) }; }
       if (recorded.payload.state === 'rejected_after_fence') return { submissionAttemptId, state: 'rejected_after_fence', error: 'Worker close fence already committed' };
       const supplementId = String(recorded.payload.supplementId); const sequence = Number(recorded.payload.sequence);
-      const current = this.registry.get(input.runId, input.expectedNodeExecutionId);
-      if (!current) {
-        owner.wal.recordDelivery({ submissionAttemptId, supplementId, sequence, nodeExecutionId: owner.nodeExecutionId, workerSessionId: owner.workerSessionId ?? 'unpublished', state: 'delivery_failed', error: 'Worker publication gap; retained for the next logical attempt' });
-        return { submissionAttemptId, supplementId, sequence, state: 'delivery_failed', error: 'Worker publication gap; text retained' };
-      }
       try {
         this.pendingCalls.set(input.runId, [...(this.pendingCalls.get(input.runId) ?? []), supplementId]);
         if (current.session.isStreaming) await current.session.steer(input.text, input.images);
@@ -184,27 +191,63 @@ export class WorkflowInteractionPort {
     });
   }
 
-  /** Model completion is serialized with artifact binding and the close fence. */
-  recordModelCallCompleted(runId: string, modelCallRef: string): Promise<void> {
+  /**
+   * Pi 0.84.2 establishes the next provider call at turn_start. A
+   * message_end is too late: steering is consumed before that event.
+   */
+  recordModelTurnStart(runId: string, turnIndex: number, modelCallRef: string): Promise<void> {
     return this.queue(runId).run(async () => {
       const worker = this.registry.get(runId); const pendingIds = this.pendingCalls.get(runId) ?? [];
-      if (!worker || pendingIds.length === 0) return;
-      this.pendingCalls.delete(runId);
+      if (!worker) return;
       const records = worker.wal.records();
-      for (const supplementId of pendingIds) {
+      const ids = pendingIds.filter((id) => records.some((record) => record.type === 'supplement' && record.payload.supplementId === id && record.payload.nodeExecutionId === worker.nodeExecutionId));
+      this.pendingCalls.delete(runId);
+      this.activeCalls.set(runId, { ref: modelCallRef, supplementIds: ids });
+      for (const supplementId of ids) {
         const record = records.find((item) => item.type === 'supplement' && item.payload.supplementId === supplementId);
+        if (record) worker.wal.recordDelivery({ submissionAttemptId: record.payload.submissionAttemptId, supplementId, sequence: record.payload.sequence, nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, state: 'model_call_started', modelCallRef, turnIndex });
+      }
+      this.applyPendingModelChanges(worker, modelCallRef);
+    });
+  }
+
+  /** Completion is accepted only for the ref established at turn_start. */
+  recordModelCallCompleted(runId: string, modelCallRef: string): Promise<void> {
+    return this.queue(runId).run(async () => {
+      const worker = this.registry.get(runId); if (!worker) return;
+      const active = this.activeCalls.get(runId);
+      if (!active || active.ref !== modelCallRef) return;
+      const ids = active.supplementIds;
+      if (!ids.length) { this.activeCalls.delete(runId); return; }
+      this.activeCalls.delete(runId);
+      const records = worker.wal.records();
+      for (const supplementId of ids) {
+        const record = records.find((item) => item.type === 'supplement' && item.payload.supplementId === supplementId && item.payload.nodeExecutionId === worker.nodeExecutionId);
         if (record) worker.wal.recordDelivery({ submissionAttemptId: record.payload.submissionAttemptId, supplementId, sequence: record.payload.sequence, nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, state: 'model_call_completed', modelCallRef });
       }
       this.bindPendingArtifact(worker);
     });
   }
 
+  private applyPendingModelChanges(worker: ActiveWorkerHandle, modelCallRef: string) {
+    const actual = worker.session.model;
+    for (const record of worker.wal.records().filter((item) => item.type === 'worker' && item.payload.kind === 'model_change' && item.payload.state === 'pending' && item.payload.nodeExecutionId === worker.nodeExecutionId)) {
+      const requested = record.payload.actualModel as { provider?: unknown; id?: unknown } | undefined;
+      if (!actual || requested?.provider !== actual.provider || requested?.id !== actual.id) {
+        worker.wal.recordWorker({ ...record.payload, state: 'failed', error: 'Pi session did not report the requested model at turn_start', effectiveFromModelCallRef: modelCallRef });
+      } else {
+        worker.actualModel = { provider: String(actual.provider), id: String(actual.id) };
+        worker.wal.recordWorker({ ...record.payload, state: 'applied', actualModel: worker.actualModel, effectiveFromModelCallRef: modelCallRef });
+      }
+    }
+  }
+
   private bindPendingArtifact(worker: ActiveWorkerHandle) {
     const pending = this.pendingArtifacts.get(worker.runId);
     if (!pending) return;
     const records = worker.wal.records();
-    const supplements = records.filter((record) => record.type === 'supplement');
-    const completed = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'model_call_completed').map((record) => String(record.payload.supplementId)));
+    const supplements = records.filter((record) => record.type === 'supplement' && record.payload.nodeExecutionId === worker.nodeExecutionId);
+    const completed = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'model_call_completed' && record.payload.nodeExecutionId === worker.nodeExecutionId).map((record) => String(record.payload.supplementId)));
     if (supplements.some((record) => !completed.has(String(record.payload.supplementId)))) return;
     const alreadyBound = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound').map((record) => String(record.payload.supplementId)));
     for (const supplement of supplements) {
@@ -219,7 +262,7 @@ export class WorkflowInteractionPort {
     return this.queue(runId).run(async () => {
       const worker = this.registry.get(runId); const owner = this.registry.owner(runId);
       if (!worker || !owner) return artifact;
-      const supplements = worker.wal.records().filter((record) => record.type === 'supplement');
+      const supplements = worker.wal.records().filter((record) => record.type === 'supplement' && record.payload.nodeExecutionId === worker.nodeExecutionId);
       const latest = supplements.at(-1);
       if (!latest) return Object.freeze({ ...artifact });
       const previousRevision = this.artifactRevisions.get(runId);
@@ -238,13 +281,13 @@ export class WorkflowInteractionPort {
    * each supplement at most once per Worker attempt. */
   async reconcileWorker(worker: ActiveWorkerHandle): Promise<void> {
     const records = worker.wal.records();
-    const bound = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound').map((record) => String(record.payload.supplementId)));
+    const bound = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound' && record.payload.nodeExecutionId === worker.nodeExecutionId).map((record) => String(record.payload.supplementId)));
     const redelivered = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'redelivered' && record.payload.workerSessionId === worker.workerSessionId).map((record) => String(record.payload.supplementId)));
     const acceptedForWorker = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'enqueue_accepted' && record.payload.redelivery === true && record.payload.workerSessionId === worker.workerSessionId).map((record) => String(record.payload.supplementId)));
     const pendingIds: string[] = [];
     for (const supplement of records.filter((record) => record.type === 'supplement')) {
       const id = String(supplement.payload.supplementId);
-      if (bound.has(id)) continue;
+      if (String(supplement.payload.nodeExecutionId) !== worker.nodeExecutionId || bound.has(id)) continue;
       if (acceptedForWorker.has(id)) {
         pendingIds.push(id);
         this.pendingCalls.set(worker.runId, [...pendingIds]);
@@ -288,8 +331,8 @@ export class WorkflowInteractionPort {
     await this.queue(runId).run(async () => {
       const worker = this.registry.get(runId); if (!worker) return;
       const records = worker.wal.records();
-      const supplements = records.filter((record) => record.type === 'supplement');
-      const bound = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound').map((record) => String(record.payload.supplementId)));
+      const supplements = records.filter((record) => record.type === 'supplement' && record.payload.nodeExecutionId === worker.nodeExecutionId);
+      const bound = new Set(records.filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound' && record.payload.nodeExecutionId === worker.nodeExecutionId).map((record) => String(record.payload.supplementId)));
       const unbound = supplements.filter((record) => !bound.has(String(record.payload.supplementId)));
       if (unbound.length) throw new RunControlWalError('SUPPLEMENT_ARTIFACT_NOT_BOUND', `cannot close ${runId}: ${unbound.length} supplement(s) lack a completed model call and immutable Artifact revision`);
       for (const pending of records.filter((record) => record.type === 'worker' && record.payload.kind === 'model_change' && record.payload.state === 'pending' && record.payload.nodeExecutionId === worker.nodeExecutionId)) worker.wal.recordWorker({ ...pending.payload, state: 'not_applied', reason });

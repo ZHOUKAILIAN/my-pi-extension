@@ -1,6 +1,7 @@
 import type { ExtensionAPI, InputEvent, InputEventResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
 type ExtensionCommandContext = ExtensionContext;
 import { CustomEditor } from '@earendil-works/pi-coding-agent';
+import { Text, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
 import { createHash, randomUUID } from 'node:crypto';
 import type {
   Artifact,
@@ -29,6 +30,7 @@ import {
   ActiveWorkerRegistry,
   WorkflowInteractionPort,
   RunControlWal,
+  RunControlWalError,
   type ModelCandidate,
   type RunStore,
   type WorkerModel,
@@ -99,7 +101,7 @@ export interface LiveRunContext {
  * Workflow state store: the WAL/Runtime remain authoritative. */
 export class LiveFixRunManager {
   readonly registry = new ActiveWorkerRegistry();
-  constructor() { WorkerSidecar.gc(process.env.PI_CODING_AGENT_DIR); }
+  constructor() {}
   private readonly runs = new Map<string, LiveRunContext>();
   private readonly sidecars = new Map<string, WorkerSidecar>();
   private readonly interactions = new Map<string, WorkflowInteractionPort>();
@@ -114,12 +116,15 @@ export class LiveFixRunManager {
     const modelCandidates = (): readonly ModelCandidate[] => {
       const scoped = ctx.scopedModels.map((item) => item.model);
       const available = (scoped.length ? scoped : ctx.modelRegistry.getAvailable()).filter((model) => ctx.modelRegistry.hasConfiguredAuth(model));
+      // Pi 0.84.2 exposes input/api on Model, not a guessed supportsTools
+      // flag. Unknown provider APIs are rejected rather than treated as capable.
+      const toolApis = new Set(['anthropic-messages', 'openai-completions', 'openai-responses', 'azure-openai-responses', 'openai-codex-responses', 'google-generative-ai', 'bedrock-converse-stream', 'vertex-ai']);
       return available.map((model) => ({
         ref: `${model.provider}/${model.id}`,
         model: model as WorkerModel,
-        compatible: (worker) => Array.isArray((model as { input?: readonly string[] }).input)
-          ? (model as { input: readonly string[] }).input.includes('text') && (model as { supportsTools?: boolean }).supportsTools !== false
-          : (model as { supportsTools?: boolean }).supportsTools !== false,
+        compatible: () => Array.isArray((model as { input?: readonly string[] }).input)
+          && (model as { input: readonly string[] }).input.includes('text')
+          && toolApis.has(String((model as { api?: unknown }).api)),
       }));
     };
     const interaction = new WorkflowInteractionPort(this.registry, modelCandidates);
@@ -155,6 +160,20 @@ export class LiveFixRunManager {
   ownerFor(ctx: ExtensionContext) { return this.registry.ownerForParent(ctx.sessionManager.getSessionId(), ctx.sessionManager.getLeafId() ?? 'root'); }
   hasOwner(ctx: ExtensionContext) { return this.ownerFor(ctx) !== undefined; }
   sidecar(runId: string) { return this.sidecars.get(runId); }
+  gc(now = Date.now()) { return WorkerSidecar.gc(process.env.PI_CODING_AGENT_DIR, now); }
+  async rebindParent(ctx: ExtensionCommandContext, runId: string): Promise<boolean> {
+    if (this.registry.owner(runId)) throw new RunControlWalError('PARENT_REBIND_RUN_ACTIVE', 'stop the current Run before rebinding its parent');
+    const confirmed = !ctx.hasUI || await ctx.ui.confirm('重新绑定 Fix 运行', `在当前工作目录重新绑定运行 ${runId}？原 runId 和历史父引用会保留。`);
+    if (!confirmed) return false;
+    RunControlWal.rebindParent(runId, {
+      rootDir: process.env.PI_CODING_AGENT_DIR,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentLeafId: ctx.sessionManager.getLeafId?.() ?? 'root',
+      cwd: ctx.cwd,
+      confirmed: true,
+    });
+    return true;
+  }
   submitSupplement(input: Parameters<WorkflowInteractionPort['submitSupplement']>[0]) {
     return this.interactions.get(input.runId)?.submitSupplement(input);
   }
@@ -294,6 +313,11 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
       host.trace(`${nodeId} · Artifact accepted from strict structured-text fallback: ${summarize(progress.artifact)}`);
       return;
     }
+    if (progress.type === 'model_applied') {
+      host.setWorkflowStatus(ctx, `fix ${nodeId} · ${progress.model.provider}/${progress.model.id} · 模型已生效`, true);
+      host.trace(`${nodeId} · model applied at ${progress.modelCallRef}: ${progress.model.provider}/${progress.model.id}`);
+      return;
+    }
     if (progress.type === 'model_end') {
       host.trace(`${nodeId} · model end: stopReason=${progress.stopReason ?? 'unknown'}${progress.errorMessage ? ` · ${progress.errorMessage}` : ''}`, progress.stopReason === 'error' || progress.stopReason === 'aborted' ? 'error' : 'info');
       return;
@@ -329,7 +353,10 @@ const makeLiveProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, no
         : { ref, runId: live.runId, nodeId, eventKind: 'tool_start', toolName: progress.name, args: progress.args, occurredAt: new Date().toISOString() });
       host.sendMessage?.({ customType: 'fix-worker-event', content: `当前 Worker 有新的可见活动（${nodeId}，opaque ref ${ref}）`, display: true, details: { runId: live.runId, ref, nodeId, eventKind: progress.type === 'text' ? 'visible_text' : 'tool_start' } });
     }
-    if (progress.type === 'tool_start' || progress.type === 'tool_end') host.setWorkflowStatus(ctx, `fix ${nodeId} · ${model.provider}/${model.id} · 工具活动`, true);
+    if (progress.type === 'model_applied') {
+      host.setWorkflowStatus(ctx, `fix ${nodeId} · ${progress.model.provider}/${progress.model.id} · 模型已生效`, true);
+      host.trace(`${nodeId} · model applied at ${progress.modelCallRef}: ${progress.model.provider}/${progress.model.id}`);
+    } else if (progress.type === 'tool_start' || progress.type === 'tool_end') host.setWorkflowStatus(ctx, `fix ${nodeId} · ${model.provider}/${model.id} · 工具活动`, true);
   };
 
 // 解析模型引用并计算本次使用的 model：
@@ -657,14 +684,22 @@ export async function continueRun(
       return { artifact, nodeId };
     };
 
-    // 7. 评审节点：runReview 后把各评审者 Artifact 同步进结果集（review.passed 由调用方决策）。
+    // 7. 评审节点：所有 reviewer 使用同一份 Run supplement 快照；不因
+    // reviewer 顺序或当前 Child publication 改变上下文，且 Runtime 仍会为
+    // 每个 reviewer 盖章独立的 nodeExecutionId/workerId。
+    const liveRunCapsule = () => {
+      const records = prepared.live?.wal.records().filter((record) => record.type === 'supplement') ?? [];
+      return prepared.live && records.length
+        ? { supplementVersion: prepared.live.wal.getSupplementVersion(), supplements: records.map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text })) }
+        : {};
+    };
     const runReviewChecked = async (
       reviewNodeId: string,
       reviewers: NodeDefinition[],
       policy: Parameters<WorkflowRuntime['runReview']>[2],
       reviewOpts: RunReviewOptions,
     ) => {
-      const review = await runtime.runReview(reviewNodeId, reviewers, policy, reviewOpts);
+      const review = await runtime.runReview(reviewNodeId, reviewers, policy, { ...reviewOpts, context: { ...liveRunCapsule(), ...(reviewOpts.context ?? {}) } });
       review.reviewArtifacts.forEach((artifact) => appendArtifact(reviewNodeId, artifact));
       return review;
     };
@@ -1397,8 +1432,11 @@ function authenticatedModelRefs(ctx: ExtensionContext): string[] {
 function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRunManager, binding: LiveRunBinding): void {
   if (ctx.mode !== 'tui') return;
   if (ctx.ui.getEditorComponent() !== binding.previousEditor) return;
+  const previous = binding.previousEditor;
   ctx.ui.setEditorComponent((tui, theme, keybindings) => {
-    const editor = new CustomEditor(tui, theme, keybindings);
+    // Compose with the editor installed by another extension. Do not silently
+    // replace its editing/history behavior; CustomEditor is only the fallback.
+    const editor = previous?.(tui, theme, keybindings) ?? new CustomEditor(tui, theme, keybindings);
     const select = async () => {
       const worker = live.activeFor(ctx);
       if (!worker) { ctx.ui.notify('当前没有可切换模型的 Worker', 'warning'); return; }
@@ -1418,9 +1456,12 @@ function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRunManager
       const next = candidates[(index + direction + candidates.length) % candidates.length];
       if (next) await workerInteractionModel(live, worker, next);
     };
-    editor.onAction('app.model.select', () => { void select(); });
-    editor.onAction('app.model.cycleForward', () => { void cycle(1); });
-    editor.onAction('app.model.cycleBackward', () => { void cycle(-1); });
+    const onAction = (editor as unknown as { onAction?: (action: string, handler: () => void) => void }).onAction;
+    if (onAction) {
+      onAction.call(editor, 'app.model.select', () => { void select(); });
+      onAction.call(editor, 'app.model.cycleForward', () => { void cycle(1); });
+      onAction.call(editor, 'app.model.cycleBackward', () => { void cycle(-1); });
+    }
     return editor;
   });
 }
@@ -1453,6 +1494,7 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
   pi.on('session_before_fork', async (_event, ctx) => ({ cancel: live.hasOwner(ctx) }));
   pi.on('session_shutdown', async () => { await live.shutdown(); });
   pi.on('session_start', async (event, ctx) => {
+    live.gc();
     if (event.reason === 'resume') {
       const unfinished = RunControlWal.list().filter((runId) => runId.startsWith('fix-'));
       if (unfinished.length) ctx.ui.notify(`发现 ${unfinished.length} 个可恢复的 Fix 运行；请确认后使用 Pi /resume`, 'warning');
@@ -1469,13 +1511,21 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
       const text = projection.eventKind === 'visible_text'
         ? projection.text ?? ''
         : `tool: ${projection.toolName ?? 'unknown'} ${JSON.stringify(projection.args ?? {}).slice(0, 500)}`;
-      return { render: (width: number) => [text.slice(0, Math.max(0, width))], invalidate: () => {} };
+      return { render: (width: number) => new Text(renderWorkerText(text, width), 0, 0).render(width), invalidate: () => {} };
     });
   }
 
   pi.registerCommand('fix', {
     description: 'Start a Fix workflow: /fix <问题描述>',
     handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const rebind = /^rebind\s+(\S+)$/u.exec(args.trim());
+      if (rebind) {
+        try {
+          const rebound = await live.rebindParent(ctx, rebind[1]!);
+          ctx.ui.notify(rebound ? `Fix 运行 ${rebind[1]} 已在当前目录重新绑定` : '已取消重新绑定', rebound ? 'info' : 'warning');
+        } catch (error) { ctx.ui.notify(`Fix 重新绑定失败：${error instanceof Error ? error.message : String(error)}`, 'error'); }
+        return;
+      }
       const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data));
       await handleFixCommand(ctx, args, { store, host, injected: (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker, live });
     },
@@ -1483,6 +1533,12 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
 }
 
 interface LiveWorkerMessageDetails { runId: string; ref: string; nodeId: string; eventKind: 'visible_text' | 'tool_start'; }
+
+/** Use Pi's terminal-width primitives rather than JS string slicing. */
+export function renderWorkerText(text: string, width: number): string {
+  const safeWidth = Math.max(1, Math.floor(width));
+  return wrapTextWithAnsi(text, safeWidth).map((line) => truncateToWidth(line, safeWidth, '')).join('\n');
+}
 
 type SupplementImages = Parameters<WorkflowInteractionPort['submitSupplement']>[0]['images'];
 async function workerInteraction(live: LiveFixRunManager, runId: string, expectedNodeExecutionId: string, text: string, images?: SupplementImages) {
