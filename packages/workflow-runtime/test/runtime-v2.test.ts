@@ -134,14 +134,19 @@ test('runReview passes with required quorum of independent reviewers', async () 
 
 test('review recovery keeps a durably committed reviewer and resumes the next participant after a checkpoint fault', async () => {
   const entries: { customType: string; data: Record<string, unknown> }[] = [];
+  const reviewParticipantCheckpoints = () => entries
+    .map(({ data }) => data)
+    .filter((checkpoint) => typeof checkpoint.reviewCycleId === 'string' && typeof checkpoint.reviewerIndex === 'number');
   let crashAfterReviewerOneCommit = true;
   const store = new PiSessionRunStore(
     { getEntries: () => entries },
     (type: string, data: unknown) => {
       entries.push({ customType: type, data: data as Record<string, unknown> });
       const checkpoint = data as Record<string, unknown>;
-      const progress = checkpoint.reviewProgress as { nextReviewerIndex?: number } | undefined;
-      if (crashAfterReviewerOneCommit && progress?.nextReviewerIndex === 1) {
+      // Inject the fault at the first review-related checkpoint. A split
+      // executeNode + runReview persistence scheme therefore fails before it
+      // can hide the missing cursor behind a second checkpoint.
+      if (crashAfterReviewerOneCommit && typeof checkpoint.reviewCycleId === 'string' && checkpoint.reviewerIndex === 0) {
         crashAfterReviewerOneCommit = false;
         throw new Error('crash after reviewer #1 participant commit');
       }
@@ -157,18 +162,32 @@ test('review recovery keeps a durably committed reviewer and resumes the next pa
     rootCauseConclusion: 'confirmed', evidenceSufficiency: 'sufficient' as const, gaps: [],
     conclusion: { status: 'accepted' as const, summary: 'ok' },
   });
+  const assertParticipantCheckpoint = (checkpoint: Record<string, unknown>, reviewerIndex: number, workerId: string) => {
+    const artifacts = (checkpoint.artifacts as unknown[]).filter((artifact) => {
+      const value = artifact as { kind?: string; reviewerIndex?: number; workerId?: string };
+      return value.kind === 'investigation_review' && value.reviewerIndex === reviewerIndex && value.workerId === workerId;
+    });
+    assert.equal(artifacts.length, 1, `reviewer #${reviewerIndex + 1} checkpoint must contain its Artifact exactly once`);
+    const progress = checkpoint.reviewProgress as { nextReviewerIndex?: number; reviewerWorkerIds?: string[] } | undefined;
+    assert.ok(progress, `reviewer #${reviewerIndex + 1} checkpoint must contain reviewProgress`);
+    assert.equal(progress.nextReviewerIndex, reviewerIndex + 1);
+    assert.deepEqual(progress.reviewerWorkerIds, Array.from({ length: reviewerIndex + 1 }, (_, index) => `reviewer-${index + 1}`));
+    assert.equal(checkpoint.activeReviewAttempt, undefined, `reviewer #${reviewerIndex + 1} checkpoint must clear activeReviewAttempt`);
+  };
   const reviewerOne: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-1', execute: async () => { reviewerOneCalls += 1; return reviewArtifact('reviewer-1'); } } };
   const reviewerTwo: NodeDefinition = { id: 'investigation_review', worker: { workerId: 'reviewer-2', execute: async () => { reviewerTwoCalls += 1; return reviewArtifact('reviewer-2'); } } };
   const policy = { reviewers: [{ model: 'inherit' }, { model: 'inherit' }], mode: 'parallel' as const, requiredApprovals: 2, requireIndependentWorker: true, excludeNodes: ['investigate'], onRejected: 'return_to_investigation' };
   await assert.rejects(firstRuntime.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' }));
-  const committed = entries.at(-1)!.data;
-  assert.equal((committed.reviewProgress as { nextReviewerIndex: number }).nextReviewerIndex, 1);
-  assert.equal((committed.reviewProgress as { approvals: number }).approvals, 1);
-  assert.equal((committed.artifacts as unknown[]).filter((artifact) => (artifact as { kind?: string }).kind === 'investigation_review').length, 1);
-  assert.equal(committed.activeReviewAttempt, undefined);
+  const firstParticipantCheckpoints = reviewParticipantCheckpoints();
+  assert.equal(firstParticipantCheckpoints.length, 1, 'reviewer #1 must have exactly one participant checkpoint');
+  assertParticipantCheckpoint(firstParticipantCheckpoints[0]!, 0, 'reviewer-1');
 
   const recovered = WorkflowRuntime.restore(makeDefinition(), store, 'run-1');
   const result = await recovered.runReview('investigation_review', [reviewerOne, reviewerTwo], policy, { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review' });
+  const participantCheckpoints = reviewParticipantCheckpoints();
+  assert.equal(participantCheckpoints.length, 2, 'each review participant must have exactly one participant checkpoint');
+  assertParticipantCheckpoint(participantCheckpoints.find((checkpoint) => checkpoint.reviewerIndex === 0)!, 0, 'reviewer-1');
+  assertParticipantCheckpoint(participantCheckpoints.find((checkpoint) => checkpoint.reviewerIndex === 1)!, 1, 'reviewer-2');
   assert.equal(result.passed, true);
   assert.equal(reviewerOneCalls, 1, 'reviewer #1 must not be rerun');
   assert.equal(reviewerTwoCalls, 1, 'reviewer #2 continues from the committed cursor');
