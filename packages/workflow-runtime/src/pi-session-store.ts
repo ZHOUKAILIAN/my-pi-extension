@@ -4,9 +4,16 @@ const STAGES: ReadonlySet<string> = new Set(['INTAKE', 'INVESTIGATING', 'DISPOSI
 
 /** 主 Pi session 的 entry 是持久化真相；内存只负责当前调用的轻量缓存。 */
 export class PiSessionRunStore implements RunStore {
-  private readonly sessionManager: { getEntries(): readonly unknown[] }; private readonly append: (type: string, data: Checkpoint) => void;
-  constructor(sessionManager: { getEntries(): readonly unknown[] }, append: (type: string, data: Checkpoint) => void) { this.sessionManager=sessionManager; this.append=append; }
+  private readonly sessionManager: { getEntries(): readonly unknown[]; getBranch?: (fromId?: string) => readonly unknown[]; getLeafId?: () => string | null };
+  private readonly append: (type: string, data: Checkpoint) => void;
+  constructor(sessionManager: { getEntries(): readonly unknown[]; getBranch?: (fromId?: string) => readonly unknown[]; getLeafId?: () => string | null }, append: (type: string, data: Checkpoint) => void) { this.sessionManager=sessionManager; this.append=append; }
   saveCheckpoint(c: Checkpoint) { this.append('workflow-run', c); }
+  /** Run Control WAL is authoritative for new interaction facts. Legacy checkpoints are
+   * read only from the current parent branch, never from sibling tree entries. */
+  private activeEntries(): readonly unknown[] {
+    if (typeof this.sessionManager.getBranch === 'function') return this.sessionManager.getBranch(this.sessionManager.getLeafId?.() ?? undefined);
+    return this.sessionManager.getEntries();
+  }
   private parseCheckpoint(entry: unknown): Checkpoint | undefined {
     const e = entry as { customType?: string; data?: unknown };
     if (e.customType !== 'workflow-run' || !e.data || typeof e.data !== 'object') return undefined;
@@ -14,11 +21,11 @@ export class PiSessionRunStore implements RunStore {
     return typeof c.runId === 'string' && typeof c.id === 'string' && typeof c.at === 'number' && typeof c.stage === 'string' && STAGES.has(c.stage) ? c as Checkpoint : undefined;
   }
   loadLast(runId: string) {
-    return this.sessionManager.getEntries().map(e => this.parseCheckpoint(e)).filter((c): c is Checkpoint => !!c && c.runId === runId).at(-1);
+    return this.activeEntries().map(e => this.parseCheckpoint(e)).filter((c): c is Checkpoint => !!c && c.runId === runId).at(-1);
   }
   latestUncompleted(prefixes: readonly string[] = ['fix-', 'bugFix-']) {
     const lastByRun = new Map<string, { checkpoint: Checkpoint; position: number }>();
-    this.sessionManager.getEntries().forEach((entry, position) => {
+    this.activeEntries().forEach((entry, position) => {
       const c = this.parseCheckpoint(entry);
       if (c && prefixes.some((prefix) => c.runId.startsWith(prefix))) lastByRun.set(c.runId, { checkpoint: c, position });
     });

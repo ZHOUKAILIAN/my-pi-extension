@@ -1,6 +1,11 @@
-import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir, type ToolDefinition, type ResourceLoader } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, SessionManager, SettingsManager, DefaultResourceLoader, getAgentDir, type ToolDefinition, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { Artifact, NodeDefinition, WorkerExecutor, Capsule } from '@pi/workflow-contracts';
 import { ArtifactContractError, validateSubmitArtifact, NODE_ARTIFACT_KINDS, ARTIFACT_JSON_SCHEMAS } from '@pi/workflow-contracts';
+import { mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import type { ActiveWorkerRegistry, WorkflowInteractionPort } from './interaction.ts';
+import type { RunControlWal } from './run-control-wal.ts';
 
 export type WorkerProgress =
   | { type: 'tool_start'; name: string; args: unknown }
@@ -115,6 +120,14 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
     onProgress?: (progress: WorkerProgress) => void;
+    live?: {
+      registry: ActiveWorkerRegistry;
+      interaction: WorkflowInteractionPort;
+      wal: RunControlWal;
+      parentSessionId: string;
+      parentLeafId: string;
+      sidecarDir?: string;
+    };
   };
 
   constructor(options: {
@@ -126,6 +139,14 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
     onProgress?: (progress: WorkerProgress) => void;
+    live?: {
+      registry: ActiveWorkerRegistry;
+      interaction: WorkflowInteractionPort;
+      wal: RunControlWal;
+      parentSessionId: string;
+      parentLeafId: string;
+      sidecarDir?: string;
+    };
   } = {}) {
     this.options = options;
   }
@@ -152,6 +173,11 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           throw error;
         }
         captured = params;
+        const live = this.options.live;
+        const execution = capsule as { runId?: string; nodeExecutionId?: string; workerId?: string };
+        if (live && execution.runId === live.wal.runId) {
+          live.interaction.bindArtifact(execution.runId, captured);
+        }
         return { content: [{ type: 'text', text: 'captured' }], details: {} };
       },
     };
@@ -195,14 +221,63 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
 
     const create = this.options.createSession ?? createAgentSession;
     if (!this.options.model && !this.options.createSession) throw Error('model must be explicitly configured');
+    const live = this.options.live;
+    let sessionManager = SessionManager.inMemory();
+    let recoveredSessionFile: string | undefined;
+    if (live) {
+      const sessionDir = live.sidecarDir ?? join(live.wal.runDir, 'workers');
+      mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+      chmodSync(sessionDir, 0o700);
+      const execution = capsule as { nodeExecutionId?: string };
+      const prior = live.wal.records().reverse().find((record) => record.type === 'worker' && record.payload.kind === 'session_started' && record.payload.nodeExecutionId === execution.nodeExecutionId && typeof record.payload.sessionFile === 'string');
+      if (prior && existsSync(String(prior.payload.sessionFile))) {
+        recoveredSessionFile = String(prior.payload.sessionFile);
+        sessionManager = SessionManager.open(recoveredSessionFile, sessionDir, this.options.cwd ?? process.cwd());
+      } else {
+        sessionManager = SessionManager.create(this.options.cwd ?? process.cwd(), sessionDir);
+      }
+    }
     const { session } = await create({
       tools: node.profile?.tools ?? [],
       customTools: [submit],
       resourceLoader: scopedLoader,
-      sessionManager: SessionManager.inMemory(),
+      sessionManager,
+      // Child SettingsManager is deliberately in-memory. Passing the parent
+      // manager here would make setModel mutate the user's global default.
+      settingsManager: SettingsManager.inMemory(),
       ...(this.options.model ? { model: this.options.model as any } : {}),
       ...(this.options.thinkingLevel !== undefined ? { thinkingLevel: this.options.thinkingLevel } : {}),
     } as any);
+
+    let liveHandle: any;
+    if (live) {
+      const execution = capsule as { runId: string; nodeExecutionId: string; workerId: string };
+      const model = (this.options.model ?? (session as any).model) as { provider?: string; id?: string } | undefined;
+      const workerSessionId = String((session as any).sessionId ?? randomUUID());
+      liveHandle = {
+        runId: execution.runId,
+        parentSessionId: live.parentSessionId,
+        parentLeafId: live.parentLeafId,
+        nodeExecutionId: execution.nodeExecutionId,
+        workerId: execution.workerId,
+        workerSessionId,
+        attemptId: randomUUID(),
+        actualModel: { provider: String(model?.provider ?? 'unknown'), id: String(model?.id ?? 'unknown') },
+        status: 'starting',
+        contextSupplementVersion: live.wal.getSupplementVersion(),
+        session,
+        wal: live.wal,
+        interaction: live.interaction,
+      };
+      try {
+        live.registry.register(liveHandle);
+        live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId, attemptId: liveHandle.attemptId, sessionFile: sessionManager.getSessionFile?.(), ...(recoveredSessionFile ? { recoveredFromSessionFile: recoveredSessionFile } : {}) });
+      } catch (error) {
+        live.registry.unregister(liveHandle.runId, liveHandle.workerSessionId);
+        liveHandle.session.dispose?.();
+        throw error;
+      }
+    }
 
     let streamedText = '';
     let lastAssistantText = '';
@@ -215,6 +290,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       try {
         validateSubmitArtifact(candidate);
         captured = candidate;
+        if (liveHandle) live!.interaction.bindArtifact(liveHandle.runId, captured);
         this.options.onProgress?.({ type: 'artifact_fallback', artifact: captured });
       } catch (error) {
         if (error instanceof ArtifactContractError) fallbackRejected = error;
@@ -222,6 +298,17 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     };
     const unsubscribe = typeof (session as any).subscribe === 'function'
       ? (session as any).subscribe((event: any) => {
+        if (liveHandle && event.type === 'agent_start') {
+          liveHandle.status = 'streaming';
+          const modelCallRef = `${liveHandle.workerSessionId}:${Date.now()}`;
+          liveHandle.onModelCall?.(modelCallRef);
+          const pending = liveHandle.wal.records().find((record: any) => record.type === 'worker' && record.payload.kind === 'model_change' && record.payload.state === 'pending');
+          if (pending) {
+            if (pending.payload.actualModel && typeof pending.payload.actualModel === 'object') liveHandle.actualModel = pending.payload.actualModel;
+            liveHandle.wal.recordWorker({ ...pending.payload, state: 'applied', effectiveFromModelCallRef: modelCallRef });
+          }
+        }
+        if (liveHandle && event.type === 'agent_settled') liveHandle.status = 'idle';
         if (event.type === 'tool_execution_start') {
           this.options.onProgress?.({ type: 'tool_start', name: event.toolName, args: event.args });
         }
@@ -232,6 +319,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           streamedText += event.assistantMessageEvent.delta;
         }
         if (event.type === 'message_end' && event.message?.role === 'assistant') {
+          if (liveHandle && !event.message.errorMessage) live!.interaction.recordModelCallCompleted(liveHandle.runId, `${liveHandle.workerSessionId}:${Date.now()}`);
           modelStopReason = event.message.stopReason;
           modelErrorMessage = event.message.errorMessage;
           const text = Array.isArray(event.message.content)
@@ -320,6 +408,15 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       return captured;
     } finally {
       unsubscribe?.();
+      if (liveHandle) {
+        liveHandle.status = captured ? 'settled' : 'failed';
+        try {
+          live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, status: liveHandle.status });
+        } finally {
+          live!.interaction.closeWorker(liveHandle.runId, liveHandle.status);
+          liveHandle.session.dispose?.();
+        }
+      }
     }
   }
 }

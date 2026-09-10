@@ -36,6 +36,8 @@ import {
 export * from '@pi/workflow-contracts';
 export * from './pi-session-store.ts';
 export * from './pi-sdk-worker.ts';
+export * from './run-control-wal.ts';
+export * from './interaction.ts';
 
 // checkpoint 中的业务事实只允许由 Worker 信封携带（executeNode 盖章）。
 // user_decision 不参与 executeNode/runNode 的 Worker 提交（唯一产出者是 Runtime.decide 的受控
