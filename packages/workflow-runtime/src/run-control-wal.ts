@@ -153,6 +153,7 @@ export class RunControlWal {
           ...(wal.headerBinding.parentSessionId !== undefined ? { parentSessionId: wal.headerBinding.parentSessionId } : {}),
           ...(wal.headerBinding.parentLeafId !== undefined ? { parentLeafId: wal.headerBinding.parentLeafId } : {}),
           ...(wal.headerBinding.parentSessionFile !== undefined ? { parentSessionFile: wal.headerBinding.parentSessionFile } : {}),
+          parentSessionFileExists: wal.headerBinding.parentSessionFile !== undefined && existsSync(wal.headerBinding.parentSessionFile),
           ...(wal.headerBinding.cwd !== undefined ? { cwd: wal.headerBinding.cwd } : {}),
         });
       }
@@ -208,7 +209,11 @@ export class RunControlWal {
     const effective = rebinding?.payload.to && typeof rebinding.payload.to === 'object'
       ? rebinding.payload.to as Record<string, unknown>
       : header.payload;
-    for (const field of ['parentSessionId', 'parentLeafId', 'parentSessionFile', 'cwd'] as const) {
+    // parentLeafId is a branch cursor, not a session identity. The Fix
+    // recovery scanner validates that the header leaf is an ancestor/member of
+    // the current active branch before opening this WAL; requiring equality
+    // here would reject a legitimate workflow entry that advanced the leaf.
+    for (const field of ['parentSessionId', 'parentSessionFile', 'cwd'] as const) {
       const expected = this.headerBinding[field];
       if (expected !== undefined && effective[field] !== expected) throw new RunControlWalError('WAL_HEADER_BINDING_MISMATCH', `run ${this.runId} binding ${field} does not match the current parent context`);
     }
@@ -311,7 +316,7 @@ export class RunControlWal {
       const header = this.recordsUnlocked().find((record) => record.type === 'header');
       if (!header || typeof header.payload.cwd !== 'string' || header.payload.cwd !== input.cwd) throw new RunControlWalError('PARENT_REBIND_CWD_MISMATCH', 'parent rebind is allowed only in the original cwd');
       const previous = this.recordsUnlocked().filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to ?? header.payload;
-      return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, ...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile } : {}), cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
+      return this.appendLocked('worker', { kind: 'parent_rebind', from: previous, to: { parentSessionId: input.parentSessionId, parentLeafId: input.parentLeafId, ...(input.parentSessionFile ? { parentSessionFile: input.parentSessionFile, parentSessionFileExists: existsSync(input.parentSessionFile) } : { parentSessionFileExists: false }), cwd: input.cwd }, confirmedAt: new Date(this.now()).toISOString() });
     });
   }
 
@@ -373,31 +378,69 @@ export class RunControlWalStore implements RunStore {
     const checkpointEntry = records.map((record, index) => ({ record, index })).filter((item): item is { record: RunControlRecord & { type: 'checkpoint' }; index: number } => item.record.type === 'checkpoint' && typeof item.record.payload.checkpoint === 'object' && item.record.payload.checkpoint !== null).filter((item) => (item.record.payload.checkpoint as Checkpoint).runId === runId).at(-1);
     if (!checkpointEntry) return undefined;
     const checkpoint = checkpointEntry.record.payload.checkpoint as Checkpoint;
-    // A Child identity is appended before createAgentSession. If the process
-    // dies in that startup gap, project that durable identity into restore even
-    // though no later Runtime checkpoint exists. This also covers review nodes.
-    const started = records.map((record, index) => ({ record, index })).reverse().find((item) => item.index > checkpointEntry.index && item.record.type === 'worker' && item.record.payload.kind === 'session_started');
-    if (!started) return checkpoint;
-    const executionId = String(started.record.payload.nodeExecutionId);
+
+    // Fold the lifecycle by the durable Child identity, not by “the last
+    // session_started”. A reviewer which already emitted session_settled (or
+    // close_fence) is historical evidence and must never become an active
+    // recovery cursor. attemptId is included when present so a retry of the
+    // same logical node is not mistaken for the settled attempt.
+    const keyFor = (payload: Record<string, unknown>) => [
+      payload.nodeExecutionId,
+      payload.workerSessionId,
+      payload.attemptId ?? payload.recoveryAttempt ?? payload.runAttempt,
+    ].map((value) => String(value ?? '')).join('\\0');
+    const lifecycle = new Map<string, { started: RunControlRecord & { type: 'worker' }; index: number; settled: boolean; fenced: boolean }>();
+    const findLifecycle = (payload: Record<string, unknown>) => lifecycle.get(keyFor(payload))
+      ?? [...lifecycle.values()].reverse().find((item) => item.started.payload.nodeExecutionId === payload.nodeExecutionId && item.started.payload.workerSessionId === payload.workerSessionId);
+    for (const [index, record] of records.entries()) {
+      if (record.type === 'worker' && record.payload.kind === 'session_started') {
+        lifecycle.set(keyFor(record.payload), { started: record as RunControlRecord & { type: 'worker' }, index, settled: false, fenced: false });
+      } else if (record.type === 'worker' && record.payload.kind === 'session_settled') {
+        const item = findLifecycle(record.payload);
+        if (item) item.settled = true;
+      } else if (record.type === 'close_fence') {
+        const item = findLifecycle(record.payload);
+        if (item) item.fenced = true;
+      }
+    }
+    const active = [...lifecycle.values()]
+      .filter((item) => item.index > checkpointEntry.index && !item.settled && !item.fenced)
+      .sort((a, b) => a.index - b.index)
+      .at(-1);
+    if (!active) {
+      // In particular, do not return a checkpoint's reviewer cursor after its
+      // corresponding Child has settled. The participant Artifact remains in
+      // checkpoint.artifacts and runReview derives the next participant from it.
+      if (checkpoint.activeReviewAttempt) {
+        const copy = { ...checkpoint };
+        delete copy.activeReviewAttempt;
+        return copy;
+      }
+      return checkpoint;
+    }
+    const started = active.started;
+    const executionId = String(started.payload.nodeExecutionId);
     const prefix = `${runId}.`;
     const nodeId = executionId.startsWith(prefix) ? executionId.slice(prefix.length).split('.')[0] : undefined;
+    const isReviewer = typeof started.payload.reviewCycleId === 'string' && typeof started.payload.reviewerIndex === 'number'
+      && (typeof started.payload.reviewerWorkerId === 'string' || typeof started.payload.workerId === 'string');
     return {
       ...checkpoint,
       ...(nodeId ? { activeNodeId: nodeId } : {}),
       nodeExecutionId: executionId,
       logicalNodeExecutionId: executionId,
-      recoveryAttempt: typeof started.record.payload.recoveryAttempt === 'number' ? started.record.payload.recoveryAttempt : checkpoint.recoveryAttempt,
-      ...(typeof started.record.payload.reviewCycleId === 'string' ? { reviewCycleId: started.record.payload.reviewCycleId } : {}),
-      ...(typeof started.record.payload.reviewerIndex === 'number' ? { reviewerIndex: started.record.payload.reviewerIndex } : {}),
-      ...(typeof started.record.payload.reviewerWorkerId === 'string' || typeof started.record.payload.workerId === 'string' ? { reviewerWorkerId: String(started.record.payload.reviewerWorkerId ?? started.record.payload.workerId) } : {}),
-      ...(started.record.payload.reviewerParticipant && typeof started.record.payload.reviewerParticipant === 'object' ? { reviewerParticipant: started.record.payload.reviewerParticipant as any } : {}),
-      ...(typeof started.record.payload.reviewCycleId === 'string' && typeof started.record.payload.reviewerIndex === 'number' && (typeof started.record.payload.reviewerWorkerId === 'string' || typeof started.record.payload.workerId === 'string') ? {
+      recoveryAttempt: typeof started.payload.recoveryAttempt === 'number' ? started.payload.recoveryAttempt : checkpoint.recoveryAttempt,
+      ...(typeof started.payload.reviewCycleId === 'string' ? { reviewCycleId: started.payload.reviewCycleId } : {}),
+      ...(typeof started.payload.reviewerIndex === 'number' ? { reviewerIndex: started.payload.reviewerIndex } : {}),
+      ...(typeof started.payload.reviewerWorkerId === 'string' || typeof started.payload.workerId === 'string' ? { reviewerWorkerId: String(started.payload.reviewerWorkerId ?? started.payload.workerId) } : {}),
+      ...(started.payload.reviewerParticipant && typeof started.payload.reviewerParticipant === 'object' ? { reviewerParticipant: started.payload.reviewerParticipant as any } : {}),
+      ...(isReviewer ? {
         activeReviewAttempt: {
-          reviewerIndex: started.record.payload.reviewerIndex,
-          workerId: String(started.record.payload.reviewerWorkerId ?? started.record.payload.workerId),
-          cycleId: started.record.payload.reviewCycleId,
+          reviewerIndex: Number(started.payload.reviewerIndex),
+          workerId: String(started.payload.reviewerWorkerId ?? started.payload.workerId),
+          cycleId: String(started.payload.reviewCycleId),
           nodeExecutionId: executionId,
-          attempt: typeof started.record.payload.attempt === 'number' ? started.record.payload.attempt : (typeof started.record.payload.recoveryAttempt === 'number' ? started.record.payload.recoveryAttempt : 1),
+          attempt: typeof started.payload.attempt === 'number' ? started.payload.attempt : (typeof started.payload.recoveryAttempt === 'number' ? started.payload.recoveryAttempt : 1),
         },
       } : {}),
     };

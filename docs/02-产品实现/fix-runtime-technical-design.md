@@ -1,7 +1,7 @@
 # Fix Runtime 技术设计（L2 目标设计与当前实现）
 
 - 层级：第二层（L2）
-- 状态：`DECIDED`（目标机制已采纳；§6.1 统一对话能力仍未实现）
+- 状态：`DECIDED`（§6.1 运行中统一对话机制已实现；真实 provider/长时 TUI 与进程级崩溃回放仍未验证）
 - 上游：[Fix Extension 产品规范](../01-产品定义/扩展/fix-扩展.md)
 
 > L1 定义 Fix 必须保证什么；本文定义 Runtime 怎样把这些保证落成可执行的 Stage、Node、Policy、Artifact、Guard、验证和恢复机制。源码与测试仍是当前运行事实；尚未实现的目标在文中明确标注。
@@ -840,11 +840,11 @@ Provenance 与验收重放（见本节“恢复”段落）：
 
 Pi 原生 `/resume` 负责选择并恢复历史 session。Fix 不注册自己的 `/resume` 命令；`session_start` 的 `reason=resume` 只允许 Fix 检查当前被恢复 session 内的未完成 Fix checkpoint。用户确认后，Controller 才能从该 checkpoint 继续原 `runId`；不得跨 session 搜索，不得创建新的 `runId`，也不得在没有用户确认时自动推进。投递 outbox 的恢复可以由 session 生命周期触发，但必须与 Fix Run 的恢复分开。
 
-### 6.1 执行中统一对话协作（目标设计，未实现）
+### 6.1 执行中统一对话协作（机制已实现，运行验证未完成）
 
-当前 `PiSdkWorkerExecutor.execute()` 每次创建 `SessionManager.inMemory()`，`session` 只存在于方法局部作用域。它通过 `subscribe()` 向 `WorkerProgress` 单向投影部分模型/工具事件；外层没有 Session handle，因此原输入框不能调用该 Worker 的 `steer()` / `prompt()`，正常模型选择也不能作用于当前 Worker。外层重试再次调用 `execute()` 时创建的是新内存 Session，不是恢复原 Worker 对话。
+`PiSdkWorkerExecutor.execute()` 仍在每个 Node attempt 创建 `SessionManager.inMemory()`，Session 在 Node 完成后释放；但执行期间由 `ActiveWorkerRegistry` 暴露受控 handle，`WorkflowInteractionPort` 可将输入路由到当前 Child 的 `steer()` / `prompt()`，模型 picker 也只作用于该 Child。外层重试创建的是同一逻辑 Node 的新 attempt，不冒充恢复原 Worker Session。自动化覆盖 Pi 0.84.2 ExtensionRunner、队列重入、生命周期 fail-closed 和模型/输入身份 fence；真实 provider、长时 TUI/PTY 和进程级崩溃 replay 仍未验证。
 
-目标设计在不改变 Workflow 控制权的前提下增加运行中协作。`/fix` 在持久化启动事实并建立首个 Worker 后把 Run 交给 Extension 管理的后台任务，command handler 随即返回；`input` hook 在存在当前 Worker 时处理普通输入，避免它进入主 Session pending queue。Worker 事件原文写入受保护 UI sidecar，parent entry只写 opaque ref并由 renderer 投影回原对话，不触发主 Agent 推理；`session_shutdown` best-effort停止接收新输入并清理后台任务；控制恢复依赖此前已 fsync 的 WAL，而不假设 shutdown 一定完成保存：
+实现保持 Workflow 控制权不变：`/fix` 持久化启动事实并建立首个 Worker 后由 Extension 管理运行句柄；`input` hook 在存在当前 Worker 时处理普通输入，避免进入主 Session pending queue。Worker 事件原文写入受保护 UI sidecar，parent entry 只写 opaque ref 并由 renderer 投影回原对话，不触发主 Agent 推理；`session_shutdown` best-effort 停止接收新输入并清理后台任务；控制恢复依赖此前已 fsync 的 WAL，而不假设 shutdown 一定完成保存：
 
 ```mermaid
 sequenceDiagram
@@ -958,7 +958,7 @@ Host adapter 的 fail-closed 必须通过返回值实现而不是依赖抛错：
 
 ## 7. Audit Event 与漏斗计算
 
-本节把 L1 的流程漏斗、质量漏斗和自动化准入漏斗落实为可重算的数据模型。当前源码尚未实现这些完整事件和聚合器；本节是目标 L2 设计，不能作为当前已有指标的声明。
+本节把 L1 的流程漏斗、质量漏斗和自动化准入漏斗落实为可重算的数据模型。当前源码已产生核心 Run/Artifact/Review/Decision 事件并可由 host audit sink 接收；完整事件覆盖和 Projector/Snapshot 仍是后续目标，不能把本节完整模型当作当前指标已全部实现。
 
 ### 7.1 数据流与责任边界
 
@@ -1243,13 +1243,12 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 - ACCEPTED：仅由 decide(approve) 经完整 Acceptance 进入
 ```
 
-当前尚未实现（已记录的 drift / 后续专项，不在本节之外声称完成；分期依据 L1「第一版范围」）：
+当前仍未完成（已记录的 drift / 后续专项；已实现机制与未验证边界见 §6.1 和 README 验证表；分期依据 L1「第一版范围」）：
 
 ```text
 第一版待做：
 - owner 重构：Fix 业务执行门禁（review kind 映射、check satisfier、change_plan_review gate）与
   PendingDecisionKind 语义迁回 packages/fix，或改为 WorkflowDefinition 显式 hook
-- 统一对话中的当前 Worker 展示、用户补充信息路由/消费和当前 Worker 模型切换（§6.1）
 - 5 步公开漏斗与公开 API 合入（feat/fix-metrics-cloudflare 分支已实现，见 §7.7）
 
 后续版本（第一版由人工验收兑底）：
@@ -1268,7 +1267,7 @@ INTAKE → INVESTIGATING → DISPOSITION → IMPLEMENTING → VERIFYING → WAIT
 ### TODO 跟踪
 
 - [ ] **owner 重构（第一版，优先）**：Fix 业务执行门禁（`BUSINESS_ARTIFACT_KINDS` / `NODE_ARTIFACT_KINDS` / `REVIEWED_KIND_BY_REVIEW_KIND` / `REVIEW_CHECK_SATISFIERS` / `assertChangePlanReviewGate` / legacy `fixNodes`）与 `PendingDecisionKind` 语义迁回 `packages/fix`，或改为 WorkflowDefinition 显式 hook；启动 Feature workflow 前必须完成
-- [ ] **统一对话 Worker 协作（第一版）**：实现后台 Run、Active Worker Registry、Extension Run Control WAL、原输入框补充生命周期/close fence/Artifact revision、Child 专用模型 picker、恢复和 Pi TUI/真实 provider E2E；不得以 tmux 或新增普通用户命令替代
+- [x] **统一对话 Worker 协作机制（第一版）**：后台 Run、Active Worker Registry、Extension Run Control WAL、原输入框补充生命周期/close fence、Child 专用模型 picker 和恢复机制已实现；真实 provider、长时 Pi TUI/PTY 与进程级 crash replay E2E 仍待验证，不得以自动化测试替代
 - [ ] **5 步公开漏斗合入（第一版）**：合入 `feat/fix-metrics-cloudflare` 分支（§7.7 公共漏斗、公开 API 与低样本保护）
 - [ ] **L2 §7.1–7.6 文档收敛（第一版）**：标注为已归档目标，或以 L2 内容重写归档件（原件已丢失，见 README drift 表）；仅 §7.7 保持第一版活跃目标设计
 - [ ] **最终处置报告完整模板（后续优化）**：扩展 `investigation` / `verification` / `disposition` 合同字段并重写渲染；方案与评审见归档评审件《2026-08-29-fix-报告重构-方案与评审》

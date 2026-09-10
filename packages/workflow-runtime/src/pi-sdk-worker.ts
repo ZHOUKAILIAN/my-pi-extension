@@ -445,7 +445,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       if (liveHandle) {
         liveHandle.status = captured ? 'settled' : 'failed';
         try {
-          live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, status: liveHandle.status });
+          live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, attemptId: liveHandle.attemptId, status: liveHandle.status });
         } finally {
           try {
             await live!.interaction.closeWorker(liveHandle.runId, liveHandle.status);

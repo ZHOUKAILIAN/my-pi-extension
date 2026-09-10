@@ -160,7 +160,11 @@ test('checkpoint stage 序列覆盖 8 阶段主流程', async () => {
   // 启动标记（run_started 一次性语义的落盘）先于业务 checkpoint 写入，因此在 INTAKE 阶段会
   // 出现两条 workflow-run 条目：run-start 条目与 started 标记条目。业务阶段序列从 INVESTIGATING 起。
   const stages = workflowRuns(h).map((entry) => entry.data.stage);
-  assert.deepEqual(stages, ['INTAKE', 'INTAKE', 'INVESTIGATING', 'DISPOSITION', 'IMPLEMENTING', 'VERIFYING', 'WAITING_FOR_USER', 'ACCEPTED']);
+  // Reviewer participant checkpoints are intentionally emitted within the
+  // current stage so a crash can resume the next participant. Collapse those
+  // same-stage progress records for the lifecycle assertion.
+  const stageTransitions = stages.filter((stage, index) => index === 0 || stage !== stages[index - 1]);
+  assert.deepEqual(stageTransitions, ['INTAKE', 'INVESTIGATING', 'DISPOSITION', 'IMPLEMENTING', 'VERIFYING', 'WAITING_FOR_USER', 'ACCEPTED']);
 });
 
 test('/fix review 无待评审 run 时只 notify，不起新 run', async () => {

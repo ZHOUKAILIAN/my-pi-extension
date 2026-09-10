@@ -17,7 +17,7 @@ const millis = (iso: unknown, fallback: number) => {
   return Number.isFinite(value) ? value : fallback;
 };
 
-export interface GarbageCollectionOptions { now?: number; retentionMs?: number; orphanDeadlineMs?: number; }
+export interface GarbageCollectionOptions { now?: number; retentionMs?: number; orphanDeadlineMs?: number; /** Test-only fault injection; production defaults to rmSync. */ removeTrash?: (path: string) => void; }
 
 /**
  * Run-level GC. WAL parsing, the per-run operation lock, and lease semantics
@@ -33,24 +33,24 @@ export class RunGarbageCollector {
     if (!existsSync(workflowDir)) return 0;
     // A failed async delete leaves the root tombstone and a .trash directory;
     // retry those directories on every later scan instead of abandoning them.
-    this.retryTrash(workflowDir);
+    this.retryTrash(workflowDir, options.removeTrash);
     let removed = 0;
     for (const entry of readdirSync(workflowDir, { withFileTypes: true })) {
       if (!entry.isDirectory() || entry.name === 'locks' || entry.name.startsWith('.trash-')) continue;
       const runDir = join(workflowDir, entry.name);
-      if (this.collectOne(rootDir, workflowDir, runDir, entry.name, now, retentionMs, orphanDeadlineMs)) removed += 1;
+      if (this.collectOne(rootDir, workflowDir, runDir, entry.name, now, retentionMs, orphanDeadlineMs, options.removeTrash)) removed += 1;
     }
     return removed;
   }
 
-  private static retryTrash(workflowDir: string) {
+  private static retryTrash(workflowDir: string, removeTrash?: (path: string) => void) {
     for (const entry of readdirSync(workflowDir, { withFileTypes: true })) {
       if (!entry.isDirectory() || !entry.name.startsWith('.trash-')) continue;
-      try { rmSync(join(workflowDir, entry.name), { recursive: true, force: false }); syncDir(workflowDir); } catch { /* next scan retries */ }
+      try { (removeTrash ?? ((path: string) => rmSync(path, { recursive: true, force: false })))(join(workflowDir, entry.name)); syncDir(workflowDir); } catch { /* next scan retries */ }
     }
   }
 
-  private static collectOne(rootDir: string, workflowDir: string, runDir: string, runId: string, now: number, retentionMs: number, orphanDeadlineMs: number): boolean {
+  private static collectOne(rootDir: string, workflowDir: string, runDir: string, runId: string, now: number, retentionMs: number, orphanDeadlineMs: number, removeTrash?: (path: string) => void): boolean {
     const marker = runTombstonePath(rootDir, runId);
     if (existsSync(marker) || !existsSync(join(runDir, 'control.wal'))) return false;
     try {
@@ -68,6 +68,17 @@ export class RunGarbageCollector {
         const records = readRunControlRecords(join(runDir, 'control.wal'), runId);
         const header = records.find((record) => record.type === 'header')?.payload ?? {};
         if (!records.some((record) => record.type === 'header')) return false;
+        // Parent rebind is append-only. Fold the newest structurally valid
+        // target; the original header is never used once a rebind exists.
+        const validParent = (value: unknown): value is Record<string, unknown> => {
+          if (!value || typeof value !== 'object') return false;
+          const parent = value as Record<string, unknown>;
+          return typeof parent.parentSessionId === 'string' && typeof parent.parentLeafId === 'string' && typeof parent.cwd === 'string'
+            && (parent.parentSessionFile === undefined || typeof parent.parentSessionFile === 'string');
+        };
+        const reboundParent = records.map((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind' ? record.payload.to : undefined)
+          .reverse().find(validParent);
+        const effectiveParent = reboundParent ?? header;
         const maxEpoch = records.reduce((max, record) => Math.max(max, record.epoch), 0);
         if (lease && (typeof lease.epoch !== 'number' || lease.epoch < maxEpoch)) return false;
 
@@ -89,7 +100,8 @@ export class RunGarbageCollector {
         // Only a settled run with an original parent file in its header can be
         // classified as an orphan. Record first observation durably and use the
         // earlier of normal settled retention and the seven-day orphan window.
-        if (terminal && typeof header.parentSessionFile === 'string' && header.parentSessionFile.length > 0 && !existsSync(header.parentSessionFile)) {
+        if (terminal && effectiveParent.parentSessionFileExists === false
+          || terminal && typeof effectiveParent.parentSessionFile === 'string' && effectiveParent.parentSessionFile.length > 0 && !existsSync(effectiveParent.parentSessionFile)) {
           let observedAt: number | undefined;
           const observation = gcObservationPath(runDir);
           if (existsSync(observation)) {
@@ -118,7 +130,7 @@ export class RunGarbageCollector {
         renameSync(runDir, trash);
         syncDir(workflowDir);
         setImmediate(() => {
-          try { rmSync(trash, { recursive: true, force: false }); syncDir(workflowDir); } catch { /* next scan retries */ }
+          try { (removeTrash ?? ((path: string) => rmSync(path, { recursive: true, force: false })))(trash); syncDir(workflowDir); } catch { /* next scan retries */ }
         });
         return true;
       });

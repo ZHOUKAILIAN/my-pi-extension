@@ -12,7 +12,7 @@
 | 谁拥有业务流程 | 各 Extension（Feature / Fix）拥有自己的 Workflow Definition 与验收标准；共享 Runtime 不内置业务状态图或验收标准 |
 | 不可绕过的控制面 | Worker 不修改 Run 状态；Guard 未通过不迁移；任何一方不得自报 `ACCEPTED`；用户决定必须可记录、可恢复、可被 Guard 引用 |
 | Extension 能定义什么 | Task、Role、业务上下文、Artifact 字段、Transition 业务条件、Acceptance 证据规则；不能放宽 Runtime 强制项与全局能力上限 |
-| 当前状态 | `IMPLEMENTING`；Fix 业务执行门禁 owner 仍在 `workflow-runtime` 待拆分，缺口以[实现地图 drift 表](README.md#已知-l1--l2-drift)为准 |
+| 当前状态 | `IMPLEMENTING`；Core Runtime 的执行、WAL、交互队列、parent branch 恢复与 GC 已落地并有自动化证据；Fix 业务门禁 owner 仍在 `workflow-runtime` 待拆分，真实 provider/长时 TUI/进程级崩溃证据仍缺，详见[实现地图 drift 表](README.md#已知-l1--l2-drift) |
 
 ## 职责总览
 
@@ -80,7 +80,7 @@ type WorkflowNodeDefinition = {
 
 ## Node Execution 生命周期
 
-以下生命周期是 L2 要实现的控制机制；当前原型只覆盖其中一部分：
+以下生命周期是当前 L2 执行机制；源码和测试覆盖 Worker 创建、Artifact 校验、participant 级评审 checkpoint、迁移和有限重试。真实 provider 长时运行与进程级崩溃仍需独立验证：
 
 ```mermaid
 flowchart TD
@@ -111,7 +111,7 @@ Worker Profile 中的「只读」必须由实际工具和环境能力实现，�
 
 ## 状态、存储与用户决定
 
-以下为目标机制；当前恢复主要校验已知 Stage，版本兼容性仍在 drift 中：
+以下机制已由 Runtime/Run Control WAL 实现；Pi Session legacy 入口与真实宿主崩溃恢复仍保留兼容性验证边界：
 
 | 机制 | 规则 |
 | --- | --- |
@@ -132,7 +132,7 @@ flowchart LR
 
 ## Artifact 与审计
 
-以下为目标机制；完整 provenance、Node Execution 身份和版本绑定尚未实现：
+以下校验机制已实现并由 `executeNode`、`restore` 和评审门禁共同执行；仍需真实 provider/长时 TUI 运行验证工具事件与崩溃时序：
 
 | 校验维度 | 说明 |
 | --- | --- |
@@ -171,7 +171,7 @@ flowchart TD
 
 ### 运行中统一对话适配
 
-该机制是目标 L2 设计，当前尚未实现；当前事实见[实现地图 drift](README.md#已知-l1--l2-drift)。tmux、独立窗口和子终端不属于产品依赖。
+该机制已实现为 Extension 内的适配层；它不是独立进程或 OS sandbox，tmux、独立窗口和子终端也不属于产品依赖。自动化覆盖交互队列和 Pi 0.84.2 ExtensionRunner，但真实 provider 长时 TUI、PTY picker 稳定性和进程级崩溃恢复仍属于未验证边界。
 
 ```mermaid
 flowchart LR
@@ -308,4 +308,4 @@ GC 与 writer 使用同一外部 operation lock。扫描快照后、原子 tombs
 
 非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, expectedWorkerSessionId, expectedAttemptId, modelRef})` 和带 sequence/status 的事件流。模型 picker 的四元身份 fence（Run、Node Execution、Worker Session、Attempt）在队列内重检，目标变化时 fail-closed。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
 
-当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。当前 `/fix` command handler 同步等待整个 Run，Child Session 为内存态且不可从主输入反向控制；统一对话协作仍是未实现目标。第一版把 Run 改为 Extension 管理的后台任务：启动事实和首个 Worker 成功建立后 command handler 返回，`input` hook 在存在当前 Worker 时处理普通输入，避免进入主 Session pending queue；`session_shutdown` 只 best-effort停止接收新输入并清理任务；缺少终态时从已 fsync WAL恢复。第一版继续使用 SDK 承载，增加可寻址 Session registry、事件投影、输入/模型路由和持久化事实，不以 tmux 或新用户命令作为前置条件。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。
+当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试、WAL 和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。`LiveFixRunManager` 在 Node 执行期间维护可寻址 Registry，主输入通过 `WorkflowInteractionPort` 进入当前 Child，模型 picker 只改变当前 Worker 且以 Run/Node/Session/Attempt fence 校验；Worker 完成后句柄仍会释放，不能把它描述成独立后台进程。`session_shutdown` 只 best-effort停止接收并完成已开始的 WAL commit，缺少终态时由 WAL 恢复为可确认的 interrupted attempt。当前自动测试已覆盖这些机制；真实 provider、长时 TUI/PTY 和进程级 crash replay 尚未通过。

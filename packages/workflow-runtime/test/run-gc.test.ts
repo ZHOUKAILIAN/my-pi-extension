@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { RunControlWal, RunGarbageCollector, runTombstonePath } from '../src/index.ts';
@@ -27,6 +27,29 @@ test('GC does not remove an unfinished run while its lease is live, then uses la
   assert.equal(RunControlWal.gc(root, 2_000, 0), 0);
   wal.releaseLease();
   assert.equal(RunControlWal.gc(root, 2_000, 0), 1);
+});
+
+test('GC uses the latest valid parent_rebind for orphan retention', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-gc-rebind-'));
+  const oldParent = join(root, 'old-session.json');
+  const newParent = join(root, 'new-session.json');
+  accepted(root, 'fix-gc-rebind', 1_000, oldParent);
+  writeFileSync(newParent, '{}');
+  RunControlWal.rebindParent('fix-gc-rebind', { rootDir: root, parentSessionId: 'new-parent', parentLeafId: 'new-leaf', parentSessionFile: newParent, cwd: process.cwd(), confirmed: true });
+  assert.equal(RunGarbageCollector.collect(root, { now: 3_000, retentionMs: 10_000, orphanDeadlineMs: 100 }), 0);
+});
+
+test('GC retries a trash directory after deletion failure on the next scan', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-gc-trash-retry-'));
+  accepted(root, 'fix-gc-trash-retry', 1_000);
+  let fail = true;
+  const removeTrash = (path: string) => { if (fail) throw new Error('simulated delete failure'); rmSync(path, { recursive: true, force: false }); };
+  assert.equal(RunGarbageCollector.collect(root, { now: 2_000, retentionMs: 0, removeTrash }), 1);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(readdirSync(join(root, 'workflow-runs')).some((entry) => entry.startsWith('.trash-')));
+  fail = false;
+  assert.equal(RunGarbageCollector.collect(root, { now: 2_001, retentionMs: 0, removeTrash }), 0);
+  assert.equal(readdirSync(join(root, 'workflow-runs')).some((entry) => entry.startsWith('.trash-')), false);
 });
 
 test('GC durably observes a missing parent and applies the earlier seven-day orphan deadline', () => {

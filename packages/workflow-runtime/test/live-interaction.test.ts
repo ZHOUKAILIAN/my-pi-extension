@@ -189,6 +189,54 @@ test('restore projects a pre-Child review identity from the durable startup reco
   wal.releaseLease();
 });
 
+test('idle prompt callback can re-enter turn_start, turn_end, and bindArtifact without queue deadlock', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-prompt-reentry-'));
+  const wal = RunControlWal.open('fix-prompt-reentry', { rootDir: root });
+  const registry = new ActiveWorkerRegistry();
+  const port = new WorkflowInteractionPort(registry);
+  const calls: string[] = [];
+  let turn: Promise<unknown> | undefined;
+  const session = {
+    isStreaming: false,
+    steer: async () => {},
+    prompt: async (text: string) => {
+      calls.push(`prompt:${text}`);
+      turn = (async () => {
+        const started = await port.recordModelTurnStart('fix-prompt-reentry', 1, 'prompt-call-1');
+        calls.push(`turn_start:${started?.supplementVersion}`);
+        await port.recordModelCallCompleted('fix-prompt-reentry', 'prompt-call-1');
+        await port.bindArtifact('fix-prompt-reentry', { kind: 'investigation', route: 'local_fix', rootCause: 'prompt callback', evidence: ['trace'] });
+        calls.push('turn_end:bound');
+      })();
+      await turn;
+    },
+  };
+  const worker = { ...handle(wal, session, port), runId: 'fix-prompt-reentry' } as any;
+  registry.register(worker);
+  const result = await Promise.race([
+    port.submitSupplement({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, text: 'idle fact' }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error('prompt/turn callback deadlocked')), 1000)),
+  ]);
+  assert.equal(result.state, 'enqueue_accepted');
+  assert.deepEqual(calls, ['prompt:idle fact', 'turn_start:1', 'turn_end:bound']);
+  assert.equal(wal.records().filter((record) => record.type === 'delivery' && record.payload.state === 'artifact_bound').length, 1);
+  registry.release(worker.runId);
+  wal.releaseLease();
+});
+
+test('settled reviewer lifecycle never projects an activeReviewAttempt', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-settled-review-'));
+  const wal = RunControlWal.open('fix-settled-review', { rootDir: root });
+  wal.recordCheckpoint({ checkpoint: { runId: 'fix-settled-review', stage: 'INVESTIGATING', at: 1, id: 'before-review' } });
+  wal.beginWorker({ nodeExecutionId: 'fix-settled-review.investigation_review.1', workerId: 'reviewer-1', workerSessionId: 'child-review', attemptId: 'attempt-review', reviewCycleId: 'cycle-1', reviewerIndex: 0, recoveryAttempt: 1 });
+  wal.recordWorker({ kind: 'session_settled', nodeExecutionId: 'fix-settled-review.investigation_review.1', workerId: 'reviewer-1', workerSessionId: 'child-review', attemptId: 'attempt-review', status: 'settled' });
+  wal.closeFence({ nodeExecutionId: 'fix-settled-review.investigation_review.1', workerSessionId: 'child-review', attemptId: 'attempt-review' });
+  const restored = new RunControlWalStore(wal).loadLast('fix-settled-review');
+  assert.equal(restored?.activeReviewAttempt, undefined);
+  assert.equal(restored?.activeNodeId, undefined);
+  wal.releaseLease();
+});
+
 test('model-call snapshots keep cumulative supplement versions after delivery consumption', async () => {
   const root = mkdtempSync(join(tmpdir(), 'fix-snapshot-version-'));
   const wal = RunControlWal.open('fix-snapshot-version', { rootDir: root });

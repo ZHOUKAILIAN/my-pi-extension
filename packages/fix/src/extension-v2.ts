@@ -1,7 +1,7 @@
 import type { ExtensionAPI, InputEvent, InputEventResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
 type ExtensionCommandContext = ExtensionContext;
 import { CustomEditor } from '@earendil-works/pi-coding-agent';
-import { Text, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
+import { CURSOR_MARKER, Text, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
@@ -179,6 +179,17 @@ export class LiveFixRunManager {
   }
   latestStore(ctx: ExtensionContext): { store?: RunControlWalStore; checkpoint: Checkpoint; parentMatches: boolean } | undefined {
     const rootDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? process.cwd(), '.pi', 'agent');
+    const currentSessionId = ctx.sessionManager.getSessionId();
+    const currentLeafId = ctx.sessionManager.getLeafId?.() ?? 'root';
+    // Recovery must inspect the complete active branch. A Run created at an
+    // ancestor remains owned by this session after /tree or /fork advances the
+    // leaf; scanning getEntries() would reintroduce sibling-session selection.
+    let activeBranch: readonly unknown[];
+    try { activeBranch = ctx.sessionManager.getBranch(currentLeafId); } catch { return undefined; }
+    const activeBranchIds = new Set(activeBranch.map((entry) => {
+      const id = (entry as { id?: unknown })?.id;
+      return typeof id === 'string' ? id : undefined;
+    }).filter((id): id is string => id !== undefined));
     const candidates: Array<{ runId: string; checkpoint: Checkpoint; parentMatches: boolean; orphan: boolean; store?: RunControlWalStore }> = [];
     for (const runId of RunControlWal.list(rootDir).filter((id) => id.startsWith('fix-'))) {
       try {
@@ -190,16 +201,18 @@ export class LiveFixRunManager {
         const rebind = records.filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to;
         const parent = rebind && typeof rebind === 'object' ? rebind as Record<string, unknown> : header;
         if (parent.cwd !== ctx.cwd) continue;
-        const parentMatches = parent.parentSessionId === ctx.sessionManager.getSessionId()
-          && parent.parentLeafId === (ctx.sessionManager.getLeafId?.() ?? 'root');
-        // An orphan is not “a different session in the same cwd”. It is only a
-        // WAL whose original header parent file is provably gone and which has
-        // not already been rebound. Missing header metadata is fail-closed.
+        const parentMatches = parent.parentSessionId === currentSessionId
+          && typeof parent.parentLeafId === 'string'
+          && (parent.parentLeafId === currentLeafId || activeBranchIds.has(parent.parentLeafId));
+        // A no-file run can only be offered back to the same logical parent
+        // session. In particular, a missing file must not make a newer run in
+        // another still-existing session look like an orphan candidate.
         const originalParentFile = header.parentSessionFile;
+        const headerFileMissing = header.parentSessionFileExists === false
+          || (typeof originalParentFile === 'string' && originalParentFile.length > 0 && !existsSync(originalParentFile));
         const orphan = !rebind
-          && typeof originalParentFile === 'string'
-          && originalParentFile.length > 0
-          && !existsSync(originalParentFile);
+          && headerFileMissing
+          && header.parentSessionId === currentSessionId;
         const store = parentMatches ? this.openStore(ctx, runId) : undefined;
         candidates.push({ runId, checkpoint, parentMatches, orphan, store });
       } catch { /* active, tombstoned or corrupt runs are not silently selected */ }
@@ -1585,6 +1598,16 @@ export class LiveWorkerEditor extends CustomEditor {
     this.previousCtrlD = this.previous?.onCtrlD;
     this.previousPasteImage = this.previous?.onPasteImage;
     this.previousExtensionShortcut = this.previous?.onExtensionShortcut;
+    // CustomEditor/Editor declares focused as a class field in Pi 0.84.2, so
+    // overriding it with a TypeScript accessor is not legal. Define the
+    // Focusable proxy on this instance instead and keep the delegated editor
+    // synchronized whenever TUI changes focus.
+    let focusedValue = this.previous?.focused === true;
+    Object.defineProperty(this, 'focused', {
+      configurable: true,
+      get: () => focusedValue,
+      set: (value: boolean) => { focusedValue = value; if (this.previous && 'focused' in this.previous) this.previous.focused = value; },
+    });
   }
 
   private syncPreviousCallbacks() {
@@ -1627,7 +1650,19 @@ export class LiveWorkerEditor extends CustomEditor {
 
   getText() { return this.previous?.getText ? this.previous.getText() : super.getText(); }
   setText(text: string) { if (this.previous?.setText) this.previous.setText(text); else super.setText(text); }
-  render(width: number) { return this.previous?.render ? this.previous.render(width) : super.render(width); }
+  render(width: number) {
+    const lines = this.previous?.render ? this.previous.render(width) : super.render(width);
+    // A delegated Pi 0.84.2 Editor emits CURSOR_MARKER when focused. Keep a
+    // defensive marker for third-party Focusable editors that expose focus but
+    // omit the marker, without changing the delegated cursor/text rendering.
+    if (this.focused && !lines.some((line: string) => line.includes(CURSOR_MARKER)) && lines.length) {
+      const cursor = this.previous?.getCursor?.() ?? super.getCursor();
+      const lineIndex = Math.max(0, Math.min(lines.length - 1, Number(cursor?.line ?? lines.length - 1)));
+      const column = Math.max(0, Math.min(lines[lineIndex]!.length, Number(cursor?.col ?? lines[lineIndex]!.length)));
+      lines[lineIndex] = `${lines[lineIndex]!.slice(0, column)}${CURSOR_MARKER}${lines[lineIndex]!.slice(column)}`;
+    }
+    return lines;
+  }
   invalidate() { if (this.previous?.invalidate) this.previous.invalidate(); else super.invalidate(); }
   getExpandedText() { return this.previous?.getExpandedText ? this.previous.getExpandedText() : this.getText(); }
   getLines() { return this.previous?.getLines ? this.previous.getLines() : [this.getText()]; }
@@ -1674,7 +1709,14 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
   const live = new LiveFixRunManager();
 
   pi.on('input', async (event: InputEvent, ctx): Promise<InputEventResult> => {
-    const owner = live.ownerFor(ctx);
+    let owner: ReturnType<LiveFixRunManager['ownerFor']>;
+    try { owner = live.ownerFor(ctx); }
+    catch {
+      // The host runner treats a rejected handler as “no result”, which would
+      // route the user's text into the parent Agent. Context/owner lookup is
+      // therefore itself a fail-closed boundary.
+      return { action: 'handled' };
+    }
     if (!owner || event.source === 'extension' || event.text.startsWith('/')) return { action: 'continue' };
     // Ownership is checked before Child lookup: starting, settlement, and the
     // publication gap are all handled locally and never leak to the parent.
@@ -1691,9 +1733,19 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
     }
     return { action: 'handled' };
   });
-  pi.on('session_before_tree', async (_event, ctx) => ({ cancel: live.hasOwner(ctx) }));
-  pi.on('session_before_switch', async (_event, ctx) => ({ cancel: live.hasOwner(ctx) }));
-  pi.on('session_before_fork', async (_event, ctx) => ({ cancel: live.hasOwner(ctx) }));
+  const beforeLifecycle = async (ctx: ExtensionContext): Promise<{ cancel: boolean }> => {
+    try {
+      // Read both owner and context inside the guard. The host runner catches
+      // handler exceptions as “no result”; lifecycle cancellation must instead
+      // fail closed and be an explicit return value.
+      return { cancel: live.hasOwner(ctx) };
+    } catch {
+      return { cancel: true };
+    }
+  };
+  pi.on('session_before_tree', async (_event, ctx) => beforeLifecycle(ctx));
+  pi.on('session_before_switch', async (_event, ctx) => beforeLifecycle(ctx));
+  pi.on('session_before_fork', async (_event, ctx) => beforeLifecycle(ctx));
   pi.on('session_shutdown', async () => { await live.shutdown(); });
   pi.on('session_start', async (event, ctx) => {
     live.gc();

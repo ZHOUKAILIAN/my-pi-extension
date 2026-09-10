@@ -158,37 +158,67 @@ export class WorkflowInteractionPort {
 
   async submitSupplement(input: SupplementInput): Promise<SupplementResult> {
     const submissionAttemptId = randomUUID();
-    return this.queue(input.runId).run(async () => {
+    // Only the durable target/sequence decision and the *initiation* of the
+    // SDK operation are serialized. Never await Pi prompt/steer while holding
+    // this queue: Pi invokes turn_start/turn_end synchronously from those
+    // methods, and those callbacks must be allowed to re-enter this queue.
+    const scheduled = await this.queue(input.runId).run(async () => {
       const owner = this.registry.owner(input.runId);
-      if (!owner || owner.nodeExecutionId !== input.expectedNodeExecutionId) return { submissionAttemptId, state: 'delivery_failed', error: 'no unique Run owner for this node execution' };
+      if (!owner || owner.nodeExecutionId !== input.expectedNodeExecutionId) return { result: { submissionAttemptId, state: 'delivery_failed' as const, error: 'no unique Run owner for this node execution' } };
       // A starting owner is only an interception fence. It must not consume a
       // supplement sequence before a Child is durably published.
-      if (owner.status === 'starting') return { submissionAttemptId, state: 'delivery_failed', error: 'Worker is starting; text was retained by the editor' };
+      if (owner.status === 'starting') return { result: { submissionAttemptId, state: 'delivery_failed' as const, error: 'Worker is starting; text was retained by the editor' } };
       const current = this.registry.get(input.runId, input.expectedNodeExecutionId);
       if (!current) {
         // A publication gap retains only the edited content. It is not a
         // supplement and therefore cannot create a false sequence or binding.
         try { owner.wal.recordDelivery({ submissionAttemptId, state: 'delivery_failed', nodeExecutionId: owner.nodeExecutionId, workerSessionId: owner.workerSessionId ?? 'unpublished', text: input.text, error: 'Worker publication gap; retained editor content' }); }
         catch { /* the UI still retains the input */ }
-        return { submissionAttemptId, state: 'delivery_failed', error: 'Worker publication gap; text retained' };
+        return { result: { submissionAttemptId, state: 'delivery_failed' as const, error: 'Worker publication gap; text retained' } };
       }
       let recorded;
       try { recorded = owner.wal.recordSupplement({ submissionAttemptId, nodeExecutionId: current.nodeExecutionId, workerSessionId: current.workerSessionId, text: input.text }); }
-      catch (error) { return { submissionAttemptId, state: 'delivery_failed', error: error instanceof Error ? error.message : String(error) }; }
-      if (recorded.payload.state === 'rejected_after_fence') return { submissionAttemptId, state: 'rejected_after_fence', error: 'Worker close fence already committed' };
-      const supplementId = String(recorded.payload.supplementId); const sequence = Number(recorded.payload.sequence);
-      try {
-        this.pendingCalls.set(input.runId, [...(this.pendingCalls.get(input.runId) ?? []), supplementId]);
-        if (current.session.isStreaming) await current.session.steer(input.text, input.images);
-        else await current.session.prompt(input.text, { source: 'extension' });
-        owner.wal.recordDelivery({ submissionAttemptId, supplementId, sequence, nodeExecutionId: current.nodeExecutionId, workerSessionId: current.workerSessionId, state: 'enqueue_accepted' });
-        return { submissionAttemptId, supplementId, sequence, state: 'enqueue_accepted' };
-      } catch (error) {
-        const pending = this.pendingCalls.get(input.runId) ?? [];
-        this.pendingCalls.set(input.runId, pending.filter((id) => id !== supplementId));
-        owner.wal.recordDelivery({ submissionAttemptId, supplementId, sequence, nodeExecutionId: current.nodeExecutionId, workerSessionId: current.workerSessionId, state: 'delivery_failed', error: error instanceof Error ? error.message : String(error) });
-        return { submissionAttemptId, supplementId, sequence, state: 'delivery_failed', error: error instanceof Error ? error.message : String(error) };
+      catch (error) { return { result: { submissionAttemptId, state: 'delivery_failed' as const, error: error instanceof Error ? error.message : String(error) } };
       }
+      if (recorded.payload.state === 'rejected_after_fence') return { result: { submissionAttemptId, state: 'rejected_after_fence' as const, error: 'Worker close fence already committed' } };
+      const supplementId = String(recorded.payload.supplementId); const sequence = Number(recorded.payload.sequence);
+      this.pendingCalls.set(input.runId, [...(this.pendingCalls.get(input.runId) ?? []), supplementId]);
+      let operation: Promise<void>;
+      try {
+        // Calling (not awaiting) is intentional. The promise is carried out of
+        // the queue so turn_start/turn_end can be folded before it settles.
+        operation = current.session.isStreaming
+          ? current.session.steer(input.text, input.images)
+          : current.session.prompt(input.text, { source: 'extension' });
+      } catch (error) {
+        return { result: { submissionAttemptId, supplementId, sequence, state: 'delivery_failed' as const, error: error instanceof Error ? error.message : String(error) }, syncFailure: { owner, current, supplementId, sequence, error } };
+      }
+      return { operation, owner, current, supplementId, sequence, result: undefined };
+    });
+    if (!scheduled.operation) {
+      if (scheduled.syncFailure) {
+        await this.queue(input.runId).run(async () => {
+          const pending = this.pendingCalls.get(input.runId) ?? [];
+          this.pendingCalls.set(input.runId, pending.filter((id) => id !== scheduled.syncFailure!.supplementId));
+          try { scheduled.syncFailure!.owner.wal.recordDelivery({ submissionAttemptId, supplementId: scheduled.syncFailure!.supplementId, sequence: scheduled.syncFailure!.sequence, nodeExecutionId: scheduled.syncFailure!.current.nodeExecutionId, workerSessionId: scheduled.syncFailure!.current.workerSessionId, state: 'delivery_failed', error: scheduled.syncFailure!.error instanceof Error ? scheduled.syncFailure!.error.message : String(scheduled.syncFailure!.error) }); } catch { /* retain the editor text */ }
+        });
+      }
+      return scheduled.result;
+    }
+    try {
+      await scheduled.operation;
+    } catch (error) {
+      return this.queue(input.runId).run(async () => {
+        const pending = this.pendingCalls.get(input.runId) ?? [];
+        this.pendingCalls.set(input.runId, pending.filter((id) => id !== scheduled.supplementId));
+        try { scheduled.owner.wal.recordDelivery({ submissionAttemptId, supplementId: scheduled.supplementId, sequence: scheduled.sequence, nodeExecutionId: scheduled.current.nodeExecutionId, workerSessionId: scheduled.current.workerSessionId, state: 'delivery_failed', error: error instanceof Error ? error.message : String(error) }); } catch { /* retain the editor text */ }
+        return { submissionAttemptId, supplementId: scheduled.supplementId, sequence: scheduled.sequence, state: 'delivery_failed' as const, error: error instanceof Error ? error.message : String(error) };
+      });
+    }
+    return this.queue(input.runId).run(async () => {
+      try { scheduled.owner.wal.recordDelivery({ submissionAttemptId, supplementId: scheduled.supplementId, sequence: scheduled.sequence, nodeExecutionId: scheduled.current.nodeExecutionId, workerSessionId: scheduled.current.workerSessionId, state: 'enqueue_accepted' }); }
+      catch (error) { return { submissionAttemptId, supplementId: scheduled.supplementId, sequence: scheduled.sequence, state: 'delivery_failed' as const, error: error instanceof Error ? error.message : String(error) }; }
+      return { submissionAttemptId, supplementId: scheduled.supplementId, sequence: scheduled.sequence, state: 'enqueue_accepted' as const };
     });
   }
 
@@ -372,7 +402,7 @@ export class WorkflowInteractionPort {
       const latestModelState = new Map<string, typeof records[number]>();
       for (const record of records.filter((item) => item.type === 'worker' && item.payload.kind === 'model_change' && item.payload.nodeExecutionId === worker.nodeExecutionId && typeof item.payload.requestId === 'string')) latestModelState.set(String(record.payload.requestId), record);
       for (const pending of latestModelState.values()) if (pending.payload.state === 'pending' || pending.payload.state === 'requested') worker.wal.recordWorker({ ...pending.payload, state: 'not_applied', reason });
-      const fence = worker.wal.closeFence({ nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, reason });
+      const fence = worker.wal.closeFence({ nodeExecutionId: worker.nodeExecutionId, workerSessionId: worker.workerSessionId, attemptId: worker.attemptId, reason });
       worker.closeFenceSequence = fence?.index;
       this.registry.unregisterWorker(runId, worker.workerSessionId);
     });

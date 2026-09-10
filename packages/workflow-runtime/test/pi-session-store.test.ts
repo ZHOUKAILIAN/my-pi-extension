@@ -15,6 +15,19 @@ test('PiSessionRunStore reads the last legal checkpoint and ignores invalid entr
   assert.equal(store.loadLast('r')?.id, 'b');
 });
 
+test('PiSessionRunStore scans the complete active branch when the workflow leaf advances', () => {
+  const ancestor = runCheckpoint('fix-branch', 'INVESTIGATING', 1);
+  const sibling = runCheckpoint('fix-sibling', 'VERIFYING', 2);
+  const current = runCheckpoint('fix-branch', 'IMPLEMENTING', 3);
+  const store = new PiSessionRunStore({
+    getEntries: () => [ancestor, sibling, current],
+    getLeafId: () => 'current-leaf',
+    getBranch: (leaf) => { assert.equal(leaf, 'current-leaf'); return [ancestor, current]; },
+  }, () => {});
+  assert.equal(store.loadLast('fix-branch')?.stage, 'IMPLEMENTING');
+  assert.equal(store.latestUncompleted()?.runId, 'fix-branch');
+});
+
 test('PiSessionRunStore preserves append order for equal timestamps', () => {
   const entries = [
     { customType: 'workflow-run', data: checkpoint('IMPLEMENTING', 10, 'first') },
