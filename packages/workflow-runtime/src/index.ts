@@ -321,6 +321,7 @@ export class WorkflowRuntime {
   // 审计事件序号：eventId 是审计去重/回放的绑定键，默认 idGen 为毫秒级，同一毫秒内多个事件
   // 必须能区分；以实例内单调序号保证唯一性，跨秒/跨实例由 idGen（含 runId 与时钟）区分。
   private eventSeq = 0;
+  private executionSeq = 0;
   private checkpointIncomplete = false;
   // 决策记录产生者：仅 decide() 委托路径置为 'runtime:decide'；legacy resume()/gate 路径不置位，
   // 因此不会把 gate 决策误标成 Runtime decide 路径（未 opt-in 的 legacy checkpoint 不附加 v2 决策来源记录）。
@@ -354,6 +355,17 @@ export class WorkflowRuntime {
   }
 
   getArtifacts(): readonly Artifact[] { return this.artifacts; }
+
+  /** Allocate a stable logical execution identity; retries reuse this id. */
+  createNodeExecutionId(nodeId: string): string {
+    return `${this.runId}.${nodeId}.${this.clock()}-${++this.executionSeq}`;
+  }
+  getNodeExecutionId(nodeId: string): string | undefined {
+    return this.currentExecution?.nodeId === nodeId ? this.currentExecution.nodeExecutionId : undefined;
+  }
+  getRecoveryAttempt(nodeId: string): number | undefined {
+    return this.currentExecution?.nodeId === nodeId ? this.currentExecution.attempt : undefined;
+  }
   restoreArtifacts(artifacts: readonly Artifact[] | undefined) {
     this.artifacts = artifacts ? [...artifacts] : [];
     for (const artifact of this.artifacts) {
@@ -817,7 +829,11 @@ export class WorkflowRuntime {
     if (this.policyDigest !== undefined) checkpoint.policyDigest = this.policyDigest;
     if (this.sourceVersion !== undefined) checkpoint.sourceVersion = this.sourceVersion;
     if (this.activeNodeId !== undefined) checkpoint.activeNodeId = this.activeNodeId;
-    if (this.currentExecution?.nodeExecutionId !== undefined) checkpoint.nodeExecutionId = this.currentExecution.nodeExecutionId;
+    if (this.currentExecution?.nodeExecutionId !== undefined) {
+      checkpoint.nodeExecutionId = this.currentExecution.nodeExecutionId;
+      checkpoint.logicalNodeExecutionId = this.currentExecution.nodeExecutionId;
+      checkpoint.recoveryAttempt = this.currentExecution.attempt;
+    }
     if (this.candidateRevision !== undefined) checkpoint.candidateRevision = this.candidateRevision;
     if (this.reviewCycleId !== undefined) checkpoint.reviewCycleId = this.reviewCycleId;
     // 评审周期账本有记录才写，无记录不写，legacy checkpoint 形状保持不变。
@@ -929,7 +945,7 @@ export class WorkflowRuntime {
   async executeNode(
     node: NodeDefinition,
     task: unknown,
-    opts: { context?: Capsule } = {},
+    opts: { context?: Capsule; nodeExecutionId?: string; recoveryAttempt?: number } = {},
   ): Promise<{ artifact: Artifact; execution: { nodeId: string; nodeExecutionId: string; workerId: string; attempt: number } }> {
     if (!this.ranAnyNode) {
       this.recordEvent('run_started');
@@ -949,8 +965,13 @@ export class WorkflowRuntime {
         sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
       });
     }
-    const nodeExecutionId = `${this.runId}.${node.id}.${this.clock()}`;
+    const nodeExecutionId = opts.nodeExecutionId ?? this.createNodeExecutionId(node.id);
+    const recoveryAttempt = opts.recoveryAttempt ?? 1;
     const workerId = node.worker?.workerId ?? 'worker';
+    // Keep the identity in memory while the Worker runs. If it fails, the catch
+    // below persists this exact identity so recovery can reuse it.
+    this.currentExecution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt };
+    this.activeNodeId = node.id;
     // sourceVersion 是运行时可选择绑定的来源标记（如外部源/模型快照）。未绑定时用 'baseline'
     // 作为信封完整性的 fallback 盖章：信封合同要求非空 sourceVersion，fallback 只保证信封可写、
     // 绝不把 'baseline' 当作已验证/可接受的来源事实——受控终局（ACCEPTED）恢复要求 checkpoint
@@ -962,11 +983,24 @@ export class WorkflowRuntime {
       workerId,
       sourceVersion: srcVersion,
       requiresArtifactConclusion: this.definition.requiresArtifactConclusion === true,
+      recoveryAttempt,
       ...(node.id === 'verify' ? { requiresRepositoryChange: this.dispositionRequiresRepositoryChange() } : {}),
       ...opts.context,
     };
     if (!node.worker) throw new WorkflowRuntimeError('NODE_WORKER_REQUIRED', 'node worker required');
-    const raw = await node.worker.execute(node, task, capsule);
+    let raw: Artifact;
+    try {
+      raw = await node.worker.execute(node, task, capsule);
+    } catch (error) {
+      this.store.saveCheckpoint({
+        schemaVersion: 1, runId: this.runId, stage: this.stage, at: this.clock(), id: this.idGen(),
+        problem: this.problem, started: true, workflowVersion: this.definitionVersion ?? this.definition.sourceVersion,
+        policyDigest: this.policyDigest, sourceVersion: this.sourceVersion ?? this.definition.sourceVersion,
+        activeNodeId: node.id, nodeExecutionId, logicalNodeExecutionId: nodeExecutionId, recoveryAttempt,
+        artifacts: this.artifacts.length ? this.artifacts : undefined,
+      });
+      throw error;
+    }
     // 信封盖章：只认 schemaVersion/runId/producerKind/sourceVersion/unverified/nodeExecutionId/workerId，conclusion 不触发校验。
     const hasEnvelope = ['schemaVersion', 'runId', 'producerKind', 'sourceVersion', 'nodeExecutionId', 'workerId']
       .some((field) => field in raw);
@@ -1033,7 +1067,7 @@ export class WorkflowRuntime {
     }
     this.artifacts = [...this.artifacts, stamped];
     this.activeNodeId = node.id;
-    const execution = { nodeId: node.id, nodeExecutionId, workerId, attempt: 1 };
+    const execution = { nodeId: node.id, nodeExecutionId, workerId, attempt: recoveryAttempt };
     this.currentExecution = execution;
     this.nodeWorkerIds[node.id] = [...(this.nodeWorkerIds[node.id] ?? []), workerId];
     if (stamped.kind === 'implementation') this.candidateRevision = (stamped as ImplementationArtifact).artifact.candidateRevision;
@@ -1828,6 +1862,14 @@ export class WorkflowRuntime {
       if (checkpoint.policyDigest !== undefined) runtime.policyDigest = checkpoint.policyDigest;
       if (effectiveSourceVersion !== undefined) runtime.sourceVersion = effectiveSourceVersion;
       if (checkpoint.activeNodeId !== undefined) runtime.activeNodeId = checkpoint.activeNodeId;
+      if (checkpoint.nodeExecutionId !== undefined && checkpoint.activeNodeId !== undefined) {
+        runtime.currentExecution = {
+          nodeId: checkpoint.activeNodeId,
+          nodeExecutionId: checkpoint.logicalNodeExecutionId ?? checkpoint.nodeExecutionId,
+          workerId: 'recovered',
+          attempt: checkpoint.recoveryAttempt ?? 1,
+        };
+      }
       if (checkpoint.candidateRevision !== undefined) {
         runtime.candidateRevision = checkpoint.candidateRevision;
       } else {

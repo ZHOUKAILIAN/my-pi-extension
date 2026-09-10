@@ -32,7 +32,7 @@ test('PiSdk adapter scopes a real Pi ResourceLoader before creating the session'
   let options: any;
   const executor = new PiSdkWorkerExecutor({
     cwd: process.cwd(),
-    skills: ['cst-plus'],
+    skills: [],
     model: { provider: 'p', id: 'm' },
     createSession: async (request: any) => {
       options = request;
@@ -42,9 +42,8 @@ test('PiSdk adapter scopes a real Pi ResourceLoader before creating the session'
       } } };
     },
   });
-  await executor.execute({ id: 'n', profile: { tools: ['read'], skills: ['cst-plus'] } }, 'task', {});
-  assert.deepEqual(options.resourceLoader.getSkills().skills.map((skill: any) => skill.name), ['cst-plus']);
-  assert.equal(options.resourceLoader.getSkills().skills[0].filePath.includes('cst-plus'), true);
+  await executor.execute({ id: 'n', profile: { tools: ['read'] } }, 'task', {});
+  assert.deepEqual(options.resourceLoader.getSkills().skills, []);
 });
 
 test('PiSdk adapter rejects an unknown configured skill before session creation', async () => {

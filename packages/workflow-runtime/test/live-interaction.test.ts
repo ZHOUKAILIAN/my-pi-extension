@@ -53,10 +53,34 @@ test('WorkflowInteractionPort routes one input to the bound Child and preserves 
   const accepted = await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: 'fix-live.investigate.1', text: 'please check cache' });
   assert.equal(accepted.state, 'enqueue_accepted');
   assert.deepEqual(calls, ['steer:please check cache']);
-  port.closeWorker('fix-live');
-  const rejected = await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: 'fix-live.investigate.1', text: 'keep this text' });
-  assert.equal(rejected.state, 'delivery_failed', 'closed Worker is no longer an input target');
-  assert.equal(registry.get('fix-live'), undefined);
+  await assert.rejects(port.closeWorker('fix-live'), (error: unknown) => error instanceof Error && error.message.includes('lack a completed model call'));
+  const retained = await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: 'fix-live.investigate.1', text: 'keep this text' });
+  assert.equal(retained.state, 'enqueue_accepted', 'an unbound supplement keeps the Worker open until it is settled');
+  registry.release('fix-live');
+  wal.releaseLease();
+});
+
+test('Worker recovery redelivers each unbound supplement to the replacement Child once', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-redelivery-'));
+  const wal = RunControlWal.open('fix-live', { rootDir: root });
+  const registry = new ActiveWorkerRegistry();
+  const calls: string[] = [];
+  const port = new WorkflowInteractionPort(registry);
+  const firstSession = { isStreaming: true, steer: async () => {}, prompt: async () => {} };
+  const first = handle(wal, firstSession, port);
+  registry.register(first);
+  await port.submitSupplement({ runId: 'fix-live', expectedNodeExecutionId: first.nodeExecutionId, text: 'recover this fact' });
+  registry.unregisterWorker('fix-live', first.workerSessionId);
+  const replacementSession = { isStreaming: false, steer: async () => {}, prompt: async (text: string) => { calls.push(text); } };
+  const replacement = { ...first, workerSessionId: 'child-2', workerId: 'worker-2', attemptId: 'attempt-2', recoveryAttempt: 2, session: replacementSession };
+  registry.register(replacement);
+  await port.reconcileWorker(replacement);
+  await port.reconcileWorker(replacement);
+  assert.deepEqual(calls, ['recover this fact']);
+  await port.recordModelCallCompleted('fix-live', 'child-2:call');
+  await port.bindArtifact('fix-live', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
+  await port.closeWorker('fix-live');
+  assert.equal(wal.records().filter((record) => record.type === 'delivery' && record.payload.state === 'redelivered').length, 1);
   wal.releaseLease();
 });
 
