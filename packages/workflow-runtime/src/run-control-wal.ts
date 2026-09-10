@@ -348,6 +348,24 @@ export class RunControlWalStore implements RunStore {
   saveCheckpoint(checkpoint: Checkpoint) { this.wal.recordCheckpoint({ checkpoint }); }
   loadLast(runId: string) {
     if (runId !== this.wal.runId) return undefined;
-    return this.wal.records().map((record) => record.type === 'checkpoint' ? record.payload.checkpoint : undefined).filter((value): value is Checkpoint => !!value && typeof value === 'object' && (value as Checkpoint).runId === runId).at(-1);
+    const records = this.wal.records();
+    const checkpointEntry = records.map((record, index) => ({ record, index })).filter((item): item is { record: RunControlRecord & { type: 'checkpoint' }; index: number } => item.record.type === 'checkpoint' && typeof item.record.payload.checkpoint === 'object' && item.record.payload.checkpoint !== null).filter((item) => (item.record.payload.checkpoint as Checkpoint).runId === runId).at(-1);
+    if (!checkpointEntry) return undefined;
+    const checkpoint = checkpointEntry.record.payload.checkpoint as Checkpoint;
+    // A Child identity is appended before createAgentSession. If the process
+    // dies in that startup gap, project that durable identity into restore even
+    // though no later Runtime checkpoint exists. This also covers review nodes.
+    const started = records.map((record, index) => ({ record, index })).reverse().find((item) => item.index > checkpointEntry.index && item.record.type === 'worker' && item.record.payload.kind === 'session_started');
+    if (!started) return checkpoint;
+    const executionId = String(started.record.payload.nodeExecutionId);
+    const prefix = `${runId}.`;
+    const nodeId = executionId.startsWith(prefix) ? executionId.slice(prefix.length).split('.')[0] : undefined;
+    return {
+      ...checkpoint,
+      ...(nodeId ? { activeNodeId: nodeId } : {}),
+      nodeExecutionId: executionId,
+      logicalNodeExecutionId: executionId,
+      recoveryAttempt: typeof started.record.payload.recoveryAttempt === 'number' ? started.record.payload.recoveryAttempt : checkpoint.recoveryAttempt,
+    };
   }
 }

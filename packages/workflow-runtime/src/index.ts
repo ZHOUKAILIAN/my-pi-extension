@@ -368,6 +368,7 @@ export class WorkflowRuntime {
   getRecoveryAttempt(nodeId: string): number | undefined {
     return this.currentExecution?.nodeId === nodeId ? this.currentExecution.attempt : undefined;
   }
+  getActiveNodeId(): string | undefined { return this.activeNodeId; }
   restoreArtifacts(artifacts: readonly Artifact[] | undefined) {
     this.artifacts = artifacts ? [...artifacts] : [];
     for (const artifact of this.artifacts) {
@@ -1155,8 +1156,10 @@ export class WorkflowRuntime {
     const reviewArtifacts: Artifact[] = [];
     const reviewerWorkerIds: string[] = [];
     const ratedArtifacts: { artifactId: string; workerId: string; accepted: boolean }[] = [];
-    for (const reviewer of reviewers) {
+    const recoveredReviewExecution = this.currentExecution?.nodeId === reviewNodeId ? this.currentExecution : undefined;
+    for (const [reviewerIndex, reviewer] of reviewers.entries()) {
       const { artifact, execution } = await this.executeNode(reviewer, `review audit task: ${opts.reviewedNodeId}`, {
+        ...(reviewerIndex === 0 && recoveredReviewExecution ? { nodeExecutionId: recoveredReviewExecution.nodeExecutionId, recoveryAttempt: recoveredReviewExecution.attempt + 1 } : {}),
         context: { ...opts.context, reviewedNodeId: opts.reviewedNodeId, reviewCycleId },
       });
       if (artifact.kind !== opts.reviewArtifactKind) {

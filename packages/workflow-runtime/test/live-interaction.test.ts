@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { appendFileSync, mkdtempSync, statSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ActiveWorkerRegistry, RunControlWal, WorkerSidecar, WorkflowInteractionPort } from '../src/index.ts';
+import { ActiveWorkerRegistry, RunControlWal, RunControlWalStore, WorkerSidecar, WorkflowInteractionPort } from '../src/index.ts';
 
 const handle = (wal: RunControlWal, session: any, interaction: WorkflowInteractionPort) => ({
   runId: 'fix-live', parentSessionId: 'parent', parentLeafId: 'leaf', nodeExecutionId: 'fix-live.investigate.1',
@@ -142,6 +142,18 @@ test('turn_start binds the queued supplement; a late or unrelated message_end re
   await port.bindArtifact('fix-live', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
   await port.closeWorker('fix-live');
   assert.equal(wal.records().filter((record) => record.payload.state === 'artifact_bound').length, 1);
+  wal.releaseLease();
+});
+
+test('restore projects a pre-Child review identity from the durable startup record', () => {
+  const root = mkdtempSync(join(tmpdir(), 'fix-review-startup-'));
+  const wal = RunControlWal.open('fix-review-startup', { rootDir: root });
+  wal.recordCheckpoint({ checkpoint: { runId: 'fix-review-startup', stage: 'INVESTIGATING', at: 1, id: 'before-review' } });
+  wal.beginWorker({ nodeExecutionId: 'fix-review-startup.investigation_review.2', workerId: 'reviewer', workerSessionId: 'child-review' });
+  const restored = new RunControlWalStore(wal).loadLast('fix-review-startup');
+  assert.equal(restored?.activeNodeId, 'investigation_review');
+  assert.equal(restored?.logicalNodeExecutionId, 'fix-review-startup.investigation_review.2');
+  assert.equal(restored?.recoveryAttempt, 1);
   wal.releaseLease();
 });
 

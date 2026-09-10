@@ -716,7 +716,9 @@ export async function continueRun(
 
     // 9. 最终处置报告见模块级 buildFixReport（continueRun 与 /fix review 复用，见 step 11）。
 
-    // 10. 主循环：按阶段分派直至 ACCEPTED。
+    // 10. 主循环：按阶段分派直至 ACCEPTED。恢复时仅首轮消费 WAL 投影出的评审节点；
+    // 同一调用内评审拒绝回流后，必须重新执行业务节点而不是重复评审。
+    let recoveredReviewNode = runtime.getActiveNodeId();
     while (runtime.stage !== 'ACCEPTED') {
       const stage = runtime.stage;
       host.setWorkflowStatus(ctx, `fix ${stage}`);
@@ -730,6 +732,21 @@ export async function continueRun(
           break;
         }
         case 'INVESTIGATING': {
+          const recoveredReview = recoveredReviewNode === 'investigation_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'investigation')
+            : undefined;
+          if (recoveredReview) {
+            const review = await runReviewChecked(
+              'investigation_review',
+              prepared.reviewers.investigation_review,
+              FIX_REVIEW_POLICIES.investigation_review,
+              { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed) runtime.transition('DISPOSITION', recoveredReview);
+            else runtime.transition('INVESTIGATING', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           const r = await exec('investigate', problem);
           if (r === 'paused') return 'paused';
           const investigation = r.artifact as InvestigationArtifact;
@@ -752,6 +769,21 @@ export async function continueRun(
           break;
         }
         case 'DISPOSITION': {
+          const recoveredReview = recoveredReviewNode === 'change_plan_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'disposition') as DispositionArtifact | undefined
+            : undefined;
+          if (recoveredReview?.requiresRepositoryChange === true) {
+            const review = await runReviewChecked(
+              'change_plan_review',
+              prepared.reviewers.change_plan_review,
+              FIX_REVIEW_POLICIES.change_plan_review,
+              { reviewedNodeId: 'disposition', reviewArtifactKind: 'change_plan_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed) runtime.transition('IMPLEMENTING', recoveredReview);
+            else runtime.transition('DISPOSITION', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           // F1：continue_disposition 的用户处置决定内容瞬态传给重跑的 disposition worker（worker
           // 在 capsule.userDecision 中读取“用户决定了什么”，避免重跑仍只带原始 problem 导致
           // wait_decision 反复循环）。来源：最新 checkpoint 的 decisionRecord——只有“刚被
@@ -810,6 +842,22 @@ export async function continueRun(
           break;
         }
         case 'IMPLEMENTING': {
+          const recoveredReview = recoveredReviewNode === 'change_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'implementation') as Artifact | undefined
+            : undefined;
+          if (recoveredReview) {
+            const review = await runReviewChecked(
+              'change_review',
+              prepared.reviewers.change_review,
+              FIX_REVIEW_POLICIES.change_review,
+              { reviewedNodeId: 'implement', reviewArtifactKind: 'change_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed && runtime.changeReviewBindsImplementation((results.disposition as ResultProjection | undefined)?.requiresRepositoryChange === true)) runtime.transition('VERIFYING', recoveredReview);
+            else if (review.passed) { pauseRecoverableNode('change_review', 'IMPLEMENTING', new WorkflowRuntimeError('CHANGE_REVIEW_NOT_BOUND', 'change_review must bind the current implementation candidateRevision before entering verification')); return 'paused'; }
+            else runtime.transition('IMPLEMENTING', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           const r = await exec('implement', problem);
           if (r === 'paused') return 'paused';
           const review = await runReviewChecked(

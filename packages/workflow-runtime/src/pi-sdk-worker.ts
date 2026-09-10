@@ -359,7 +359,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
             this.options.onProgress?.({ type: 'text', text });
           }
         }
-        if (liveHandle && event.type === 'turn_end') {
+        if (liveHandle && event.type === 'turn_end' && event.message?.role === 'assistant' && !event.message.errorMessage) {
           const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
           void live!.interaction.recordModelCallCompleted(liveHandle.runId, `${liveHandle.workerSessionId}:turn:${turnIndex}`);
         }
