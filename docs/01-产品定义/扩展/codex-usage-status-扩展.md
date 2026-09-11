@@ -1,12 +1,12 @@
-# Codex Usage Status Extension 产品规范
+# Codex Usage Status + Fast Extension 产品规范
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `DECIDED` |
+| 状态 | `IMPLEMENTING` |
 | 层级 | 第一层（L1 Extension） |
-| 用户目标 | 在 Pi 底部状态栏查看当前 ChatGPT Codex 订阅额度窗口的剩余比例、可用性与重置时间。 |
-| 适用范围 | `ctx.mode === "tui"` 且当前模型为 `openai-codex`，并且当前授权可安全读取 ChatGPT Codex 额度的会话。 |
-| 当前实现 | `packages/codex-usage-status` 已实现并通过模拟/静态验收；真实 Pi TUI/provider E2E 与全仓测试环境验证尚待完成，当前事实见 [L2 技术设计](../../02-产品实现/codex-usage-status-技术设计.md)。 |
+| 用户目标 | 在 Pi 底部状态栏查看当前 ChatGPT Codex 订阅额度窗口的剩余比例、可用性与重置时间，并按请求启用 Codex Fast 优先处理。 |
+| 适用范围 | 额度状态仍只适用于 TUI 的 `openai-codex` 安全授权会话；Fast 适用于满足严格模型、provider、API、base URL 和 OAuth 条件的当前模型，并支持 TUI/RPC 控制。 |
+| 当前实现 | `packages/codex-usage-status` 已实现额度状态、Fast 核心逻辑与 parent-Fast interop；已有模拟测试证据；真实 Pi TUI/provider E2E 未执行，全仓验证证据与当前 drift 见 [L2 技术设计](../../02-产品实现/codex-usage-status-技术设计.md)。 |
 
 ## 1. 产品保证
 
@@ -28,7 +28,31 @@ flowchart LR
 7. 额度查询失败、超时、字段不兼容或扩展被禁用时，不得阻塞、取消、重试或改变 Pi 的模型请求和会话状态。
 8. 同 provider 登录、登出或切换账号没有 Pi 认证事件时，扩展按每次输入、模型切换和最多 60 秒的授权校验识别作用域变化。每次成功确认作用域后开始 60 秒 lease；lease 到期即先清除快照并显示 `unavailable`，再后台校验，因此运行中底栏对当前授权的识别最多滞后 60 秒。发现变化时必须立即清除旧快照。
 
-## 2. 数据语义
+## 2. Fast 交互、请求与计费保证
+
+Fast 必须：
+
+1. 每个扩展 factory 默认以短暂内存意图从 Off 开始，不写入配置或 session。唯一例外是 §2.1 定义的一次性 trusted-launcher child：仅被选中的 child 可从 `PI_CODEX_FAST=1` 初始化 requested On；parent 的 reload/new/resume/fork，以及 child 后续 factory（包括 reload/new/resume/fork）仍从 Off 开始。
+2. 注册 `/fast`。无参数切换 requested intent；`on`、`off`、`toggle`、`status` 分别执行对应动作，其他参数显示用法警告。只有 `ctx.hasUI` 为真时允许 TUI/RPC 命令改变意图；JSON/print 不改变意图并安全通知限制。
+3. 区分 requested intent 和 effective state：Off、On 且 eligible 时 Active、On 且不 eligible 时 Inactive。模型切换不清除同一实例的 requested On；切回 eligible 必须更新状态并通知。额度 limited、stale 或 unavailable 不得自动关闭 Fast。
+4. 仅当当前模型的 provider 恰为 `openai-codex`、API 恰为 `openai-codex-responses`、base URL 恰为 `https://chatgpt.com/backend-api`、OAuth 校验为真，且模型 id 恰为 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol` 或 `gpt-5.6-terra` 时 eligible；mini、spark、前缀、大小写及其他变体均拒绝。该判定不读取额度授权、不联网、不启动 timer。
+5. Active 时，仅对 plain-object provider payload 且 `payload.model` 精确匹配当前模型 id 的 `before_provider_request` 请求返回浅复制并设置 `service_tier: "priority"`；其他情况保持不变。Fast 只作用于实际触发该 hook 的逻辑 Agent 请求；该返回值是本扩展的请求输出，不是“请求实际已按 priority 发送”的证明。
+6. 以独立底部状态 key 显示 `⚡ Fast`（受限 truecolor soft-orange `#D98C3F`，RGB `(217, 140, 63)`，固定 ANSI 序列 `\u001b[38;2;217;140;63m⚡ Fast\u001b[0m`，文本后立即 reset）、Fast inactive（muted）或 Fast off（muted）；Off/Active/Inactive 只描述本扩展的 intent/effective state。Active 通知固定为 `⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.`；TUI 以同一 orange ANSI 渲染并以 `info` 发送，RPC（`context.mode` 非 `tui`）发送不含 ANSI 的相同纯文本并以 `info` 发送；Inactive/Off 保持现有通知语义。请求被本扩展改写后，在匹配的 assistant message_end 按请求时模型/session 快照修正 Pi session cost：以 public `calculateCost` 重算 base，再应用 `gpt-5.5` 为 2.5、其他 allowlist 模型为 2 的 priority multiplier；只改 `usage.cost`，并对已正确计费结果幂等。支持的组合要求：没有后续 `before_provider_request` handler 改变或移除本扩展输出的 `service_tier`，且没有其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或已修正的 `usage.cost`，从而影响本次修正或最终持久化。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook；超出该组合时，本扩展只保证自己的 hook 输出，不保证 provider 最终 tier 或 session 最终 cost。
+7. 在上述支持的 handler 组合下，对 valid 的 `error` 或 `aborted` assistant message，只要 usage 字段完整且合法，仍按已产生的 usage 修正 cost；malformed usage fail open。
+
+### 2.1 Parent-Fast 继承例外
+
+Fast 的 factory 默认仍为 Off，但存在一个明确的一次性、受信任 launcher 例外：
+
+- parent 扩展用 Pi 官方 `pi.events` 发布稳定事件名 `@pi/codex-usage-status:fast-requested/v1`，payload 必须是无额外字段的 plain object `{ version: 1, sessionId: string, requested: boolean }`。缺失、版本不符、类型不符或多字段事件一律忽略；parent `session_start` 发布当前 requested，合法 `/fast` 状态改变后刷新，`session_shutdown` 发布该 session 的 `requested: false`。
+- launcher 仅把 parent requested intent 在实际 spawn 的瞬间按 session id 读取，并以全新环境副本删除 `PI_CODEX_FAST`；只有 resolved USER-source、名字严格为 `implementer` 或 `code_reviewer`、且其 agent frontmatter 有精确标量 `codexFast: inherit` 时才传 `PI_CODEX_FAST=1`。Parent Off、其他 user agent、所有 project agent（包括同名 project override）均 Off。
+- `PI_CODEX_FAST=1` 是 child factory 的一次性 advisory trusted-launcher input，不是认证、安全边界或持久化配置。child 启动立即读取并删除它；缺失及任何非精确值均 Off。child reload/new/resume/fork 重新建 factory 后回到 Off。
+- 继承的只是 requested intent；child 自己再次执行 provider、API、base URL、OAuth 和模型 eligibility。Parent requested On 但 Inactive 时，eligible child 仍可 Active。已 spawn child 不受后续 toggle 影响；chain 与排队 parallel item 在各自实际 spawn 时取快照，而不是按整个 tool invocation 取快照。
+- role/source/config policy 属于本地 external dispatcher integration，不是本 package 单独可验证的产品权限或认证机制；package 只保证协议和 child bootstrap 语义。Fast 激活通知必须明确说明新 spawn 的 selected user `implementer`/`code_reviewer` 会继承 requested Fast，同时保持紧凑 orange UI。
+
+额度状态仍遵循以下数据语义：
+
+## 3. 数据语义
 
 | 字段 | 定义 | 展示规则 |
 | --- | --- | --- |
@@ -40,7 +64,7 @@ flowchart LR
 
 同一快照只从默认 bucket 的 primary/secondary 窗口按该顺序展示。`additional_rate_limits` 及其标签、许可和窗口均不解析、不展示。若无任何有效主窗口，视为查询失败而非零额度。
 
-## 3. 刷新与失败语义
+## 4. 刷新与失败语义
 
 | 场景 | 用户可见结果 | 不可绕过的规则 |
 | --- | --- | --- |
@@ -54,7 +78,7 @@ flowchart LR
 | 暂时失败且同一作用域的上次成功快照未满 10 分钟 | 保留上次数据并标记 `stale` | 不得将过期数据说成当前值。 |
 | 无有效快照、登录缺失、账户失配、作用域变化或快照满 10 分钟 | `Codex: unavailable` | 不根据 token、模型 token 使用量或历史调用估算额度。 |
 
-## 4. 安全与隐私边界
+## 5. 安全与隐私边界
 
 - 扩展只可使用 Pi 已解析的 `openai-codex` 授权，在内存中解析必需的账户作用域并请求固定 ChatGPT origin；不得要求用户复制 token，也不得把 token 写入配置、日志、session、trace 或 UI。
 - 授权解析属于 Pi 内部操作，可能最长耗时 15 秒或受认证锁影响而更久；5 秒时限只约束 usage HTTP 请求。任何授权或 HTTP 晚到结果都必须经过当前 generation/作用域检查，不能写入底栏。当前模型还必须被 Pi 确认为 OAuth，并保有原生 `openai-codex-responses` API 与 `https://chatgpt.com/backend-api` base URL；任何改变 endpoint/API 的覆盖或非 OAuth 授权一律 `unavailable` 且不联网。仅改变名称等、运行时不可区分且不改变上述信任边界的模型元数据覆盖不在拒绝范围内。
@@ -62,7 +86,7 @@ flowchart LR
 - 状态栏仅展示默认主额度的许可状态、剩余比例、固定进度条、可选窗口时长、可选重置时间和新鲜度。
 - 接口、授权和服务端字段是外部依赖。其依据和不稳定性见[额度查询调研](../../归档/研究/2026-09-09-codex额度查询调研.md)。
 
-## 5. 验收标准
+## 6. 验收标准
 
 | 编号 | 场景 | 通过条件 |
 | --- | --- | --- |
@@ -74,7 +98,17 @@ flowchart LR
 | A6 | 非 Codex 模型、模型切换、同 provider 登出/换号或授权校验永久 pending | 模型切换立即清除；scope lease 到期（最多 60 秒）即清除旧快照，登录状态变化或 pending 不得延长它。 |
 | A7 | 非 TUI 模式 | 不调用授权解析、网络或定时器。 |
 | A8 | 审计检查 | Git diff、测试输出、状态栏、session 和日志均不含 token、账户标识、完整响应或原始 headers。 |
+| F1 | Fast 命令与模式 | `/fast` 的空参数、`on`、`off`、`toggle`、`status` 和非法参数行为符合定义；JSON/print（`hasUI=false`）不改变 intent，RPC（`hasUI=true`）可控制。 |
+| F2 | Fast gate 与状态 | 只有精确的 provider/API/base URL/OAuth/model-id allowlist 通过 gate；同一实例覆盖 Off、Active、Inactive、模型切换后保留 requested On 并在切回时恢复。 |
+| F3 | payload hook 与组合边界 | Active 仅为匹配的 plain-object payload 返回浅复制 `service_tier=priority`，保留原 payload/嵌套引用；支持组合要求没有后续 `before_provider_request` handler 改变或移除该 tier。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook，因此验收只证明本扩展 hook 输出，不证明 provider 最终 tier；超出支持组合不作最终 tier/cost 保证。 |
+| F4 | request-time ticket | ticket 使用请求时 model/session 快照；中途 Off、session mismatch、shutdown 和超过 32 项 FIFO 上限均 fail open，且不修正无本扩展 hook 的请求。 |
+| F5 | Fast cost | allowlist 非 `gpt-5.5` 为 2x、`gpt-5.5` 为 2.5x；long-context model tier 保留，四个 scaled component 相加得到 total，已 native-priority 浮点 cost 幂等不替换。支持组合还要求没有其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或 corrected `usage.cost`，从而影响本次修正或最终持久化；否则只保证本扩展自己的 hook 输出，不保证最终 session cost。 |
+| F6 | malformed/terminal usage | 负数、非整数、缺失必需字段、非法 reasoning/cacheWrite1h、`reasoning > output` 或 `cacheWrite1h > cacheWrite` 不修正；合法且有 accrued usage 的 `error`/`aborted` message 仅在上述支持的 `message_end` 组合下按已决定语义修正。 |
+| F7 | extension isolation/reset | Fast 使用独立 status key，不依赖额度查询；新建第二个 extension factory 后 intent 从 Off 开始，usage controller 的授权/网络行为不受 Fast 命令或 gate 影响。 |
+| F8 | parent requested Off | 任意新 spawn 均不带 Fast；状态按 session id 隔离，false/`session_shutdown` 清除对应 parent intent。 |
+| F9 | selected child inheritance | parent requested On 仅使 resolved USER-source 且 exact name/config 命中的 `implementer`、`code_reviewer` child 获得一次性 `PI_CODEX_FAST=1`；其他 user、project 和同名 project override 不继承。 |
+| F10 | bootstrap and timing | child 只读取并删除精确 `"1"`；child eligibility 独立决定 Active；reload/new/resume/fork Off；chain/queued parallel 按实际 spawn 快照；launcher 继承是 advisory、无持久化且不构成 package-only VERIFIED 证据。 |
 
-## 6. 进入实现的门禁
+## 7. 进入实现的门禁
 
 本规范必须完成独立的产品语义/指标评审和实现/运营评审，且所有 P0/P1 finding 已关闭，才可改动源码。若上游接口不再可用或其授权边界无法满足本规范，状态改为 `BLOCKED`，不以抓取网页或推算 token 使用量替代。
