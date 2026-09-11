@@ -1,7 +1,7 @@
 ---
 name: implementer
 description: 执行角色。按已对齐方案、已确认根因或 UI 边界做最小代码改动。
-model: smartingredients/deepseek-v4-flash
+model: openai-codex/gpt-5.6-luna
 tools: read, bash, edit, write, grep, find, ls
 ---
 

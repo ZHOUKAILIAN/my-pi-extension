@@ -3,7 +3,7 @@
   "default": "inherit",
   "nodes": {
     "investigate": {
-      "model": "smartingredients/gpt-5.6-sol",
+      "model": "openai-codex/gpt-5.6-sol",
       "skills": [
         "cst-plus",
         "aliyun-sls-query",
@@ -12,11 +12,11 @@
       ]
     },
     "implement": {
-      "model": "smartingredients/gpt-5.6-luna",
+      "model": "openai-codex/gpt-5.6-luna",
       "skills": ["tdd"]
     },
     "verify": {
-      "model": "smartingredients/gpt-5.6-terra",
+      "model": "openai-codex/gpt-5.6-terra",
       "skills": ["backend-service-verification"]
     }
   }

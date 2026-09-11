@@ -24,6 +24,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 | `packages/workflow-runtime/src/` | 通用状态机、Pi SDK Worker、Skill scope、Session checkpoint、Run Control WAL、交互队列、恢复与 GC；当前仍承载 Fix 业务门禁 | 已实现：有限重试、close fence、补充/模型生命周期审计、participant 级评审恢复、parent branch 校验、tombstone/trash GC；Fix 门禁 owner 待拆分（drift） |
 | `packages/fix/src/` | `/fix` command、模型策略、UI 决策、报告、traceId、实时 Worker 输入和 Child picker 接线 | v2 主流程与 Extension 交互适配已实现；真实 provider E2E、长时 TUI 稳定性和真实崩溃回放仍待验证 |
 | `packages/*/test/` | 对应源码的行为和回归证据 | 现有自动测试可运行 |
+| `packages/codex-usage-status/` | ChatGPT Codex 额度状态栏扩展 | 已实现独立 Pi extension；固定 ChatGPT usage endpoint、OAuth scope lease、白名单 DTO 与 TUI 状态投影见 [Codex Usage Status 技术设计](codex-usage-status-技术设计.md) |
 
 尚未存在 `packages/feature` 和独立 `workflow-ui` 实现。
 
