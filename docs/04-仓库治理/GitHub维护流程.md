@@ -45,6 +45,21 @@ npm run typecheck
 ```
 
 涉及真实 provider、Pi UI 或外部运行环境的行为，仅有单元测试时不得声称 E2E 已完成。
+
+执行中 Worker 协作能力合并前还必须验证：
+
+| 验证项 | 最低证据 |
+| --- | --- |
+| 单一输入路由 | streaming/idle 输入都到提交时绑定的 Worker；Node close fence 前输入使旧 Artifact 失效并触发绑定最新补充版本的重新交付，fence 后提交保留内容且不广播、不静默改投；真实 ExtensionRunner 吞异常时 input 仍返回 handled、before lifecycle 仍返回 cancel |
+| 上下文连续 | recorded/enqueue_accepted/model_call_completed/artifact_bound 逐条可核对；同一 Run 后续 Capsule 使用连续 supplementVersion，恢复后无跳过 |
+| 模型切换 | 选择器目标变化 fail-closed；候选满足 scoped/认证/兼容约束；已请求/待生效/已切换/未应用/失败与 Child AgentSession、Audit 一致且不误改主 Session |
+| 控制边界 | 补充信息和模型变化不能扩大 tools/skills/capability，不能绕过 Artifact、Guard 或 Acceptance |
+| 恢复 | 在 Run Control WAL append/fsync、enqueue、模型调用、Artifact、checkpoint 各边界做崩溃故障注入；operation lock + writer lease/epoch覆盖双 Pi进程、核验/append竞态、reload旧callback迟到和stale owner接管；compaction/sibling branch不作为控制事实；同 Node恢复重投明确展示，跨 Node不自动改投；legacy导入幂等且失败不双写 |
+| 父 Session 生命周期 | `/tree`、switch/fork/new/resume、重复 `/fix` 对可取消接缝 fail-closed；reload/shutdown 不虚假承诺可阻止退出，缺少终态时从 durable WAL 推断 interrupted；旧 branch 不再收输入，父 Session 首次落盘前崩溃可经用户确认重绑 |
+| 本地数据 | 受控目录实际为 `0700`、文件为 `0600`；20 attempts上限、settled intermediate 30 天、无 live lease unfinished 30 天、parent缺失 settled最多7天可验证；GC锁内复核、tombstone/rename和删除重试覆盖与恢复竞态；新 Run export/share只含 opaque ID/粗状态，legacy边界有提示，公开 Trace/Telemetry无原文 |
+| 宿主兼容 | lockfile Pi 版本与受支持宿主均验证；Child 独立 SettingsManager、input hook、后台任务、自定义 editor/keybinding、picker 和 session API 有契约测试，接缝缺失时 fail-closed |
+| 真实交互 | 至少一次真实 Pi TUI + provider E2E，证明 `/fix` 单一入口、同一输入框补充和 Child 专用模型选择；单元测试不能替代 |
+
 ## 文档写回
 
 - Bug、回归和已有能力优化：产品契约不变时只更新 L2 实现与测试；契约变化时更新对应 L1 owner，并同步实现或记录 drift。

@@ -1,4 +1,10 @@
-import type { ExtensionAPI, ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, InputEvent, InputEventResult, ExtensionContext } from '@earendil-works/pi-coding-agent';
+type ExtensionCommandContext = ExtensionContext;
+import { CustomEditor } from '@earendil-works/pi-coding-agent';
+import { CURSOR_MARKER, Text, truncateToWidth, wrapTextWithAnsi } from '@earendil-works/pi-tui';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import type {
   Artifact,
   Checkpoint,
@@ -17,10 +23,20 @@ import {
   WorkflowRuntimeError,
   PiSdkWorkerExecutor,
   PiSessionRunStore,
+  RunControlWalStore,
+  WorkerSidecar,
   WorkflowRuntime,
   WorkerArtifactSubmissionError,
   type WorkerExecutor,
   type WorkerProgress,
+  ActiveWorkerRegistry,
+  WorkflowInteractionPort,
+  RunControlWal,
+  RunControlWalError,
+  readRunControlRecords,
+  type ModelCandidate,
+  type RunStore,
+  type WorkerModel,
 } from '@pi/workflow-runtime';
 import {
   FIX_NODE_IDS,
@@ -65,7 +81,205 @@ export interface FixHost {
 // 3 个独立评审节点 id；评审 executor 由 prepareRun 按每个参与者独立 Worker 身份构造。
 export const REVIEWABLE_REVIEW_NODE_IDS: Array<FixNodeId> = ['investigation_review', 'change_plan_review', 'change_review'];
 
+export interface LiveRunBinding {
+  runId: string;
+  wal: RunControlWal;
+  registry: ActiveWorkerRegistry;
+  interaction: WorkflowInteractionPort;
+  parentSessionId: string;
+  parentLeafId: string;
+  sidecarDir?: string;
+  sidecar: WorkerSidecar;
+  store: RunControlWalStore;
+  previousEditor: ReturnType<ExtensionContext['ui']['getEditorComponent']>;
+}
+
+export interface LiveRunContext {
+  binding: LiveRunBinding;
+  promise: Promise<RunResult>;
+  parentContext?: ExtensionContext;
+}
+
+/** Process-local owner for background Fix runs. It is intentionally not a second
+ * Workflow state store: the WAL/Runtime remain authoritative. */
+export class LiveFixRunManager {
+  readonly registry = new ActiveWorkerRegistry();
+  constructor() {}
+  private readonly runs = new Map<string, LiveRunContext>();
+  private readonly sidecars = new Map<string, WorkerSidecar>();
+  private readonly interactions = new Map<string, WorkflowInteractionPort>();
+
+  createBinding(ctx: ExtensionCommandContext, runId: string): LiveRunBinding {
+    const parentSessionId = ctx.sessionManager.getSessionId?.() ?? process.env.PI_SESSION_ID ?? 'unknown-parent';
+    const parentLeafId = ctx.sessionManager.getLeafId?.() ?? 'root';
+    const rootDir = process.env.PI_CODING_AGENT_DIR;
+    const wal = RunControlWal.open(runId, { rootDir, parentSessionId, parentLeafId, parentSessionFile: ctx.sessionManager.getSessionFile?.(), cwd: ctx.cwd });
+    const sidecar = new WorkerSidecar(wal.runDir);
+    this.sidecars.set(runId, sidecar);
+    const modelCandidates = (): readonly ModelCandidate[] => liveModelCandidates(ctx).map((model) => ({
+      ref: `${model.provider}/${model.id}`,
+      model: model as WorkerModel,
+      compatible: () => true,
+    }));
+    const interaction = new WorkflowInteractionPort(this.registry, modelCandidates);
+    this.interactions.set(runId, interaction);
+    const binding: LiveRunBinding = {
+      runId,
+      wal,
+      registry: this.registry,
+      interaction,
+      parentSessionId,
+      parentLeafId,
+      sidecarDir: `${wal.runDir}/workers`,
+      sidecar,
+      store: new RunControlWalStore(wal),
+      previousEditor: ctx.ui.getEditorComponent(),
+    };
+    this.registry.reserve({ runId, parentSessionId, parentLeafId, nodeExecutionId: `${runId}.starting.0`, status: 'starting', wal });
+    return binding;
+  }
+
+  attach(run: LiveRunContext) {
+    this.runs.set(run.binding.runId, run);
+    void run.promise.then(() => undefined, () => undefined).finally(() => {
+      this.runs.delete(run.binding.runId);
+      this.registry.release(run.binding.runId);
+      if (run.parentContext?.mode === 'tui') run.parentContext.ui.setEditorComponent(run.binding.previousEditor);
+      this.interactions.delete(run.binding.runId);
+      if (activeTraceId === run.binding.runId) activeTraceId = undefined;
+      try { run.binding.wal.releaseLease(); } catch { /* durable WAL remains recoverable */ }
+    });
+  }
+  activeFor(ctx: ExtensionCommandContext) { return this.registry.getForParent(ctx.sessionManager.getSessionId(), ctx.sessionManager.getLeafId() ?? 'root'); }
+  ownerFor(ctx: ExtensionContext) { return this.registry.ownerForParent(ctx.sessionManager.getSessionId(), ctx.sessionManager.getLeafId() ?? 'root'); }
+  hasOwner(ctx: ExtensionContext) { return this.ownerFor(ctx) !== undefined; }
+  sidecar(runId: string) {
+    const cached = this.sidecars.get(runId);
+    if (cached) return cached;
+    // Renderer processes can be recreated independently of the Run manager.
+    // Resolve only a validated run directory below the protected root; never
+    // treat the opaque ref as a filesystem path.
+    if (!runId || runId !== runId.replace(/[^a-zA-Z0-9._-]/g, '_')) return undefined;
+    const rootDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? process.cwd(), '.pi', 'agent');
+    if (!RunControlWal.list(rootDir).includes(runId)) return undefined;
+    const sidecar = WorkerSidecar.openExisting(join(rootDir, 'workflow-runs', runId));
+    if (sidecar) this.sidecars.set(runId, sidecar);
+    return sidecar;
+  }
+  gc(now = Date.now()) { return WorkerSidecar.gc(process.env.PI_CODING_AGENT_DIR, now); }
+  submitSupplement(input: Parameters<WorkflowInteractionPort['submitSupplement']>[0]) {
+    return this.interactions.get(input.runId)?.submitSupplement(input);
+  }
+  requestModelChange(input: Parameters<WorkflowInteractionPort['requestModelChange']>[0]) {
+    return this.interactions.get(input.runId)?.requestModelChange(input);
+  }
+  openStore(ctx: ExtensionContext, runId: string): RunControlWalStore {
+    const wal = RunControlWal.open(runId, { rootDir: process.env.PI_CODING_AGENT_DIR, parentSessionId: ctx.sessionManager.getSessionId(), parentLeafId: ctx.sessionManager.getLeafId() ?? 'root', parentSessionFile: ctx.sessionManager.getSessionFile?.(), cwd: ctx.cwd });
+    return new RunControlWalStore(wal);
+  }
+  latestStore(ctx: ExtensionContext): { store?: RunControlWalStore; checkpoint: Checkpoint; parentMatches: boolean } | undefined {
+    const rootDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME ?? process.cwd(), '.pi', 'agent');
+    const currentSessionId = ctx.sessionManager.getSessionId();
+    const currentLeafId = ctx.sessionManager.getLeafId?.() ?? 'root';
+    // Recovery must inspect the complete active branch. A Run created at an
+    // ancestor remains owned by this session after /tree or /fork advances the
+    // leaf; scanning getEntries() would reintroduce sibling-session selection.
+    let activeBranch: readonly unknown[];
+    try { activeBranch = ctx.sessionManager.getBranch(currentLeafId); } catch { return undefined; }
+    const activeBranchIds = new Set(activeBranch.map((entry) => {
+      const id = (entry as { id?: unknown })?.id;
+      return typeof id === 'string' ? id : undefined;
+    }).filter((id): id is string => id !== undefined));
+    const candidates: Array<{ runId: string; checkpoint: Checkpoint; parentMatches: boolean; orphan: boolean; store?: RunControlWalStore }> = [];
+    for (const runId of RunControlWal.list(rootDir).filter((id) => id.startsWith('fix-'))) {
+      try {
+        const records = readRunControlRecords(join(rootDir, 'workflow-runs', runId, 'control.wal'), runId);
+        const checkpoint = records.filter((record) => record.type === 'checkpoint' && record.payload.checkpoint && typeof record.payload.checkpoint === 'object')
+          .map((record) => record.payload.checkpoint as Checkpoint).at(-1);
+        if (!checkpoint || checkpoint.stage === 'ACCEPTED' || checkpoint.problem === undefined) continue;
+        const header = records.find((record) => record.type === 'header')?.payload ?? {};
+        const rebind = records.filter((record) => record.type === 'worker' && record.payload.kind === 'parent_rebind').at(-1)?.payload.to;
+        const parent = rebind && typeof rebind === 'object' ? rebind as Record<string, unknown> : header;
+        if (parent.cwd !== ctx.cwd) continue;
+        const parentMatches = parent.parentSessionId === currentSessionId
+          && typeof parent.parentLeafId === 'string'
+          && (parent.parentLeafId === currentLeafId || activeBranchIds.has(parent.parentLeafId));
+        // A no-file run may be offered for an explicit UI-confirmed rebind
+        // even when the current Session ID differs. This exception is narrow:
+        // the header must say the parent file did not exist at first persist,
+        // the original path must still be undiscoverable, and the cwd must
+        // already match. A header that claimed an existing file is never
+        // treated as an orphan merely because that file is missing now.
+        const originalParentFile = header.parentSessionFile;
+        const noDiscoverableParentFile = header.parentSessionFileExists === false
+          && (typeof originalParentFile !== 'string' || originalParentFile.length === 0 || !existsSync(originalParentFile));
+        const orphan = !rebind && noDiscoverableParentFile;
+        const store = parentMatches ? this.openStore(ctx, runId) : undefined;
+        candidates.push({ runId, checkpoint, parentMatches, orphan, store });
+      } catch { /* active, tombstoned or corrupt runs are not silently selected */ }
+    }
+    // Exact parent + active leaf always wins. Session B remains untouched even
+    // when an orphan has a newer checkpoint or a lexically smaller runId.
+    const exact = candidates.filter((candidate) => candidate.parentMatches);
+    const orphanCandidates = candidates.filter((candidate) => candidate.orphan);
+    // Do not guess between multiple missing-parent Runs. A future UI picker can
+    // make that choice explicitly; today's synchronous discovery fails closed.
+    const pool = exact.length ? exact : (ctx.hasUI && orphanCandidates.length === 1 ? orphanCandidates : []);
+    pool.sort((a, b) => b.checkpoint.at - a.checkpoint.at || a.checkpoint.problem!.localeCompare(b.checkpoint.problem!) || a.runId.localeCompare(b.runId));
+    const selected = pool[0];
+    for (const candidate of candidates) {
+      if (candidate !== selected) { try { candidate.store?.wal.releaseLease(); } catch {} }
+    }
+    return selected;
+  }
+  async shutdown() {
+    await Promise.all([...this.runs.values()].map((run) => run.binding.interaction.shutdown()));
+    for (const owner of this.registry.allOwners()) owner.wal.markShutdown();
+  }
+
+  migrateLegacyCheckpoint(ctx: ExtensionCommandContext, checkpoint: Checkpoint) {
+    const wal = RunControlWal.open(checkpoint.runId, {
+      rootDir: process.env.PI_CODING_AGENT_DIR,
+      parentSessionId: ctx.sessionManager.getSessionId(),
+      parentLeafId: ctx.sessionManager.getLeafId() ?? 'root',
+      parentSessionFile: ctx.sessionManager.getSessionFile?.(),
+      cwd: ctx.cwd,
+    });
+    try {
+      const branch = ctx.sessionManager.getBranch(ctx.sessionManager.getLeafId() ?? undefined);
+      const source = [...branch].reverse().find((entry) => entry.type === 'custom' && entry.customType === 'workflow-run' && (entry.data as Checkpoint | undefined)?.id === checkpoint.id);
+      if (!source || source.type !== 'custom' || !source.data) throw new Error('legacy checkpoint is not on the active parent branch');
+      const sourceChecksum = createHash('sha256').update(JSON.stringify(source.data)).digest('hex');
+      wal.migrateLegacyCheckpoint({ parentSessionId: ctx.sessionManager.getSessionId(), sourceEntryId: checkpoint.id, sourceChecksum, checkpoint });
+    } finally {
+      try { wal.releaseLease(); } catch { /* keep the WAL for explicit recovery */ }
+    }
+  }
+}
+
+
 type ReviewNodeId = 'investigation_review' | 'change_plan_review' | 'change_review';
+type ModelPolicyAudit = { runNode: string; source: 'project-file' | 'runtime-default'; configuredRef: string; resolved?: { provider: string; id: string }; thinkingLevel: unknown; skills?: string[]; tools: string[] };
+type ResultProjection = {
+  kind?: string;
+  conclusion?: { status?: string; summary?: string };
+  summary?: string;
+  overview?: string;
+  rootCause?: string;
+  evidence?: unknown[];
+  risks?: string[];
+  unverified?: string[];
+  remainingRisk?: string[];
+  dispositionType?: string;
+  requiresRepositoryChange?: boolean;
+  minimalScope?: string;
+  verificationTarget?: string;
+  filesChanged?: string[];
+  candidateRevision?: string;
+  prUrl?: string;
+  artifact?: ResultProjection;
+  failure?: { kind: string; reason: string; responsibility?: string; resolution?: string };
+};
 
 // 模块级当前 Run 的 traceId（迁移 legacy activeTraceId 语义）：
 // host.trace 的 sendMessage 始终推送；appendEntry 仅在 activeTraceId 存在时写，
@@ -76,29 +290,28 @@ let activeTraceId: string | undefined;
 // sendMessage 存在性守卫兼容不暴露 sendMessage 的老宿主。
 const makeFixHost = (pi: ExtensionAPI): FixHost => {
   const setWorkflowStatus = (ctx: ExtensionCommandContext, text: string, working = true) => {
-    const ui = (ctx as any).ui;
-    ui?.setStatus?.('fix', text);
-    ui?.setWorkingMessage?.(text);
-    ui?.setWorkingVisible?.(working);
+      ctx.ui.setStatus?.('fix', text);
+    ctx.ui.setWorkingMessage?.(text);
+    ctx.ui.setWorkingVisible?.(working);
   };
   const clearWorkflowWorking = (ctx: ExtensionCommandContext) => {
-    (ctx as any).ui?.setWorkingVisible?.(false);
+    ctx.ui.setWorkingVisible?.(false);
   };
   const appendEntry = (type: string, data: unknown) => {
-    pi.appendEntry(type, data as any);
+    pi.appendEntry(type, data);
   };
   const trace = (content: string, level: 'info' | 'error' = 'info') => {
     const timestamp = Date.now();
     const traceId = activeTraceId;
     const visible = `[fix${traceId ? ` traceId=${traceId}` : ''}] ${content}`;
-    if (typeof (pi as any).sendMessage === 'function') {
-      (pi as any).sendMessage({ customType: 'fix-trace', content: visible, display: true, details: { traceId, level, timestamp } });
+    if (typeof pi.sendMessage === 'function') {
+      pi.sendMessage({ customType: 'fix-trace', content: visible, display: true, details: { traceId, level, timestamp } });
     }
     // sendMessage 使 trace 可见；appendEntry 使 /resume 后可回放。
     if (traceId) appendEntry('workflow-trace', { runId: traceId, traceId, content, level, timestamp });
   };
   const sendMessage = (options: { customType: string; content: string; display?: boolean; details?: Record<string, unknown> }) => {
-    if (typeof (pi as any).sendMessage === 'function') (pi as any).sendMessage(options);
+    if (typeof pi.sendMessage === 'function') pi.sendMessage({ ...options, display: options.display ?? true });
   };
   return { trace, setWorkflowStatus, clearWorkflowWorking, appendEntry, sendMessage };
 };
@@ -134,6 +347,11 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
       host.trace(`${nodeId} · Artifact accepted from strict structured-text fallback: ${summarize(progress.artifact)}`);
       return;
     }
+    if (progress.type === 'model_applied') {
+      host.setWorkflowStatus(ctx, `fix ${nodeId} · ${progress.model.provider}/${progress.model.id} · 模型已生效`, true);
+      host.trace(`${nodeId} · model applied at ${progress.modelCallRef}: ${progress.model.provider}/${progress.model.id}`);
+      return;
+    }
     if (progress.type === 'model_end') {
       host.trace(`${nodeId} · model end: stopReason=${progress.stopReason ?? 'unknown'}${progress.errorMessage ? ` · ${progress.errorMessage}` : ''}`, progress.stopReason === 'error' || progress.stopReason === 'aborted' ? 'error' : 'info');
       return;
@@ -158,17 +376,38 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
     }
   };
 
+const makeLiveProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId: string, model: { provider: string; id: string }, live: LiveRunBinding) =>
+  (progress: WorkerProgress) => {
+    // Only public assistant text and tool invocation summaries enter the protected
+    // display sidecar. Thinking deltas and tool results are deliberately dropped.
+    if (progress.type === 'text' || progress.type === 'tool_start') {
+      const ref = randomUUID();
+      live.sidecar.append(progress.type === 'text'
+        ? { ref, runId: live.runId, nodeId, eventKind: 'visible_text', text: progress.text.slice(-4000), occurredAt: new Date().toISOString() }
+        : { ref, runId: live.runId, nodeId, eventKind: 'tool_start', toolName: progress.name, args: progress.args, occurredAt: new Date().toISOString() });
+      host.sendMessage?.({ customType: 'fix-worker-event', content: `当前 Worker 有新的可见活动（${nodeId}，opaque ref ${ref}）`, display: true, details: { runId: live.runId, ref, nodeId, eventKind: progress.type === 'text' ? 'visible_text' : 'tool_start' } });
+    }
+    if (progress.type === 'model_applied') {
+      host.setWorkflowStatus(ctx, `fix ${nodeId} · ${progress.model.provider}/${progress.model.id} · 模型已生效`, true);
+      host.trace(`${nodeId} · model applied at ${progress.modelCallRef}: ${progress.model.provider}/${progress.model.id}`);
+    } else if (progress.type === 'tool_start' || progress.type === 'tool_end') {
+      const actual = live.registry.get(live.runId)?.actualModel ?? model;
+      host.setWorkflowStatus(ctx, `fix ${nodeId} · ${actual.provider}/${actual.id} · 工具活动`, true);
+    }
+  };
+
 // 解析模型引用并计算本次使用的 model：
 // - inherit：用 ctx.model（无 ctx.model 且无注入时抛错，语义沿用 resolveModelRef）；
 // - 非 inherit：用 registry.find 解析，找不到回退（仅注入外壳存在时回退占位模型）；
 // - registry 缺省回退与 model 最终取值照抄 legacy（extension.ts prepareRun）。
-const resolveRunModel = (ctx: ExtensionCommandContext, configuredRef: string, injected: WorkerExecutor | undefined): any => {
-  const inherited = (ctx as any).model ?? (injected ? { provider: 'injected', id: 'fixWorker' } : undefined);
-  const registry = (ctx as any).modelRegistry ?? {
-    find: (provider: string, id: string) => (injected ? { provider, id } : undefined),
-  };
+const resolveRunModel = (ctx: ExtensionCommandContext, configuredRef: string, injected: WorkerExecutor | undefined) => {
+  const inherited = ctx.model ?? (injected ? { provider: 'injected', id: 'fixWorker' } : undefined);
+  const registry = injected && !ctx.modelRegistry
+    ? { find: (provider: string, id: string) => ({ provider, id }) }
+    : ctx.modelRegistry;
   const resolved = resolveModelRef(configuredRef as ModelRef, inherited, registry);
-  return injected ? ((ctx as any).model ?? resolved) : resolved;
+  if (!injected && ctx.modelRegistry.hasConfiguredAuth?.(resolved) === false) throw Error(`model is not authenticated: ${configuredRef}`);
+  return injected ? (ctx.model ?? resolved) : resolved;
 };
 
 // 构造一次 Run 的全部节点执行与评审准备信息。
@@ -177,19 +416,21 @@ export function prepareRun(
   ctx: ExtensionCommandContext,
   host: FixHost,
   injected?: WorkerExecutor,
+  live?: LiveRunBinding,
 ): {
   policyDigest: string;
   effective: EffectivePolicy;
   definitions: Record<FixWorkerNodeId, NodeDefinition>;
   reviewers: Record<ReviewNodeId, NodeDefinition[]>;
-  audits: any[];
+  audits: ModelPolicyAudit[];
   resolvedThinkingLevel: unknown;
+  live?: LiveRunBinding;
 } {
   // 老版本宿主可能不暴露信任判定；沿用历史默认值（trusted）。
-  const trusted = typeof (ctx as any).isProjectTrusted === 'function' ? (ctx as any).isProjectTrusted() : true;
+  const trusted = ctx.isProjectTrusted();
   const effective = loadEffectivePolicy(ctx.cwd, { trusted });
   const policyDigest = effective.digest;
-  const resolvedThinkingLevel = (ctx as any).thinkingLevel;
+  const resolvedThinkingLevel = ctx.thinkingLevel;
 
   const workers = {} as Record<FixWorkerNodeId, WorkerExecutor>;
   const reviewers = {
@@ -197,7 +438,7 @@ export function prepareRun(
     change_plan_review: [],
     change_review: [],
   } as Record<ReviewNodeId, NodeDefinition[]>;
-  const audits: any[] = [];
+  const audits: ModelPolicyAudit[] = [];
 
   // 按 FIX_NODE_IDS 顺序逐节点准备：5 个纯 worker 节点构造 executor 并收集，
   // 3 个评审节点按 FIX_REVIEW_POLICIES 的参与者逐个构造独立评审者。
@@ -225,7 +466,8 @@ export function prepareRun(
               skills,
               cwd: ctx.cwd,
               workerId: `reviewer:${id}:${i + 1}`,
-              onProgress: makeProgressHandler(host, ctx, id, model),
+              onProgress: live ? makeLiveProgressHandler(host, ctx, id, model, live) : makeProgressHandler(host, ctx, id, model),
+              ...(live ? { live: { ...live } } : {}),
             });
         built.push(makeReviewerNode(id, executor));
         if (i === 0) {
@@ -256,7 +498,8 @@ export function prepareRun(
       skills: cfg.skills,
       cwd: ctx.cwd,
       workerId: `worker:${nodeId}`,
-      onProgress: makeProgressHandler(host, ctx, nodeId, model),
+      onProgress: live ? makeLiveProgressHandler(host, ctx, nodeId, model, live) : makeProgressHandler(host, ctx, nodeId, model),
+      ...(live ? { live: { ...live } } : {}),
     });
     workers[workerNodeId] = worker;
     audits.push({
@@ -278,7 +521,7 @@ export function prepareRun(
     verify: workers.verify,
   });
 
-  return { policyDigest, effective, definitions, reviewers, audits, resolvedThinkingLevel };
+  return { policyDigest, effective, definitions, reviewers, audits, resolvedThinkingLevel, live };
 }
 
 // ============================================================
@@ -299,7 +542,7 @@ type RunReviewOptions = Parameters<WorkflowRuntime['runReview']>[3];
 // 现象字段投影自 Intake 的 summary/overview（用户可读字段），原始 problem（Run 级追溯事实）
 // 不直接进入报告；缺少新字段的旧 checkpoint 按“尚未确认”处理，不做 phenomenon 降级。
 // 模块级复用：continueRun 的 ACCEPTED 收尾与 /fix review approve（或 UI 验收）决策后均产出。
-const buildFixReport = (results: Record<string, any>): string => {
+const buildFixReport = (results: Record<string, ResultProjection>): string => {
   const intake = results.intake ?? {};
   const investigation = results.investigation ?? {};
   const disposition = results.disposition ?? {};
@@ -327,7 +570,7 @@ const buildFixReport = (results: Record<string, any>): string => {
     items.length ? items.map((item) => `- ${typeof item === 'string' ? item : JSON.stringify(item)}`) : ['- 未提供'];
   const reviewConclusions = [results.investigation_review, results.change_plan_review, results.change_review]
     .filter(Boolean)
-    .map((review: any) => ({
+    .map((review: ResultProjection) => ({
       nodeId: review.kind,
       status: review.conclusion?.status,
       summary: review.conclusion?.summary,
@@ -389,7 +632,7 @@ const buildFixReport = (results: Record<string, any>): string => {
  */
 export async function continueRun(
   ctx: ExtensionCommandContext,
-  store: PiSessionRunStore,
+  store: RunStore,
   runId: string,
   problem: string,
   prepared: PreparedRun,
@@ -416,12 +659,12 @@ export async function continueRun(
     });
 
     // 3. 局部结果集：按 kind 投影 runtime 已接受 Artifact；后续 appendArtifact 同步更新。
-    const results: Record<string, any> = Object.fromEntries(
-      runtime.getArtifacts().map((artifact) => [artifact.kind, artifact]),
+    const results: Record<string, ResultProjection> = Object.fromEntries(
+      runtime.getArtifacts().map((artifact) => [artifact.kind, artifact as unknown as ResultProjection]),
     );
 
     const appendArtifact = (nodeId: string, artifact: Artifact) => {
-      results[artifact.kind] = artifact;
+      results[artifact.kind] = artifact as unknown as ResultProjection;
       host.trace(`${nodeId} · Artifact accepted: ${JSON.stringify(artifact).slice(0, 1600)}`);
     };
 
@@ -453,14 +696,31 @@ export async function continueRun(
       capsule?: Record<string, unknown>,
     ): Promise<{ artifact: Artifact; nodeId: FixWorkerNodeId } | 'paused'> => {
       let artifact: Artifact;
+      const restoredNodeExecutionId = runtime.getNodeExecutionId(nodeId);
+      const logicalNodeExecutionId = restoredNodeExecutionId ?? runtime.createNodeExecutionId(nodeId);
+      let recoveryAttempt = restoredNodeExecutionId ? (runtime.getRecoveryAttempt(nodeId) ?? 0) + 1 : 1;
+      const liveRecords = prepared.live?.wal.records() ?? [];
+      const supplementRecords = liveRecords.filter((record) => record.type === 'supplement').map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text }));
+      const latestSnapshot = [...liveRecords].reverse().find((record) => record.type === 'worker' && record.payload.kind === 'model_call_snapshot');
+      const inheritedSupplementVersion = prepared.live ? Math.max(
+        prepared.live.wal.getSupplementVersion(),
+        typeof latestSnapshot?.payload.supplementVersion === 'number' ? latestSnapshot.payload.supplementVersion : 0,
+      ) : 0;
+      const liveCapsule = prepared.live ? {
+        supplementVersion: inheritedSupplementVersion,
+        ...(supplementRecords.length ? { supplements: supplementRecords } : {}),
+        ...(typeof latestSnapshot?.payload.contextRef === 'string' ? { supplementContextRef: latestSnapshot.payload.contextRef } : {}),
+        ...(typeof latestSnapshot?.payload.modelCallRef === 'string' ? { modelCallRef: latestSnapshot.payload.modelCallRef } : {}),
+      } : {};
       try {
-        const result = await runtime.executeNode(prepared.definitions[nodeId], task, { context: capsule });
+        const result = await runtime.executeNode(prepared.definitions[nodeId], task, { nodeExecutionId: logicalNodeExecutionId, recoveryAttempt, context: { ...liveCapsule, ...capsule } });
         artifact = result.artifact;
       } catch (firstError) {
         if (!(firstError instanceof WorkerArtifactSubmissionError) && !(firstError instanceof ArtifactContractError)) throw firstError;
-        host.trace(`${nodeId} · ${firstError.code}; retrying with a new worker session · ${firstError.message}`);
+        host.trace(`${nodeId} · ${firstError.code}; retrying with recovery attempt 2 · ${firstError.message}`);
         try {
-          const result = await runtime.executeNode(prepared.definitions[nodeId], task, { context: capsule });
+          recoveryAttempt += 1;
+          const result = await runtime.executeNode(prepared.definitions[nodeId], task, { nodeExecutionId: logicalNodeExecutionId, recoveryAttempt, context: { ...liveCapsule, ...capsule } });
           artifact = result.artifact;
         } catch (secondError) {
           if (!(secondError instanceof WorkerArtifactSubmissionError) && !(secondError instanceof ArtifactContractError)) throw secondError;
@@ -472,14 +732,40 @@ export async function continueRun(
       return { artifact, nodeId };
     };
 
-    // 7. 评审节点：runReview 后把各评审者 Artifact 同步进结果集（review.passed 由调用方决策）。
+    // 7. 评审节点：所有 reviewer 使用同一份 Run supplement 快照；不因
+    // reviewer 顺序或当前 Child publication 改变上下文，且 Runtime 仍会为
+    // 每个 reviewer 盖章独立的 nodeExecutionId/workerId。
+    const liveRunCapsule = () => {
+      const allRecords = prepared.live?.wal.records() ?? [];
+      const records = allRecords.filter((record) => record.type === 'supplement');
+      const snapshot = [...allRecords].reverse().find((record) => record.type === 'worker' && record.payload.kind === 'model_call_snapshot');
+      if (!prepared.live) return {};
+      return {
+        supplementVersion: Math.max(
+          prepared.live.wal.getSupplementVersion(),
+          typeof snapshot?.payload.supplementVersion === 'number' ? snapshot.payload.supplementVersion : 0,
+        ),
+        ...(records.length ? { supplements: records.map((record) => ({ supplementId: record.payload.supplementId, sequence: record.payload.sequence, text: record.payload.text })) } : {}),
+        ...(typeof snapshot?.payload.contextRef === 'string' ? { supplementContextRef: snapshot.payload.contextRef } : {}),
+        ...(typeof snapshot?.payload.modelCallRef === 'string' ? { modelCallRef: snapshot.payload.modelCallRef } : {}),
+      };
+    };
     const runReviewChecked = async (
       reviewNodeId: string,
       reviewers: NodeDefinition[],
       policy: Parameters<WorkflowRuntime['runReview']>[2],
       reviewOpts: RunReviewOptions,
     ) => {
-      const review = await runtime.runReview(reviewNodeId, reviewers, policy, reviewOpts);
+      const review = await runtime.runReview(reviewNodeId, reviewers, policy, {
+        ...reviewOpts,
+        // Resolve the capsule for each participant, not once at runReview entry.
+        // A supplement accepted while reviewer #1 is running is therefore visible
+        // to reviewer #2 and is never retroactively attached to #1.
+        context: () => ({
+          ...liveRunCapsule(),
+          ...(typeof reviewOpts.context === 'function' ? reviewOpts.context() : (reviewOpts.context ?? {})),
+        }),
+      });
       review.reviewArtifacts.forEach((artifact) => appendArtifact(reviewNodeId, artifact));
       return review;
     };
@@ -488,7 +774,7 @@ export async function continueRun(
     const extractReviewConclusions = () =>
       [results.investigation_review, results.change_plan_review, results.change_review]
         .filter(Boolean)
-        .map((review: any) => ({
+        .map((review: ResultProjection) => ({
           nodeId: review.kind,
           status: review.conclusion?.status,
           summary: review.conclusion?.summary,
@@ -496,7 +782,11 @@ export async function continueRun(
 
     // 9. 最终处置报告见模块级 buildFixReport（continueRun 与 /fix review 复用，见 step 11）。
 
-    // 10. 主循环：按阶段分派直至 ACCEPTED。
+    // 10. 主循环：按阶段分派直至 ACCEPTED。恢复时仅首轮消费 WAL 投影出的评审节点；
+    // 同一调用内评审拒绝回流后，必须重新执行业务节点而不是重复评审。
+    // Only an explicit unfinished reviewer attempt can select a reviewer
+    // recovery path. A historical activeNodeId/reviewCycleId is not a cursor.
+    let recoveredReviewNode = runtime.getActiveReviewAttempt() ? runtime.getActiveNodeId() : undefined;
     while (runtime.stage !== 'ACCEPTED') {
       const stage = runtime.stage;
       host.setWorkflowStatus(ctx, `fix ${stage}`);
@@ -510,6 +800,21 @@ export async function continueRun(
           break;
         }
         case 'INVESTIGATING': {
+          const recoveredReview = recoveredReviewNode === 'investigation_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'investigation')
+            : undefined;
+          if (recoveredReview) {
+            const review = await runReviewChecked(
+              'investigation_review',
+              prepared.reviewers.investigation_review,
+              FIX_REVIEW_POLICIES.investigation_review,
+              { reviewedNodeId: 'investigate', reviewArtifactKind: 'investigation_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed) runtime.transition('DISPOSITION', recoveredReview);
+            else runtime.transition('INVESTIGATING', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           const r = await exec('investigate', problem);
           if (r === 'paused') return 'paused';
           const investigation = r.artifact as InvestigationArtifact;
@@ -532,6 +837,21 @@ export async function continueRun(
           break;
         }
         case 'DISPOSITION': {
+          const recoveredReview = recoveredReviewNode === 'change_plan_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'disposition') as DispositionArtifact | undefined
+            : undefined;
+          if (recoveredReview?.requiresRepositoryChange === true) {
+            const review = await runReviewChecked(
+              'change_plan_review',
+              prepared.reviewers.change_plan_review,
+              FIX_REVIEW_POLICIES.change_plan_review,
+              { reviewedNodeId: 'disposition', reviewArtifactKind: 'change_plan_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed) runtime.transition('IMPLEMENTING', recoveredReview);
+            else runtime.transition('DISPOSITION', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           // F1：continue_disposition 的用户处置决定内容瞬态传给重跑的 disposition worker（worker
           // 在 capsule.userDecision 中读取“用户决定了什么”，避免重跑仍只带原始 problem 导致
           // wait_decision 反复循环）。来源：最新 checkpoint 的 decisionRecord——只有“刚被
@@ -590,6 +910,22 @@ export async function continueRun(
           break;
         }
         case 'IMPLEMENTING': {
+          const recoveredReview = recoveredReviewNode === 'change_review'
+            ? [...runtime.getArtifacts()].reverse().find((artifact) => artifact.kind === 'implementation') as Artifact | undefined
+            : undefined;
+          if (recoveredReview) {
+            const review = await runReviewChecked(
+              'change_review',
+              prepared.reviewers.change_review,
+              FIX_REVIEW_POLICIES.change_review,
+              { reviewedNodeId: 'implement', reviewArtifactKind: 'change_review', context: { previousArtifact: recoveredReview } },
+            );
+            if (review.passed && runtime.changeReviewBindsImplementation((results.disposition as ResultProjection | undefined)?.requiresRepositoryChange === true)) runtime.transition('VERIFYING', recoveredReview);
+            else if (review.passed) { pauseRecoverableNode('change_review', 'IMPLEMENTING', new WorkflowRuntimeError('CHANGE_REVIEW_NOT_BOUND', 'change_review must bind the current implementation candidateRevision before entering verification')); return 'paused'; }
+            else runtime.transition('IMPLEMENTING', review.reviewArtifacts[0]);
+            recoveredReviewNode = undefined;
+            break;
+          }
           const r = await exec('implement', problem);
           if (r === 'paused') return 'paused';
           const review = await runReviewChecked(
@@ -869,7 +1205,7 @@ const unquoteContent = (token: string): string => {
 // approve 通过时写最终处置报告（与 continueRun ACCEPTED 收尾共用模块级 buildFixReport）。
 async function applyReviewDecision(
   ctx: ExtensionCommandContext,
-  deps: { store: PiSessionRunStore; host: FixHost; policyDigest?: string },
+  deps: { store: RunStore; host: FixHost; policyDigest?: string },
   runId: string,
   decision: UserDecisionArtifact,
 ): Promise<void> {
@@ -931,8 +1267,22 @@ async function applyReviewDecision(
 async function runReviewCommand(
   ctx: ExtensionCommandContext,
   args: string,
-  deps: { store: PiSessionRunStore; host: FixHost; policyDigest?: string },
+  deps: { store: PiSessionRunStore; host: FixHost; policyDigest?: string; live?: LiveFixRunManager },
 ): Promise<void> {
+  let reviewStore: RunStore = deps.store;
+  let reviewWal: RunControlWal | undefined;
+  let liveCheckpoint: Checkpoint | undefined;
+  if (deps.live && typeof ctx.sessionManager.getSessionId === 'function') {
+    try {
+      const runIdMatch = args.match(/^review(?:\s+(\S+))?/);
+      const selected = runIdMatch?.[1] ? { store: deps.live.openStore(ctx, runIdMatch[1]), checkpoint: undefined } : deps.live.latestStore(ctx);
+      if (selected?.store) { reviewStore = selected.store; reviewWal = selected.store.wal; liveCheckpoint = selected.checkpoint; }
+    } catch (error) {
+      ctx.ui.notify(`fix review WAL recovery failed: ${error instanceof Error ? error.message : String(error)}`, 'error');
+      return;
+    }
+  }
+  const releaseReviewLease = () => { if (reviewWal) { try { reviewWal.releaseLease(); } catch { /* preserve WAL for explicit recovery */ } reviewWal = undefined; } };
   // 动作后的剩余全部内容作为 note/reasonCode 载体（P3）：continue-disposition 需要承载含空格的
   // 多词决定内容，支持引号包裹（`"..."`）；无引号的单 token 保持向后兼容。
   const match = args.match(/^review(?:\s+(\S+))?(?:\s+(approve|request-changes|reject|continue-verification|continue-disposition))?(?:\s+(.+))?\s*$/);
@@ -943,20 +1293,21 @@ async function runReviewCommand(
   // 无引号单 token 保持原样（向后兼容）。request-changes 的原因码仍必须是 FIX_REVIEW_REASONS 枚举值。
   const content = reasonToken === undefined ? undefined : unquoteContent(reasonToken.trim());
 
-  const trusted = typeof (ctx as any).isProjectTrusted === 'function' ? (ctx as any).isProjectTrusted() : true;
+  const trusted = ctx.isProjectTrusted();
   const currentPolicyDigest = loadEffectivePolicy(ctx.cwd, { trusted }).digest;
   // 当前命令必须按当前有效策略恢复；调用方传入的旧 digest 不能绕过策略变更。
   const reviewDeps = { ...deps, policyDigest: currentPolicyDigest };
 
   // 定位 run：给 runIdToken 则 loadLast 并校验 stage；否则取最近未完成的 WAITING_FOR_USER run。
-  const checkpoint = runIdToken ? deps.store.loadLast(runIdToken) : deps.store.latestUncompleted();
+  const checkpoint = runIdToken ? reviewStore.loadLast(runIdToken) : liveCheckpoint ?? deps.store.latestUncompleted();
   if (!checkpoint || checkpoint.stage !== 'WAITING_FOR_USER') {
+    releaseReviewLease();
     ctx.ui.notify('no pending fix review');
     return;
   }
   const runId = checkpoint.runId;
-  const requestId = deps.store.loadLast(runId)?.pendingDecisionRequest;
-  const candidate = deps.store.loadLast(runId)?.candidateRevision;
+  const requestId = reviewStore.loadLast(runId)?.pendingDecisionRequest;
+  const candidate = reviewStore.loadLast(runId)?.candidateRevision;
 
   // 无 action：只展示待评审详情（不写 entry）；有 UI 时用 collectDecision 收集决策（视为有 action 继续）。
   if (!action) {
@@ -991,8 +1342,9 @@ async function runReviewCommand(
         },
         { requestId, candidateRevision: candidate, actions },
       );
-      if (decision) await applyReviewDecision(ctx, { ...deps, policyDigest: currentPolicyDigest }, runId, decision);
+      if (decision) await applyReviewDecision(ctx, { ...deps, store: reviewStore, policyDigest: currentPolicyDigest }, runId, decision);
     }
+    releaseReviewLease();
     return;
   }
 
@@ -1001,12 +1353,14 @@ async function runReviewCommand(
   // 用户处置决定内容（reasonCode 承载，与 UI 的 note 同为决定内容载体）；
   // approve / reject / continue-verification 原因码可选。
   if (!(Object.values(FIX_REVIEW_ACTIONS) as string[]).includes(action)) {
+    releaseReviewLease();
     ctx.ui.notify('usage: /fix review <runId> approve|request-changes|reject|continue-verification|continue-disposition');
     return;
   }
   let reasonCode: string | undefined;
   if (action === 'request-changes') {
     if (!content || !(Object.values(FIX_REVIEW_REASONS) as string[]).includes(content)) {
+      releaseReviewLease();
       ctx.ui.notify('usage: /fix review <runId> request-changes <原因码>');
       return;
     }
@@ -1015,6 +1369,7 @@ async function runReviewCommand(
     // F1：continue_disposition 必须携带用户决定内容，避免无内容继续造成 wait_decision 反复循环。
     // 内容可含空格：引号包裹或多 token 整体作为内容；无引号单 token 保持兼容。
     if (!content) {
+      releaseReviewLease();
       ctx.ui.notify('usage: /fix review <runId> continue-disposition <处置决定内容>');
       return;
     }
@@ -1036,7 +1391,8 @@ async function runReviewCommand(
     ...(reasonCode !== undefined ? { reasonCode } : {}),
     ...(candidate !== undefined ? { candidateRevision: candidate } : {}),
   };
-  await applyReviewDecision(ctx, reviewDeps, runId, decision);
+  await applyReviewDecision(ctx, { ...reviewDeps, store: reviewStore }, runId, decision);
+  releaseReviewLease();
 }
 
 // /fix 主命令入口：review 分支转交 runReviewCommand；problem 分支校验问题描述、生成 runId、
@@ -1045,7 +1401,7 @@ async function runReviewCommand(
 export async function handleFixCommand(
   ctx: ExtensionCommandContext,
   args: string,
-  deps: { store: PiSessionRunStore; host: FixHost; injected?: WorkerExecutor; policyDigest?: string },
+  deps: { store: PiSessionRunStore; host: FixHost; injected?: WorkerExecutor; policyDigest?: string; live?: LiveFixRunManager },
 ): Promise<void> {
   const trimmed = args.trim();
   if (/^review(\s|$)/.test(trimmed)) {
@@ -1057,7 +1413,37 @@ export async function handleFixCommand(
     ctx.ui.notify(parsed.usage!);
     return;
   }
-  const runId = `fix-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const runId = `fix-${Date.now()}-${randomUUID()}`;
+  // In the real Extension host, the Worker is a background Child AgentSession.
+  // Tests and explicitly injected executors retain the synchronous compatibility path.
+  if (deps.live && !deps.injected) {
+    if (deps.live.hasOwner(ctx)) {
+      ctx.ui.notify('当前 Fix 仍在执行，不能同时启动第二个接收者', 'warning');
+      return;
+    }
+    let binding: LiveRunBinding | undefined;
+    try {
+      binding = deps.live.createBinding(ctx, runId);
+      installLiveModelControls(ctx, deps.live, binding);
+      deps.host.appendEntry('workflow-command', { operation: 'start', runId, traceId: runId, time: Date.now() });
+      const prepared = prepareRun(ctx, deps.host, undefined, binding);
+      binding.store.saveCheckpoint({
+        runId, schemaVersion: 1, stage: 'INTAKE', at: Date.now(), id: `${runId}-initial`, problem: parsed.problem,
+        workflowVersion: FIX_WORKFLOW_VERSION, policyDigest: prepared.policyDigest,
+      });
+      deps.host.setWorkflowStatus(ctx, 'fix INTAKE · background Worker', true);
+      activeTraceId = runId;
+      const promise = continueRun(ctx, binding.store, runId, parsed.problem!, prepared, deps.host, { injected: undefined });
+      deps.live.attach({ binding, promise, parentContext: ctx });
+      return;
+    } catch (error) {
+      deps.live.registry.release(runId);
+      try { binding?.wal.releaseLease(); } catch { /* preserve the WAL for explicit recovery */ }
+      ctx.ui.notify(`fix 未启动（${error instanceof Error ? error.message : String(error)}）`, 'error');
+      deps.host.clearWorkflowWorking(ctx);
+      return;
+    }
+  }
   try {
     activeTraceId = runId;
     deps.host.setWorkflowStatus(ctx, 'fix INTAKE · preparing worker');
@@ -1095,15 +1481,51 @@ export async function handleFixCommand(
 // session_start(reason='resume') 恢复入口：取最近未完成 checkpoint，用户确认后重新 prepareRun
 // 并从 checkpoint 阶段继续；WAITING_FOR_USER 阶段跳过重复确认（决策已由用户发起）。
 // host 缺省时用 makeFixHost(pi) 自建（与 default export 闭包等价，host 无内部状态）。
-export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, host?: FixHost): Promise<void> {
+export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, host?: FixHost, live?: LiveFixRunManager): Promise<void> {
   const gateway = host ?? makeFixHost(pi);
-  const injected = (pi as any as { fixWorker?: WorkerExecutor }).fixWorker;
-  const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data as any));
-  const checkpoint = store.latestUncompleted();
-  if (!checkpoint || !checkpoint.problem) return;
-  if (!ctx.hasUI || !(await ctx.ui.confirm('恢复 fix 工作流', `${checkpoint.problem}\n当前阶段：${checkpoint.stage}`))) return;
+  const injected = (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker;
+  const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data));
+  const liveCandidate = live && !injected ? live.latestStore(ctx) : undefined;
+  const checkpoint = liveCandidate?.checkpoint ?? store.latestUncompleted();
+  if (!checkpoint || !checkpoint.problem) { try { liveCandidate?.store?.wal.releaseLease(); } catch { /* best effort */ } return; }
+  const recoveryTitle = liveCandidate && !liveCandidate.parentMatches ? '恢复并重新绑定 fix 工作流' : '恢复 fix 工作流';
+  const recoveryDetail = liveCandidate && !liveCandidate.parentMatches
+    ? `${checkpoint.problem}\n当前阶段：${checkpoint.stage}\n原父 Session 文件不可发现，将在当前会话中重新绑定。`
+    : `${checkpoint.problem}\n当前阶段：${checkpoint.stage}`;
+  if (!ctx.hasUI || !(await ctx.ui.confirm(recoveryTitle, recoveryDetail))) { try { liveCandidate?.store?.wal.releaseLease(); } catch { /* best effort */ } return; }
+  try { liveCandidate?.store?.wal.releaseLease(); } catch { /* reacquire through the binding below */ }
+  // A WAL whose original parent is gone is recoverable only after this same
+  // ordinary resume confirmation. The runId stays internal; it is never a
+  // user-facing command or prompt value.
+  if (liveCandidate && !liveCandidate.parentMatches) {
+    try {
+      RunControlWal.rebindParent(checkpoint.runId, {
+        rootDir: process.env.PI_CODING_AGENT_DIR,
+        parentSessionId: ctx.sessionManager.getSessionId(),
+        parentLeafId: ctx.sessionManager.getLeafId?.() ?? 'root',
+        parentSessionFile: ctx.sessionManager.getSessionFile?.(),
+        cwd: ctx.cwd,
+        confirmed: true,
+      });
+    } catch (error) {
+      ctx.ui.notify(`Fix 恢复失败：无法重新绑定当前会话（${error instanceof Error ? error.message : String(error)}）`, 'error');
+      return;
+    }
+  }
+  // Legacy parent checkpoints are imported once into the protected WAL before
+  // a resumed Worker can start. Conflicts and branch ambiguity fail closed.
+  if (live && !injected && !liveCandidate) {
+    try { live.migrateLegacyCheckpoint(ctx, checkpoint); }
+    catch (error) { ctx.ui.notify(`Fix 恢复失败：无法迁移 legacy checkpoint（${error instanceof Error ? error.message : String(error)}）`, 'error'); return; }
+  }
+  let binding: LiveRunBinding | undefined;
+  let handedOff = false;
   try {
-    const prepared = prepareRun(ctx, gateway, injected);
+    binding = live && !injected ? live.createBinding(ctx, checkpoint.runId) : undefined;
+    if (binding && live) installLiveModelControls(ctx, live, binding);
+    const prepared = prepareRun(ctx, gateway, injected, binding);
+    const runStore: RunStore = binding?.store ?? store;
+    if (binding && !binding.store.loadLast(checkpoint.runId)) runStore.saveCheckpoint(checkpoint);
     activeTraceId = checkpoint.runId;
     gateway.trace(`trace started · resumed from ${checkpoint.stage}`);
     gateway.appendEntry('workflow-command', {
@@ -1112,11 +1534,18 @@ export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandC
       traceId: checkpoint.runId,
       time: Date.now(),
     });
-    await continueRun(ctx, store, checkpoint.runId, checkpoint.problem, prepared, gateway, {
+    const promise = continueRun(ctx, runStore, checkpoint.runId, checkpoint.problem, prepared, gateway, {
       injected,
       confirmationAlreadyGiven: checkpoint.stage === 'WAITING_FOR_USER',
     });
+    if (binding && live) {
+      live.attach({ binding, promise, parentContext: ctx });
+      handedOff = true;
+      return;
+    }
+    await promise;
   } catch (error) {
+    try { binding?.wal.releaseLease(); } catch { /* preserve the WAL for explicit recovery */ }
     gateway.clearWorkflowWorking(ctx);
     const message = error instanceof Error ? error.message : String(error);
     const recovery = error instanceof WorkerArtifactSubmissionError
@@ -1128,27 +1557,246 @@ export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandC
     gateway.trace(`failed · ${message}${recovery}`, 'error');
     ctx.ui.notify(`fix failed: ${message}${recovery}`, 'error');
   } finally {
-    activeTraceId = undefined;
+    if (!handedOff) activeTraceId = undefined;
   }
+}
+
+const TOOL_CAPABLE_APIS = new Set(['anthropic-messages', 'openai-completions', 'openai-responses', 'azure-openai-responses', 'openai-codex-responses', 'google-generative-ai', 'bedrock-converse-stream', 'vertex-ai']);
+const liveModelCandidates = (ctx: ExtensionContext) => {
+  const scoped = ctx.scopedModels.map((item) => item.model);
+  return (scoped.length ? scoped : ctx.modelRegistry.getAvailable())
+    .filter((model) => ctx.modelRegistry.hasConfiguredAuth(model))
+    .filter((model) => Array.isArray((model as { input?: readonly string[] }).input)
+      && (model as { input: readonly string[] }).input.includes('text')
+      && TOOL_CAPABLE_APIS.has(String((model as { api?: unknown }).api)));
+};
+function authenticatedModelRefs(ctx: ExtensionContext): string[] {
+  return liveModelCandidates(ctx).map((model) => `${model.provider}/${model.id}`);
+}
+
+export class LiveWorkerEditor extends CustomEditor {
+  private readonly injectedKeybindings: { matches(data: string, action: string): boolean };
+  private readonly activeWorker: () => boolean;
+  private readonly onSelect: () => void;
+  private readonly onCycle: (direction: 1 | -1) => void;
+  private readonly previous: any;
+  private readonly previousSubmit?: (text: string) => void;
+  private readonly previousChange?: (text: string) => void;
+  private readonly previousEscape?: () => void;
+  private readonly previousCtrlD?: () => void;
+  private readonly previousPasteImage?: () => void;
+  private readonly previousExtensionShortcut?: (data: string) => boolean;
+
+  constructor(tui: any, theme: any, keybindings: any, previousFactory: any, controls: { active: () => boolean; select: () => void; cycle: (direction: 1 | -1) => void }) {
+    super(tui, theme, keybindings);
+    this.injectedKeybindings = keybindings;
+    this.activeWorker = controls.active;
+    this.onSelect = controls.select;
+    this.onCycle = controls.cycle;
+    // Compose the extension that owned the editor before us. Do not replace it
+    // with a second blank Pi editor: text, history, autocomplete and its own
+    // shortcuts continue to live on this delegated instance.
+    this.previous = previousFactory?.(tui, theme, keybindings);
+    this.previousSubmit = this.previous?.onSubmit;
+    this.previousChange = this.previous?.onChange;
+    this.previousEscape = this.previous?.onEscape;
+    this.previousCtrlD = this.previous?.onCtrlD;
+    this.previousPasteImage = this.previous?.onPasteImage;
+    this.previousExtensionShortcut = this.previous?.onExtensionShortcut;
+    // CustomEditor/Editor declares focused as a class field in Pi 0.84.2, so
+    // overriding it with a TypeScript accessor is not legal. Define the
+    // Focusable proxy on this instance instead and keep the delegated editor
+    // synchronized whenever TUI changes focus.
+    let focusedValue = this.previous?.focused === true;
+    Object.defineProperty(this, 'focused', {
+      configurable: true,
+      get: () => focusedValue,
+      set: (value: boolean) => { focusedValue = value; if (this.previous && 'focused' in this.previous) this.previous.focused = value; },
+    });
+  }
+
+  private syncPreviousCallbacks() {
+    if (!this.previous) return;
+    this.previous.onSubmit = (text: string) => { this.previousSubmit?.(text); this.onSubmit?.(text); };
+    this.previous.onChange = (text: string) => { this.previousChange?.(text); this.onChange?.(text); };
+    // Pi 0.84.2 installs app handlers on the returned wrapper after the
+    // factory runs. Mirror them onto the delegated editor before dispatch.
+    if (this.previous.actionHandlers instanceof Map) {
+      for (const [action, handler] of this.actionHandlers) this.previous.actionHandlers.set(action, handler);
+    }
+    if ('onEscape' in this) this.previous.onEscape = () => { this.previousEscape?.(); this.onEscape?.(); };
+    if ('onCtrlD' in this) this.previous.onCtrlD = () => { this.previousCtrlD?.(); this.onCtrlD?.(); };
+    if ('onPasteImage' in this) this.previous.onPasteImage = () => { this.previousPasteImage?.(); this.onPasteImage?.(); };
+    if ('onExtensionShortcut' in this) this.previous.onExtensionShortcut = (data: string) => this.previousExtensionShortcut?.(data) === true || this.onExtensionShortcut?.(data) === true;
+  }
+
+  private delegateInput(data: string) {
+    this.syncPreviousCallbacks();
+    if (this.previous?.handleInput) this.previous.handleInput(data);
+    else super.handleInput(data);
+  }
+
+  handleInput(data: string) {
+    const matches = (action: string) => this.injectedKeybindings.matches(data, action);
+    // Pi's explicit editor controls have priority over model actions. This is
+    // intentionally checked before Child picker keys so history, clipboard,
+    // interrupt, exit and other extension handlers cannot be hijacked.
+    const explicitEditorAction = ['tui.editor.historyPrevious', 'tui.editor.historyNext', 'app.clipboard.pasteImage', 'app.interrupt', 'app.exit'].some(matches);
+    if (!this.activeWorker() || explicitEditorAction) { this.delegateInput(data); return; }
+    if (matches('app.model.select') || matches('app.model.cycleForward') || matches('app.model.cycleBackward')) {
+      this.syncPreviousCallbacks();
+      if (this.previousExtensionShortcut?.(data) === true || this.onExtensionShortcut?.(data) === true) return;
+    }
+    if (matches('app.model.select')) { this.onSelect(); return; }
+    if (matches('app.model.cycleForward')) { this.onCycle(1); return; }
+    if (matches('app.model.cycleBackward')) { this.onCycle(-1); return; }
+    this.delegateInput(data);
+  }
+
+  getText() { return this.previous?.getText ? this.previous.getText() : super.getText(); }
+  setText(text: string) { if (this.previous?.setText) this.previous.setText(text); else super.setText(text); }
+  render(width: number) {
+    const lines = this.previous?.render ? this.previous.render(width) : super.render(width);
+    // A delegated Pi 0.84.2 Editor emits CURSOR_MARKER when focused. Keep a
+    // defensive marker for third-party Focusable editors that expose focus but
+    // omit the marker, without changing the delegated cursor/text rendering.
+    if (this.focused && !lines.some((line: string) => line.includes(CURSOR_MARKER)) && lines.length) {
+      const cursor = this.previous?.getCursor?.() ?? super.getCursor();
+      const lineIndex = Math.max(0, Math.min(lines.length - 1, Number(cursor?.line ?? lines.length - 1)));
+      const column = Math.max(0, Math.min(lines[lineIndex]!.length, Number(cursor?.col ?? lines[lineIndex]!.length)));
+      lines[lineIndex] = `${lines[lineIndex]!.slice(0, column)}${CURSOR_MARKER}${lines[lineIndex]!.slice(column)}`;
+    }
+    return lines;
+  }
+  invalidate() { if (this.previous?.invalidate) this.previous.invalidate(); else super.invalidate(); }
+  getExpandedText() { return this.previous?.getExpandedText ? this.previous.getExpandedText() : this.getText(); }
+  getLines() { return this.previous?.getLines ? this.previous.getLines() : [this.getText()]; }
+  getCursor() { return this.previous?.getCursor ? this.previous.getCursor() : super.getCursor(); }
+  addToHistory(text: string) { if (this.previous?.addToHistory) this.previous.addToHistory(text); else super.addToHistory(text); }
+  setAutocompleteProvider(provider: any) { if (this.previous?.setAutocompleteProvider) this.previous.setAutocompleteProvider(provider); else super.setAutocompleteProvider(provider); }
+  setPaddingX(padding: number) { if (this.previous?.setPaddingX) this.previous.setPaddingX(padding); else super.setPaddingX(padding); }
+  getPaddingX() { return this.previous?.getPaddingX ? this.previous.getPaddingX() : super.getPaddingX(); }
+  setAutocompleteMaxVisible(max: number) { if (this.previous?.setAutocompleteMaxVisible) this.previous.setAutocompleteMaxVisible(max); else super.setAutocompleteMaxVisible(max); }
+  getAutocompleteMaxVisible() { return this.previous?.getAutocompleteMaxVisible ? this.previous.getAutocompleteMaxVisible() : super.getAutocompleteMaxVisible(); }
+  isShowingAutocomplete() { return this.previous?.isShowingAutocomplete ? this.previous.isShowingAutocomplete() : super.isShowingAutocomplete(); }
+}
+
+export function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRunManager, binding: LiveRunBinding): void {
+  if (ctx.mode !== 'tui' || ctx.ui.getEditorComponent() !== binding.previousEditor) return;
+  const select = async () => {
+    const worker = live.activeFor(ctx);
+    if (!worker) { ctx.ui.notify('当前没有可切换模型的 Worker', 'warning'); return; }
+    const candidates = authenticatedModelRefs(ctx);
+    if (!candidates.length) { ctx.ui.notify('当前 Worker 没有已认证且兼容工具的可选模型', 'warning'); return; }
+    const selected = await ctx.ui.select('选择当前 Worker 模型', candidates);
+    if (!selected) return;
+    const result = await workerInteractionModel(live, worker, selected);
+    ctx.ui.notify(result?.state === 'pending' ? `模型已请求，待下一次调用生效：${selected}` : `模型切换${result?.state ?? 'failed'}`, result?.state === 'failed' ? 'error' : 'info');
+  };
+  const cycle = async (direction: 1 | -1) => {
+    const worker = live.activeFor(ctx); if (!worker) return;
+    const candidates = authenticatedModelRefs(ctx);
+    const current = `${worker.actualModel.provider}/${worker.actualModel.id}`;
+    const index = candidates.indexOf(current);
+    const next = candidates[(index + direction + candidates.length) % candidates.length];
+    if (next) await workerInteractionModel(live, worker, next);
+  };
+  ctx.ui.setEditorComponent((tui, theme, keybindings) => new LiveWorkerEditor(tui, theme, keybindings, binding.previousEditor, {
+    active: () => live.activeFor(ctx) !== undefined,
+    select: () => { void select(); },
+    cycle: (direction) => { void cycle(direction); },
+  }));
 }
 
 // fix v2 Extension 入口：register /fix 命令 + session_start(resume) 钩子。
 export default function fixExtensionV2(pi: ExtensionAPI) {
   const host = makeFixHost(pi);
+  const live = new LiveFixRunManager();
 
-  if (typeof (pi as any).on === 'function') {
-    (pi as any).on('session_start', async (event: any, ctx: ExtensionCommandContext) => {
-      if (event.reason === 'resume') await resumeFromSession(pi, ctx, host);
+  pi.on('input', async (event: InputEvent, ctx): Promise<InputEventResult> => {
+    let owner: ReturnType<LiveFixRunManager['ownerFor']>;
+    try { owner = live.ownerFor(ctx); }
+    catch {
+      // The host runner treats a rejected handler as “no result”, which would
+      // route the user's text into the parent Agent. Context/owner lookup is
+      // therefore itself a fail-closed boundary.
+      return { action: 'handled' };
+    }
+    if (!owner || event.source === 'extension' || event.text.startsWith('/')) return { action: 'continue' };
+    // Ownership is checked before Child lookup: starting, settlement, and the
+    // publication gap are all handled locally and never leak to the parent.
+    try {
+      const expectedNodeExecutionId = live.activeFor(ctx)?.nodeExecutionId ?? owner.nodeExecutionId;
+      const result = await workerInteraction(live, owner.runId, expectedNodeExecutionId, event.text, event.images);
+      if (result?.state !== 'enqueue_accepted') {
+        try { ctx.ui.setEditorText(event.text); } catch { /* best effort */ }
+        ctx.ui.notify(`补充信息未投递：${result?.error ?? result?.state ?? 'unknown'}；文本已保留`, 'warning');
+      }
+    } catch (error) {
+      try { ctx.ui.setEditorText(event.text); } catch { /* best effort */ }
+      ctx.ui.notify(`补充信息未投递，文本已保留：${error instanceof Error ? error.message : String(error)}`, 'error');
+    }
+    return { action: 'handled' };
+  });
+  const beforeLifecycle = async (ctx: ExtensionContext): Promise<{ cancel: boolean }> => {
+    try {
+      // Read both owner and context inside the guard. The host runner catches
+      // handler exceptions as “no result”; lifecycle cancellation must instead
+      // fail closed and be an explicit return value.
+      return { cancel: live.hasOwner(ctx) };
+    } catch {
+      return { cancel: true };
+    }
+  };
+  pi.on('session_before_tree', async (_event, ctx) => beforeLifecycle(ctx));
+  pi.on('session_before_switch', async (_event, ctx) => beforeLifecycle(ctx));
+  pi.on('session_before_fork', async (_event, ctx) => beforeLifecycle(ctx));
+  pi.on('session_shutdown', async () => { await live.shutdown(); });
+  pi.on('session_start', async (event, ctx) => {
+    live.gc();
+    if (event.reason === 'resume') {
+      const unfinished = RunControlWal.list().filter((runId) => runId.startsWith('fix-'));
+      if (unfinished.length) ctx.ui.notify(`发现 ${unfinished.length} 个可恢复的 Fix 运行；请确认后使用 Pi /resume`, 'warning');
+      await resumeFromSession(pi, ctx, host, live);
+    }
+  });
+
+  if (typeof pi.registerMessageRenderer === 'function') {
+    pi.registerMessageRenderer<LiveWorkerMessageDetails>('fix-worker-event', (message) => {
+      const details = message.details;
+      if (!details) return undefined;
+      const projection = live.sidecar(details.runId)?.get(details.ref);
+      if (!projection) return { render: () => ['Worker activity unavailable'], invalidate: () => {} };
+      const text = projection.eventKind === 'visible_text'
+        ? projection.text ?? ''
+        : `tool: ${projection.toolName ?? 'unknown'} ${JSON.stringify(projection.args ?? {}).slice(0, 500)}`;
+      return { render: (width: number) => new Text(renderWorkerText(text, width), 0, 0).render(width), invalidate: () => {} };
     });
   }
 
   pi.registerCommand('fix', {
     description: 'Start a Fix workflow: /fix <问题描述>',
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data as any));
-      await handleFixCommand(ctx, args, { store, host, injected: (pi as any as { fixWorker?: WorkerExecutor }).fixWorker });
+      const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data));
+      await handleFixCommand(ctx, args, { store, host, injected: (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker, live });
     },
   });
+}
+
+interface LiveWorkerMessageDetails { runId: string; ref: string; nodeId: string; eventKind: 'visible_text' | 'tool_start'; }
+
+/** Use Pi's terminal-width primitives rather than JS string slicing. */
+export function renderWorkerText(text: string, width: number): string {
+  const safeWidth = Math.max(1, Math.floor(width));
+  return wrapTextWithAnsi(text, safeWidth).map((line) => truncateToWidth(line, safeWidth, '')).join('\n');
+}
+
+type SupplementImages = Parameters<WorkflowInteractionPort['submitSupplement']>[0]['images'];
+async function workerInteraction(live: LiveFixRunManager, runId: string, expectedNodeExecutionId: string, text: string, images?: SupplementImages) {
+  return live.submitSupplement({ runId, expectedNodeExecutionId, text, images });
+}
+async function workerInteractionModel(live: LiveFixRunManager, worker: NonNullable<ReturnType<LiveFixRunManager['activeFor']>>, modelRef: string) {
+  return live.requestModelChange({ runId: worker.runId, expectedNodeExecutionId: worker.nodeExecutionId, expectedWorkerSessionId: worker.workerSessionId, expectedAttemptId: worker.attemptId, modelRef });
 }
 
 // 供测试与运行时壳使用的定义导出保留。

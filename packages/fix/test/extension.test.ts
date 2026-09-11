@@ -25,3 +25,18 @@ test('registers and executes through the Pi extension loader', async () => {
   // intentionally not used here. CLI smoke below binds it to a real session.
   assert.equal(typeof loaded.extensions[0].commands.get('fix')?.handler, 'function');
 });
+
+test('real 0.84.2 ExtensionRunner receives fail-closed lifecycle results when context/owner lookup throws', async () => {
+  const loaderUrl = new URL('../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js', import.meta.url);
+  const runnerUrl = new URL('../../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js', import.meta.url);
+  const { loadExtensions, createExtensionRuntime } = await import(loaderUrl.href);
+  const { ExtensionRunner } = await import(runnerUrl.href);
+  const runtime = createExtensionRuntime();
+  const loaded = await loadExtensions([resolve(dirname(fileURLToPath(import.meta.url)), '../src/extension.ts')], process.cwd(), undefined, runtime);
+  const runner = new ExtensionRunner(loaded.extensions, loaded.runtime, process.cwd(), {} as any, {} as any);
+  (runner as any).sessionManager = { getSessionId: () => { throw new Error('session context unavailable'); } };
+  for (const type of ['session_before_tree', 'session_before_switch', 'session_before_fork'] as const) {
+    const result = await runner.emit({ type } as any);
+    assert.deepEqual(result, { cancel: true }, type);
+  }
+});

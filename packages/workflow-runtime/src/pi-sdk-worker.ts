@@ -1,6 +1,24 @@
-import { createAgentSession, SessionManager, DefaultResourceLoader, getAgentDir, type ToolDefinition, type ResourceLoader } from '@earendil-works/pi-coding-agent';
+import { createAgentSession, SessionManager, SettingsManager, DefaultResourceLoader, getAgentDir, type ToolDefinition, type ResourceLoader } from '@earendil-works/pi-coding-agent';
 import type { Artifact, NodeDefinition, WorkerExecutor, Capsule } from '@pi/workflow-contracts';
 import { ArtifactContractError, validateSubmitArtifact, NODE_ARTIFACT_KINDS, ARTIFACT_JSON_SCHEMAS } from '@pi/workflow-contracts';
+import { mkdirSync, chmodSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import type { ActiveWorkerHandle, ActiveWorkerRegistry, WorkflowInteractionPort, WorkerModel, WorkerSessionLike } from './interaction.ts';
+import type { RunControlWal } from './run-control-wal.ts';
+
+type WorkerMessage = { role?: string; stopReason?: string; errorMessage?: string; content?: unknown };
+type WorkerEvent = {
+  type: string;
+  toolName?: string;
+  args?: unknown;
+  result?: unknown;
+  isError?: boolean;
+  assistantMessageEvent?: { type?: string; delta?: string };
+  message?: WorkerMessage;
+  messages?: readonly WorkerMessage[];
+};
+type WorkerSessionRuntime = WorkerSessionLike & { messages?: readonly WorkerMessage[] };
 
 export type WorkerProgress =
   | { type: 'tool_start'; name: string; args: unknown }
@@ -12,7 +30,8 @@ export type WorkerProgress =
   /** 未知 node.id 无法绑定 per-kind schema（ARTIFACT_JSON_SCHEMAS 无对应 kind）时退回
    *  最小宽松 schema（只声明 kind），结构校验完全交给 execute 内权威层兜底；发本事件
    *  保证该降级在进度流中可见，不会被静默吞掉。 */
-  | { type: 'schema_fallback'; nodeId: string };
+  | { type: 'schema_fallback'; nodeId: string }
+  | { type: 'model_applied'; model: { provider: string; id: string }; modelCallRef: string };
 
 export class WorkerArtifactSubmissionError extends Error {
   readonly code: string;
@@ -32,12 +51,12 @@ const FALLBACK_ARTIFACT_SCHEMA = {
   properties: { kind: { type: 'string' } },
   required: ['kind'],
   additionalProperties: true,
-} as any;
+} satisfies ToolDefinition['parameters'];
 
 // 每节点唯一 kind 的 JSON Schema 由 contracts 单一定义表派生（ARTIFACT_JSON_SCHEMAS），
 // 注入 submit_artifact 工具声明进入口校验（pi convert → validate）；
 // validateSubmitArtifact 仍是权威校验（语义/条件必填层）。
-function artifactSchemaFor(nodeId: string, onProgress?: (progress: WorkerProgress) => void): any {
+function artifactSchemaFor(nodeId: string, onProgress?: (progress: WorkerProgress) => void): ToolDefinition['parameters'] {
   const kind = NODE_ARTIFACT_KINDS[nodeId];
   const schema = kind ? (ARTIFACT_JSON_SCHEMAS as Record<string, Record<string, unknown>>)[kind] : undefined;
   if (schema) return schema;
@@ -115,6 +134,14 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
     onProgress?: (progress: WorkerProgress) => void;
+    live?: {
+      registry: ActiveWorkerRegistry;
+      interaction: WorkflowInteractionPort;
+      wal: RunControlWal;
+      parentSessionId: string;
+      parentLeafId: string;
+      sidecarDir?: string;
+    };
   };
 
   constructor(options: {
@@ -126,6 +153,14 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
     onProgress?: (progress: WorkerProgress) => void;
+    live?: {
+      registry: ActiveWorkerRegistry;
+      interaction: WorkflowInteractionPort;
+      wal: RunControlWal;
+      parentSessionId: string;
+      parentLeafId: string;
+      sidecarDir?: string;
+    };
   } = {}) {
     this.options = options;
   }
@@ -151,7 +186,13 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           if (error instanceof ArtifactContractError) rejectedSubmission = error;
           throw error;
         }
-        captured = params;
+        const live = this.options.live;
+        const execution = capsule as { runId?: string; nodeExecutionId?: string; workerId?: string };
+        if (live && execution.runId === live.wal.runId) {
+          captured = await live.interaction.bindArtifact(execution.runId, params) as Artifact;
+        } else {
+          captured = params;
+        }
         return { content: [{ type: 'text', text: 'captured' }], details: {} };
       },
     };
@@ -195,56 +236,140 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
 
     const create = this.options.createSession ?? createAgentSession;
     if (!this.options.model && !this.options.createSession) throw Error('model must be explicitly configured');
+    const live = this.options.live;
+    let sessionManager = SessionManager.inMemory();
+    let recoveredSessionFile: string | undefined;
+    let durableWorkerSessionId: string | undefined;
+    let durableAttemptId: string | undefined;
+    if (live) {
+      const execution = capsule as { nodeExecutionId: string; workerId: string; recoveryAttempt?: number; reviewCycleId?: string; reviewerIndex?: number; reviewerParticipant?: unknown };
+      durableWorkerSessionId = randomUUID();
+      durableAttemptId = randomUUID();
+      // Establish logical identity and attempt before creating the Child. A
+      // crash in createAgentSession therefore restores the same node attempt.
+      live.wal.beginWorker({ nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId: durableWorkerSessionId, attemptId: durableAttemptId, recoveryAttempt: execution.recoveryAttempt ?? 1, reviewCycleId: execution.reviewCycleId, reviewerIndex: execution.reviewerIndex, reviewerParticipant: execution.reviewerParticipant, logicalNodeExecutionId: execution.nodeExecutionId, attempt: execution.recoveryAttempt ?? 1, startup: true });
+    }
+    if (live) {
+      const sessionDir = live.sidecarDir ?? join(live.wal.runDir, 'workers');
+      mkdirSync(sessionDir, { recursive: true, mode: 0o700 });
+      chmodSync(sessionDir, 0o700);
+      const execution = capsule as { nodeExecutionId?: string };
+      const prior = live.wal.records().reverse().find((record) => record.type === 'worker' && ['session_started', 'session_published'].includes(String(record.payload.kind)) && record.payload.nodeExecutionId === execution.nodeExecutionId && typeof record.payload.sessionFile === 'string');
+      if (prior && existsSync(String(prior.payload.sessionFile))) {
+        recoveredSessionFile = String(prior.payload.sessionFile);
+        sessionManager = SessionManager.open(recoveredSessionFile, sessionDir, this.options.cwd ?? process.cwd());
+      } else {
+        sessionManager = SessionManager.create(this.options.cwd ?? process.cwd(), sessionDir);
+      }
+    }
     const { session } = await create({
       tools: node.profile?.tools ?? [],
       customTools: [submit],
       resourceLoader: scopedLoader,
-      sessionManager: SessionManager.inMemory(),
-      ...(this.options.model ? { model: this.options.model as any } : {}),
+      sessionManager,
+      // Child SettingsManager is deliberately in-memory. Passing the parent
+      // manager here would make setModel mutate the user's global default.
+      settingsManager: SettingsManager.inMemory(),
+      ...(this.options.model ? { model: this.options.model } : {}),
       ...(this.options.thinkingLevel !== undefined ? { thinkingLevel: this.options.thinkingLevel } : {}),
-    } as any);
+    } as unknown as Parameters<typeof createAgentSession>[0]);
+
+    let liveHandle: ActiveWorkerHandle | undefined;
+    if (live) {
+      const execution = capsule as { runId: string; nodeExecutionId: string; workerId: string; recoveryAttempt?: number };
+      const model = (this.options.model ?? (session as WorkerSessionLike).model) as WorkerModel | undefined;
+      const workerSessionId = durableWorkerSessionId ?? String((session as WorkerSessionLike).sessionId ?? randomUUID());
+      liveHandle = {
+        runId: execution.runId,
+        parentSessionId: live.parentSessionId,
+        parentLeafId: live.parentLeafId,
+        nodeExecutionId: execution.nodeExecutionId,
+        workerId: execution.workerId,
+        workerSessionId,
+        attemptId: durableAttemptId ?? randomUUID(),
+        recoveryAttempt: execution.recoveryAttempt ?? 1,
+        actualModel: { provider: String(model?.provider ?? 'unknown'), id: String(model?.id ?? 'unknown') },
+        status: 'starting',
+        contextSupplementVersion: live.wal.getSupplementVersion(),
+        session,
+        wal: live.wal,
+      };
+      try {
+        live.registry.register(liveHandle);
+        live.wal.recordWorker({ kind: 'session_published', nodeExecutionId: execution.nodeExecutionId, workerId: execution.workerId, workerSessionId, sessionFile: sessionManager.getSessionFile?.(), piSessionId: (session as WorkerSessionLike).sessionId, ...(recoveredSessionFile ? { recoveredFromSessionFile: recoveredSessionFile } : {}) });
+        await live.interaction.reconcileWorker(liveHandle);
+      } catch (error) {
+        live.registry.unregisterWorker(liveHandle.runId, liveHandle.workerSessionId);
+        liveHandle.session.dispose?.();
+        throw error;
+      }
+    }
 
     let streamedText = '';
     let lastAssistantText = '';
     let modelStopReason: string | undefined;
     let modelErrorMessage: string | undefined;
     let transientError: string | undefined;
-    const tryCaptureFallback = (text: string) => {
+    const tryCaptureFallback = async (text: string) => {
       const candidate = extractStructuredArtifact(text);
       if (candidate === undefined) return;
       try {
         validateSubmitArtifact(candidate);
-        captured = candidate;
+        captured = liveHandle
+          ? await live!.interaction.bindArtifact(liveHandle.runId, candidate) as Artifact
+          : candidate;
         this.options.onProgress?.({ type: 'artifact_fallback', artifact: captured });
       } catch (error) {
         if (error instanceof ArtifactContractError) fallbackRejected = error;
       }
     };
-    const unsubscribe = typeof (session as any).subscribe === 'function'
-      ? (session as any).subscribe((event: any) => {
+    const workerSession = session as unknown as WorkerSessionRuntime;
+    const textFromContent = (content: unknown): string => Array.isArray(content)
+      ? content.filter((item): item is { type: string; text: string } => typeof item === 'object' && item !== null && (item as { type?: unknown }).type === 'text' && typeof (item as { text?: unknown }).text === 'string').map((item) => item.text).join('')
+      : '';
+    const unsubscribe = workerSession.subscribe?.((rawEvent: unknown) => {
+        const event = rawEvent as WorkerEvent;
+        if (liveHandle && event.type === 'agent_start') liveHandle.status = 'streaming';
+        if (liveHandle && event.type === 'turn_start') {
+          const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
+          const suppliedRef = (event as WorkerEvent & { modelCallRef?: unknown }).modelCallRef;
+          const modelCallRef = typeof suppliedRef === 'string' && suppliedRef.length > 0 ? suppliedRef : `${liveHandle.workerSessionId}:turn:${turnIndex}`;
+          void live!.interaction.recordModelTurnStart(liveHandle.runId, turnIndex, modelCallRef).then((turn) => {
+            const actual = (session as WorkerSessionLike).model;
+            if (actual) liveHandle!.actualModel = { provider: String(actual.provider), id: String(actual.id) };
+            // This progress event is a state transition, not a snapshot of the
+            // model on every turn. Do not claim model_applied without a request.
+            if (turn?.appliedModel) this.options.onProgress?.({ type: 'model_applied', model: turn.appliedModel, modelCallRef });
+          });
+        }
+        if (liveHandle && event.type === 'agent_settled') liveHandle.status = 'idle';
         if (event.type === 'tool_execution_start') {
-          this.options.onProgress?.({ type: 'tool_start', name: event.toolName, args: event.args });
+          this.options.onProgress?.({ type: 'tool_start', name: event.toolName ?? 'unknown', args: event.args ?? {} });
         }
         if (event.type === 'tool_execution_end') {
-          this.options.onProgress?.({ type: 'tool_end', name: event.toolName, result: event.result, isError: event.isError });
+          this.options.onProgress?.({ type: 'tool_end', name: event.toolName ?? 'unknown', result: event.result ?? '', isError: event.isError === true });
         }
         if (event.type === 'message_update' && event.assistantMessageEvent?.type === 'text_delta') {
-          streamedText += event.assistantMessageEvent.delta;
+          streamedText += event.assistantMessageEvent.delta ?? '';
         }
         if (event.type === 'message_end' && event.message?.role === 'assistant') {
           modelStopReason = event.message.stopReason;
           modelErrorMessage = event.message.errorMessage;
-          const text = Array.isArray(event.message.content)
-            ? event.message.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('')
-            : '';
+          const text = textFromContent(event.message.content);
           if (text.trim()) {
             lastAssistantText = text;
             this.options.onProgress?.({ type: 'text', text });
           }
         }
+        if (liveHandle && event.type === 'turn_end' && event.message?.role === 'assistant' && !event.message.errorMessage) {
+          const turnIndex = Number((event as WorkerEvent & { turnIndex?: number }).turnIndex ?? 0);
+          const suppliedRef = (event as WorkerEvent & { modelCallRef?: unknown }).modelCallRef;
+          const modelCallRef = typeof suppliedRef === 'string' && suppliedRef.length > 0 ? suppliedRef : `${liveHandle.workerSessionId}:turn:${turnIndex}`;
+          void live!.interaction.recordModelCallCompleted(liveHandle.runId, modelCallRef);
+        }
         if (event.type === 'agent_end') {
           const assistant = Array.isArray(event.messages)
-            ? [...event.messages].reverse().find((message: any) => message.role === 'assistant')
+            ? [...event.messages].reverse().find((message) => message.role === 'assistant')
             : undefined;
           if (assistant) {
             modelStopReason = assistant.stopReason;
@@ -252,18 +377,15 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
             this.options.onProgress?.({ type: 'model_end', stopReason: modelStopReason, errorMessage: modelErrorMessage });
           }
         }
-      })
-      : undefined;
+      });
     try {
       const maxArtifactAttempts = 2;
       const lastAssistantResponse = () => {
-        const messages = (session as any).messages;
+        const messages = workerSession.messages;
         const lastAssistant = Array.isArray(messages)
-          ? [...messages].reverse().find((message: any) => message.role === 'assistant')
+          ? [...messages].reverse().find((message) => message.role === 'assistant')
           : undefined;
-        return Array.isArray(lastAssistant?.content)
-          ? lastAssistant.content.filter((item: any) => item.type === 'text').map((item: any) => item.text).join('')
-          : '';
+        return textFromContent(lastAssistant?.content);
       };
       for (let attempt = 1; attempt <= maxArtifactAttempts && !captured; attempt += 1) {
         const rejection = rejectedSubmission ?? fallbackRejected;
@@ -292,7 +414,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
           }
           if (!rejectedSubmission) throw error;
         }
-        if (!captured) tryCaptureFallback(lastAssistantText || lastAssistantResponse() || streamedText);
+        if (!captured) await tryCaptureFallback(lastAssistantText || lastAssistantResponse() || streamedText);
       }
       if (!captured) {
         const rejection = rejectedSubmission ?? fallbackRejected;
@@ -320,6 +442,18 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       return captured;
     } finally {
       unsubscribe?.();
+      if (liveHandle) {
+        liveHandle.status = captured ? 'settled' : 'failed';
+        try {
+          live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, attemptId: liveHandle.attemptId, status: liveHandle.status });
+        } finally {
+          try {
+            await live!.interaction.closeWorker(liveHandle.runId, liveHandle.status);
+          } finally {
+            liveHandle.session.dispose?.();
+          }
+        }
+      }
     }
   }
 }

@@ -12,7 +12,7 @@
 | 谁拥有业务流程 | 各 Extension（Feature / Fix）拥有自己的 Workflow Definition 与验收标准；共享 Runtime 不内置业务状态图或验收标准 |
 | 不可绕过的控制面 | Worker 不修改 Run 状态；Guard 未通过不迁移；任何一方不得自报 `ACCEPTED`；用户决定必须可记录、可恢复、可被 Guard 引用 |
 | Extension 能定义什么 | Task、Role、业务上下文、Artifact 字段、Transition 业务条件、Acceptance 证据规则；不能放宽 Runtime 强制项与全局能力上限 |
-| 当前状态 | `IMPLEMENTING`；Fix 业务执行门禁 owner 仍在 `workflow-runtime` 待拆分，缺口以[实现地图 drift 表](README.md#已知-l1--l2-drift)为准 |
+| 当前状态 | `IMPLEMENTING`；Core Runtime 的执行、WAL、交互队列、parent branch 恢复与 GC 已落地并有自动化证据；Fix 业务门禁 owner 仍在 `workflow-runtime` 待拆分，真实 provider/长时 TUI/进程级崩溃证据仍缺，详见[实现地图 drift 表](README.md#已知-l1--l2-drift) |
 
 ## 职责总览
 
@@ -80,7 +80,7 @@ type WorkflowNodeDefinition = {
 
 ## Node Execution 生命周期
 
-以下生命周期是 L2 要实现的控制机制；当前原型只覆盖其中一部分：
+以下生命周期是当前 L2 执行机制；源码和测试覆盖 Worker 创建、participant 的 Artifact+cursor 单 checkpoint、迁移和有限重试。上轮锁定 Pi 0.84.2 的 provider CLI smoke 成功；长时 provider/TUI 运行、PTY picker 和进程级崩溃仍需独立验证：
 
 ```mermaid
 flowchart TD
@@ -111,7 +111,7 @@ Worker Profile 中的「只读」必须由实际工具和环境能力实现，�
 
 ## 状态、存储与用户决定
 
-以下为目标机制；当前恢复主要校验已知 Stage，版本兼容性仍在 drift 中：
+以下机制已由 Runtime/Run Control WAL 实现；Pi Session legacy 入口与真实宿主崩溃恢复仍保留兼容性验证边界：
 
 | 机制 | 规则 |
 | --- | --- |
@@ -132,7 +132,7 @@ flowchart LR
 
 ## Artifact 与审计
 
-以下为目标机制；完整 provenance、Node Execution 身份和版本绑定尚未实现：
+以下校验机制已实现并由 `executeNode`、`restore` 和评审门禁共同执行；仍需真实 provider/长时 TUI 运行验证工具事件与崩溃时序：
 
 | 校验维度 | 说明 |
 | --- | --- |
@@ -168,6 +168,44 @@ flowchart TD
 | Decision Adapter | 只提交结构化意图，Controller 重新校验当前 Run、版本、权限和 Guard 后才改变状态 |
 | 技术字段 | `runId`、`nodeExecutionId`、candidate revision、错误码和事件 ID 默认不作为用户输入，作为详情、复制引用或调试信息保留 |
 | UI 状态 | UI 不复制 Run 状态、不修改 Artifact/Audit，不在本地形成第二套决定状态 |
+
+### 运行中统一对话适配
+
+该机制已实现为 Extension 内的适配层；它不是独立进程或 OS sandbox，tmux、独立窗口和子终端也不属于产品依赖。上轮已在锁定的 Pi 0.84.2 上完成 provider CLI smoke；自动化覆盖交互队列和 ExtensionRunner，但真实 provider 长时 TUI、PTY picker 稳定性和进程级崩溃恢复仍属于未验证边界。
+
+```mermaid
+flowchart LR
+  editor[原对话输入 / 模型选择] --> adapter[Workflow Interaction Adapter]
+  adapter --> registry[Active Worker Registry]
+  registry --> session[Pi AgentSession]
+  session --> events[Session Events]
+  events --> adapter
+  adapter --> transcript[原对话中的 Worker 输出 / 工具摘要]
+  adapter --> supplement[Run 级用户补充记录]
+  supplement --> capsule[后续 Context Capsule 引用]
+```
+
+| 组件 | 目标责任 |
+| --- | --- |
+| Active Worker Registry | 以 `runId` / `nodeExecutionId` 定位当前 Worker Session 句柄、状态、实际模型、输入上下文版本和 close fence；不拥有 Run Stage |
+| Workflow Interaction Adapter | 把原输入框消息路由为当前 Session 的 `steer` / `prompt`，把当前 subagent picker 的选择路由为绑定 Worker 的模型变化 |
+| Event Projection | 订阅模型可见输出和 tool start/update/end，把原文写入受保护 UI sidecar，并以随机 opaque ref生成主对话展示；parent entry不含原文，不伪造隐藏推理 |
+| Run Control WAL | 串行持久化补充、close fence、checkpoint 和逐条投递事件；分配 Run 内连续序号，记录目标、模型调用引用和 Artifact 绑定，不用单一水位掩盖失败/跳过 |
+| Controller Fence | 原子比较 supplement sequence 与 Node close fence；fence 前的新输入使旧 Artifact 失效，直到新模型调用与绑定最新补充版本的 Artifact 完成 |
+
+输入路由必须遵守单一 owner：第一版同一 UI 最多发布一个可交互 Worker，其他并发 Worker 只投影状态。Controller 先关闭旧目标并写 close fence，再发布新目标；用户提交必须与目标/sequence 分配原子化，fence 后提交返回失败并保留编辑内容，不能因为异步切换自动改写。所有后续 Worker 默认按顺序获得同一 Run 的补充记录；每次 Node Artifact 绑定其实际输入上下文的 `supplementVersion`。
+
+Extension 自有 append-only Run Control WAL 是补充、投递事件、close fence 和 checkpoint 的唯一控制事实；它位于 Pi 本地 agent 状态目录，按 Run 隔离，目录 `0700`、文件 `0600`。每个 Run 还使用Run 目录之外、同一受保护 root `locks/` 下的短持有 operation lock、长持有 writer lease 和单调 `writerEpoch`。每次 append 从取得 operation lock 开始，把 lease/epoch 核验、单条完整 record append 和 file fsync 放在同一跨进程排他临界区，释放后才对调用方确认；takeover 同样先取得该 lock，再原子切换 lease并递增 epoch，因此不存在“核验后、append 前”被接管的窗口。lease 记录 host/process identity、extension instance nonce 和 epoch，每条 WAL record 都携带 epoch。活 owner、旧 reload callback 尚未释放或 owner 无法确定时，恢复/第二 Pi 进程 fail-closed；只有能证明原进程已结束，或用户在 UI 明确确认接管不确定 owner 后，才能隔离旧 lease并接管。追加记录使用稳定 event/supplement ID、checksum、`O_APPEND`，在确认 `recorded` 前完成文件 `fsync`；首次创建/重命名时同步父目录。无法达到该 durability boundary 时输入接收 fail-closed。父 Pi Session 当前 branch 只保存不含原文和内容派生 digest 的随机 opaque ID及粗粒度状态投影；Child Session JSONL 只是执行对话证据，不拥有 Run 状态。
+
+现有未完成 `workflow-run` parent checkpoint 只允许从当前 active branch 幂等导入：临时 WAL generation 完整写入并 fsync、原子 rename及目录 fsync成功前，旧 checkpoint 仍是唯一事实且不得启动 Worker；成功后 WAL header 记录 source entry/checksum，Runtime 只从 WAL 推进，不 dual-write。冲突、未知版本或导入失败 fail-closed。历史 parent entry 不重写且可能被 Pi export/share，但新补充原文/Child 输出不再写入。
+
+Run Control WAL 绑定 `parentSessionId`、开始时的 `parentLeafId` 和 cwd digest。恢复读取完整 WAL，不使用 compaction-aware context；只有 header 明确 `parentSessionFileExists=false` 且原 parent file 不可发现时，才在同 cwd 经 UI 明确确认把未完成 Run 重新绑定到不同的新 Session，并保留原 runId/父引用；header 曾显示已有文件的 Run、其他仍存在 Session 的 Run 和无 UI 场景不进入该 orphan rebind 路径。投递采用 at-least-once：每条 `supplementId` 在 Worker 上下文中去重；无法证明消费时，只能自动交给同一逻辑 Node Execution 的恢复 attempt并明确展示/审计，跨 Node或待用户决定状态必须保留内容并由用户面向新接收者再次提交。
+
+模型选择由 Workflow UI 自有、无额外命令的 picker 承载，不调用或回滚主 Session 的内建 `/model`。Workflow 自定义 editor 使用注入的 keybindings manager 条件接管 `app.model.select`/cycle：有当前 Worker 时打开 Child picker，无 Worker 时委托原 editor；状态区持续显示当前接收者和 key hint。picker 打开时绑定 `nodeExecutionId`，确认时重新校验目标未变；候选来自 Pi scoped/available 且已认证模型，并由 Runtime 检查当前 Worker 所需工具/schema兼容性。项目 Node `model` 是默认模型，不是第一版候选 allowlist；若未来需要限制集合，必须扩展版本化 Policy schema。Child 注入独立 `SettingsManager.inMemory()`，避免旧 Pi `setModel()` 改写全局默认。
+
+模型选择生命周期为 `requested → pending → applied | not_applied | failed`：`setModel()` 成功只表示待生效；同一 Worker 使用新模型开始下一次模型调用并记录 `effectiveFromModelCallRef` 后才显示“已切换”。Worker 在调用前 close 时记录 `not_applied`，不得带到后续 Node或显示成功。切换不能误改主 Session。
+
+用户补充是运行事实，不是业务 Artifact 或 User Decision。Runtime 可以把它作为版本化 Context Capsule 输入交给 Worker，但 Worker 仍须重新提交满足合同的 Artifact，Controller 仍须执行 Guard 和 Acceptance。
 
 ### Pi TUI Review Panel
 
@@ -260,4 +298,14 @@ L2 测试除验证数据和状态正确外，还应验证：
 
 ## 当前实现选择
 
-当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。是否升级为子进程、RPC、容器或独立 Node Extension，应根据进程隔离、独立凭证/依赖、生命周期和发布需求另行评审。
+所有 host handler 必须把 fail-closed 变成返回值而不是异常：有交互 owner 时，input handler 顶层捕获全部错误、best-effort 恢复原编辑文本并始终返回 `handled`，绝不让补充落入父 Agent；可取消的 `session_before_tree/switch/fork` handler 顶层捕获错误并返回 `{ cancel: true }`。真实 ExtensionRunner 吞异常的行为必须进入故障注入测试。
+
+交互 Registry 以 `(parentSessionId, parentLeafId, runId)` 为 owner key。活跃 Run 期间再次 `/fix` 直接拒绝并显示当前任务；`session_before_tree`、`session_before_switch`、`session_before_fork` 第一版 fail-closed 取消操作，直到 Run settled或已写可恢复 paused checkpoint。`/new`、`/resume` 和 extension command 都不能只依赖 `input` hook，必须在各自 handler/lifecycle event 单独检查 owner。`session_before_tree/switch/fork` 等可取消事件使用真正 fail-closed。`/reload`、退出和信号没有可取消的 before hook：`session_shutdown` 只做 best-effort 关闭输入、完成已经开始的 WAL commit并清理句柄，不能承诺阻止宿主退出；恢复时若 durable WAL 缺少 close/settled 终态，就确定性推断为 interrupted attempt并展示可恢复状态，未经用户确认不自动推进。父分支变化后旧 Registry 不得继续接收输入。
+
+Sidecar 第一版最多 20 个 Worker attempt。含原文的 intermediate Worker/UI sidecar在 Run settled 30 天后到期；没有 live lease 的 unfinished Run 从最后一个 durable event起保留 30 天并持续提示恢复/放弃；parent 缺失的 settled Run 从首次观察起最多再保留 7 天，取更早删除期限。最终用户报告和粗粒度状态仍保留在父对话；过期 intermediate详情显示“已按本地保留策略清理”。
+
+GC 与 writer 使用同一外部 operation lock。扫描快照后、原子 tombstone/rename前必须在锁内重新核验 parent、Run终态、deadline、writer lease/epoch；活 owner或不确定状态一律不删。删除先把 Run 目录 rename到 root trash/tombstone并 fsync目录，再异步删除；恢复端在同一 lock下看到 tombstone必须拒绝。明确放弃在下一次扫描处理，删除失败记录并重试。默认值由 L3 拥有。
+
+非 TUI host 使用同一 `WorkflowInteractionPort`：`submitSupplement({runId, expectedNodeExecutionId, text})`、`requestModelChange({runId, expectedNodeExecutionId, expectedWorkerSessionId, expectedAttemptId, modelRef})` 和带 sequence/status 的事件流。模型 picker 的四元身份 fence（Run、Node Execution、Worker Session、Attempt）在队列内重检，目标变化时 fail-closed。它不是普通用户命令；TUI input hook/picker 只是该端口的适配器。没有交互适配器时仍可执行既有 Workflow，但不得声称支持运行中补充或模型切换。
+
+当前 Worker 由 Pi SDK 独立 `AgentSession` 承载；状态、合同、重试、WAL 和恢复机制见 [Fix Runtime 技术设计](fix-runtime-technical-design.md)。评审 participant 完成使用同一 durable checkpoint 写 Artifact、quorum cursor 并清除 active attempt，恢复保留已完成 participant。`LiveFixRunManager` 在 Node 执行期间维护可寻址 Registry，主输入通过 `WorkflowInteractionPort` 进入当前 Child，模型 picker 只改变当前 Worker 且以 Run/Node/Session/Attempt fence 校验；Worker 完成后句柄仍会释放，不能把它描述成独立后台进程。`session_shutdown` 只 best-effort停止接收并完成已开始的 WAL commit，缺少终态时由 WAL 恢复为可确认的 interrupted attempt。上轮 provider CLI smoke 成功；真实 provider 长时 TUI/PTY 和进程级 crash replay 尚未通过。
