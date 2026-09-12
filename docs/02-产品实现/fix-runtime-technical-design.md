@@ -377,15 +377,15 @@ Policy 不得配置为绕过 L1 最低保证。以下控制由 Runtime 固定强
   "version": 1,
   "nodes": {
     "investigate": {
-      "model": "smartingredients/gpt-5.6-sol",
+      "model": "openai-codex/gpt-5.6-sol",
       "skills": ["cst-plus", "aliyun-sls-query", "mysql-readonly", "redis-readonly"]
     },
     "implement": {
-      "model": "smartingredients/gpt-5.6-terra",
+      "model": "openai-codex/gpt-5.6-luna",
       "skills": ["tdd"]
     },
     "verify": {
-      "model": "smartingredients/gpt-5.6-sol",
+      "model": "openai-codex/gpt-5.6-terra",
       "skills": ["backend-service-verification"]
     }
   }

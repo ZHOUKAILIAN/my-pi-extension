@@ -83,7 +83,7 @@ export const FIX_NODE_PROFILES: Record<FixNodeId, NodeProfile> = {
   },
   investigate: {
     tools: ['read', 'submit_artifact'],
-    defaultModelRef: 'smartingredients/gpt-5.6-sol',
+    defaultModelRef: 'openai-codex/gpt-5.6-sol',
     defaultSkills: [],
     context: ['problem', 'intake', 'project_knowledge'],
     modelRecommendation: '设计建议调查/验证使用高推理模型（gpt-5.6-sol）；非绑定说明，仅记录设计意图',
@@ -107,7 +107,7 @@ export const FIX_NODE_PROFILES: Record<FixNodeId, NodeProfile> = {
   },
   implement: {
     tools: ['read', 'edit', 'write', 'submit_artifact'],
-    defaultModelRef: 'smartingredients/gpt-5.6-terra',
+    defaultModelRef: 'openai-codex/gpt-5.6-luna',
     defaultSkills: ['tdd'],
     context: ['problem', 'investigation', 'investigation_review', 'disposition', 'accepted_plan'],
     modelRecommendation: '设计建议实现使用工具型模型（gpt-5.6-terra）；非绑定说明，仅记录设计意图',
@@ -119,7 +119,7 @@ export const FIX_NODE_PROFILES: Record<FixNodeId, NodeProfile> = {
   },
   verify: {
     tools: ['read', 'submit_artifact'],
-    defaultModelRef: 'smartingredients/gpt-5.6-sol',
+    defaultModelRef: 'openai-codex/gpt-5.6-terra',
     defaultSkills: [],
     context: ['problem', 'investigation', 'disposition', 'implementation', 'change_review'],
     modelRecommendation: '设计建议调查/验证使用高推理模型（gpt-5.6-sol）；非绑定说明，仅记录设计意图',

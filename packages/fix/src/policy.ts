@@ -19,9 +19,9 @@ export interface ModelPolicy {
 
 const NODES = ['investigate', 'implement', 'verify'] as const;
 const DEFAULTS: Record<NodeId, NodePolicy> = {
-  investigate: { configuredRef: 'smartingredients/gpt-5.6-sol', skills: [], source: 'runtime-default' },
-  implement: { configuredRef: 'smartingredients/gpt-5.6-terra', skills: ['tdd'], source: 'runtime-default' },
-  verify: { configuredRef: 'smartingredients/gpt-5.6-sol', skills: [], source: 'runtime-default' },
+  investigate: { configuredRef: 'openai-codex/gpt-5.6-sol', skills: [], source: 'runtime-default' },
+  implement: { configuredRef: 'openai-codex/gpt-5.6-luna', skills: ['tdd'], source: 'runtime-default' },
+  verify: { configuredRef: 'openai-codex/gpt-5.6-terra', skills: [], source: 'runtime-default' },
 };
 
 function validRef(value: unknown): value is ModelRef {

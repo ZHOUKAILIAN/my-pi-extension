@@ -23,9 +23,10 @@ test('missing project files fall back to pure runtime defaults across all fix no
   const cwd = join(tmpdir(), `fix-effective-missing-${Math.random()}`);
   const policy = loadEffectivePolicy(cwd, { trusted: true });
   assert.deepEqual(Object.keys(policy.nodes).sort(), [...FIX_NODE_IDS].sort());
-  assert.equal(policy.nodes.investigate.model, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.investigate.model, 'openai-codex/gpt-5.6-sol');
+  assert.equal(policy.nodes.implement.model, 'openai-codex/gpt-5.6-luna');
   assert.ok(policy.nodes.implement.skills?.includes('tdd'));
-  assert.equal(policy.nodes.verify.model, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.verify.model, 'openai-codex/gpt-5.6-terra');
   assert.equal(policy.workflow.id, 'fix');
   assert.equal(policy.workflow.initialStage, 'INTAKE');
   assert.ok(policy.workflow.transitions.length > 0);
@@ -40,9 +41,9 @@ test('workflow.json overrides model and skills per node, defaults fill the rest'
   const policy = loadEffectivePolicy(dir, { trusted: true });
   assert.equal(policy.nodes.investigate.model, 'p/special');
   assert.deepEqual(policy.nodes.investigate.skills, ['cst-plus']);
-  assert.equal(policy.nodes.implement.model, 'smartingredients/gpt-5.6-terra');
+  assert.equal(policy.nodes.implement.model, 'openai-codex/gpt-5.6-luna');
   assert.deepEqual(policy.nodes.implement.skills, ['tdd']);
-  assert.equal(policy.nodes.verify.model, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.verify.model, 'openai-codex/gpt-5.6-terra');
   assert.equal(policy.nodes.investigation_review.model, 'inherit');
   assert.ok(policy.nodes.investigate.tools.includes('submit_artifact'));
 });
@@ -87,7 +88,7 @@ test('untrusted loading ignores project files and uses runtime defaults', () => 
   const dir = mkdtempSync(join(tmpdir(), 'fix-effective-'));
   writeProjectFile(dir, 'workflow.json', JSON.stringify({ nodes: { investigate: { model: 'p/special' } } }));
   const policy = loadEffectivePolicy(dir, { trusted: false });
-  assert.equal(policy.nodes.investigate.model, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.investigate.model, 'openai-codex/gpt-5.6-sol');
   assert.deepEqual(policy.nodes.investigate.skills, []);
 });
 
@@ -106,5 +107,5 @@ test('falls back to legacy workflow-models.json and prefers workflow.json', () =
   writeProjectFile(both, 'workflow-models.json', JSON.stringify({ version: 1, default: 'p/old' }));
   const preferred = loadEffectivePolicy(both, { trusted: true });
   assert.equal(preferred.nodes.investigate.model, 'p/new');
-  assert.equal(preferred.nodes.implement.model, 'smartingredients/gpt-5.6-terra');
+  assert.equal(preferred.nodes.implement.model, 'openai-codex/gpt-5.6-luna');
 });

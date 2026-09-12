@@ -13,29 +13,29 @@ test('public parser exposes only a problem description', () => {
     assert.deepEqual(parseFixCommand(command), { valid: false, usage });
 });
 
-test('policy defaults use the high-capability Sol/Terra/Sol model split', () => {
+test('policy defaults use the openai-codex Sol/Luna/Terra model split', () => {
   const policy = loadModelPolicy('/definitely/missing/workflow-models.json');
-  assert.equal(policy.nodes.investigate.configuredRef, 'smartingredients/gpt-5.6-sol');
-  assert.equal(policy.nodes.implement.configuredRef, 'smartingredients/gpt-5.6-terra');
-  assert.equal(policy.nodes.verify.configuredRef, 'smartingredients/gpt-5.6-sol');
+  assert.equal(policy.nodes.investigate.configuredRef, 'openai-codex/gpt-5.6-sol');
+  assert.equal(policy.nodes.implement.configuredRef, 'openai-codex/gpt-5.6-luna');
+  assert.equal(policy.nodes.verify.configuredRef, 'openai-codex/gpt-5.6-terra');
   assert.deepEqual(policy.nodes.implement.skills, ['tdd']);
 
   const model = { provider: 'p', id: 'm' };
-  const investigationModel = { provider: 'smartingredients', id: 'gpt-5.6-sol' };
-  assert.equal(resolveModelRef(policy.nodes.investigate.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'smartingredients' && id === 'gpt-5.6-sol' ? investigationModel : undefined }), investigationModel);
+  const investigationModel = { provider: 'openai-codex', id: 'gpt-5.6-sol' };
+  assert.equal(resolveModelRef(policy.nodes.investigate.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'openai-codex' && id === 'gpt-5.6-sol' ? investigationModel : undefined }), investigationModel);
   assert.equal(resolveModelRef('inherit', model, undefined), model);
-  assert.deepEqual(resolveModelRef(policy.nodes.implement.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'smartingredients' && id === 'gpt-5.6-terra' ? { provider, id } : undefined }), {
-    provider: 'smartingredients', id: 'gpt-5.6-terra',
+  assert.deepEqual(resolveModelRef(policy.nodes.implement.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'openai-codex' && id === 'gpt-5.6-luna' ? { provider, id } : undefined }), {
+    provider: 'openai-codex', id: 'gpt-5.6-luna',
   });
 });
 
 test('fixed node defaults resolve without ctx.model, while inherit does not', () => {
   const registry = { find: (provider: string, id: string) => ({ provider, id }) };
-  assert.deepEqual(resolveModelRef('smartingredients/gpt-5.6-sol', undefined, registry), {
-    provider: 'smartingredients', id: 'gpt-5.6-sol',
+  assert.deepEqual(resolveModelRef('openai-codex/gpt-5.6-sol', undefined, registry), {
+    provider: 'openai-codex', id: 'gpt-5.6-sol',
   });
-  assert.deepEqual(resolveModelRef('smartingredients/gpt-5.6-terra', undefined, registry), {
-    provider: 'smartingredients', id: 'gpt-5.6-terra',
+  assert.deepEqual(resolveModelRef('openai-codex/gpt-5.6-terra', undefined, registry), {
+    provider: 'openai-codex', id: 'gpt-5.6-terra',
   });
   assert.throws(() => resolveModelRef('inherit', undefined, registry), /requires ctx\.model/);
 });
