@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { FIX_NODE_PROFILES } from '../src/definition.ts';
 import { parseFixCommand, loadModelPolicy, resolveModelRef } from '../src/policy.ts';
 
 const usage = 'usage: /fix <问题描述>';
@@ -27,6 +28,14 @@ test('policy defaults use the openai-codex Sol/Luna/Terra model split', () => {
   assert.deepEqual(resolveModelRef(policy.nodes.implement.configuredRef, undefined, { find: (provider: string, id: string) => provider === 'openai-codex' && id === 'gpt-5.6-luna' ? { provider, id } : undefined }), {
     provider: 'openai-codex', id: 'gpt-5.6-luna',
   });
+});
+
+test('legacy runtime defaults derive model and skills from node profiles', () => {
+  const policy = loadModelPolicy('/definitely/missing/workflow-models.json');
+  for (const nodeId of ['investigate', 'implement', 'verify'] as const) {
+    assert.equal(policy.nodes[nodeId].configuredRef, FIX_NODE_PROFILES[nodeId].defaultModelRef);
+    assert.deepEqual(policy.nodes[nodeId].skills, FIX_NODE_PROFILES[nodeId].defaultSkills);
+  }
 });
 
 test('fixed node defaults resolve without ctx.model, while inherit does not', () => {

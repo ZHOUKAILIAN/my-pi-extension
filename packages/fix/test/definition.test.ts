@@ -292,6 +292,14 @@ test('FIX_NODE_PROFILES 覆盖全部 8 个 FixNodeId', () => {
   }
 });
 
+test('节点模型建议与当前默认模型一致且明确为非绑定说明', () => {
+  for (const nodeId of ['investigate', 'implement', 'verify'] as const) {
+    const profile = FIX_NODE_PROFILES[nodeId];
+    assert.ok(profile.modelRecommendation?.includes(profile.defaultModelRef.split('/')[1]));
+    assert.match(profile.modelRecommendation ?? '', /非绑定说明/);
+  }
+});
+
 test('FIX_SPECIAL_NODES 定义被评审节点到评审节点的契约', () => {
   assert.equal(FIX_SPECIAL_NODES.investigate.nodeId, 'investigation_review');
   assert.equal(FIX_SPECIAL_NODES.investigate.reviewArtifactKind, 'investigation_review');

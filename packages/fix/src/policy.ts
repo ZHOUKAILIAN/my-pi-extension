@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { FIX_NODE_PROFILES } from './definition.ts';
 
 export type ModelRef = 'inherit' | `${string}/${string}`;
 type NodeId = 'investigate' | 'implement' | 'verify';
@@ -18,11 +19,16 @@ export interface ModelPolicy {
 }
 
 const NODES = ['investigate', 'implement', 'verify'] as const;
-const DEFAULTS: Record<NodeId, NodePolicy> = {
-  investigate: { configuredRef: 'openai-codex/gpt-5.6-sol', skills: [], source: 'runtime-default' },
-  implement: { configuredRef: 'openai-codex/gpt-5.6-luna', skills: ['tdd'], source: 'runtime-default' },
-  verify: { configuredRef: 'openai-codex/gpt-5.6-terra', skills: [], source: 'runtime-default' },
-};
+const DEFAULTS: Record<NodeId, NodePolicy> = Object.fromEntries(
+  NODES.map((nodeId) => {
+    const profile = FIX_NODE_PROFILES[nodeId];
+    return [nodeId, {
+      configuredRef: profile.defaultModelRef,
+      skills: [...profile.defaultSkills],
+      source: 'runtime-default' as const,
+    }];
+  }),
+) as Record<NodeId, NodePolicy>;
 
 function validRef(value: unknown): value is ModelRef {
   return value === 'inherit' || (typeof value === 'string' && /^[^/]+\/[^/]+$/.test(value));
