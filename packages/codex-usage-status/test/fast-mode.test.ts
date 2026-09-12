@@ -4,6 +4,7 @@ import extension, {
   FAST_MODEL_IDS,
   FAST_STATUS_CONSTANTS,
   FastController,
+  formatFastDisplay,
   consumeFastBootstrap,
   FAST_REQUESTED_EVENT,
   isFastEligible,
@@ -146,10 +147,13 @@ test('commands toggle intent and status without mutating on invalid input or no-
 
 test('requested On remains across model switches and uses soft-orange Active plus muted Inactive/Off labels', () => {
   const controller = new FastController();
+  const displayChanges: string[] = [];
+  controller.onDisplayStateChange((snapshot) => displayChanges.push(snapshot.state));
   const eligible = context(model('gpt-5.4'));
   controller.setRequested(true, eligible);
   assert.equal(controller.state, 'active');
-  assert.deepEqual(eligible._statuses.at(-1), { key: FAST_STATUS_CONSTANTS.statusKey, text: ANSI_FAST_ACTIVE });
+  assert.equal(formatFastDisplay(controller.getDisplaySnapshot(), eligible.ui.theme), ANSI_FAST_ACTIVE);
+  assert.equal(eligible._statuses.length, 0);
   assert.equal(eligible._notices.at(-1).message, ANSI_FAST_ACTIVE_NOTIFICATION);
   assert.equal(eligible._notices.at(-1).type, 'info');
   assert.equal(eligible._themeCalls.length, 0);
@@ -158,23 +162,25 @@ test('requested On remains across model switches and uses soft-orange Active plu
   controller.handle(ineligible, ineligible.model, true);
   assert.equal(controller.requestedOn, true);
   assert.equal(controller.state, 'inactive');
-  assert.equal(ineligible._statuses.at(-1).text, 'Fast inactive');
-  assert.deepEqual(ineligible._themeCalls.at(-1), { color: 'muted', text: 'Fast inactive' });
+  assert.equal(formatFastDisplay(controller.getDisplaySnapshot(), ineligible.ui.theme), 'Fast inactive');
+  assert.equal(ineligible._statuses.length, 0);
   assert.match(ineligible._notices.at(-1).message, /not eligible/u);
 
   controller.handle(eligible, eligible.model, true);
   assert.equal(controller.state, 'active');
-  assert.equal(eligible._statuses.at(-1).text, ANSI_FAST_ACTIVE);
+  assert.equal(formatFastDisplay(controller.getDisplaySnapshot(), eligible.ui.theme), ANSI_FAST_ACTIVE);
+  assert.equal(eligible._statuses.length, 0);
   assert.equal(eligible._notices.at(-1).message, ANSI_FAST_ACTIVE_NOTIFICATION);
   assert.equal(eligible._notices.at(-1).type, 'info');
   assert.equal(eligible._themeCalls.length, 0);
   controller.setRequested(false, eligible);
   assert.equal(controller.state, 'off');
-  assert.equal(eligible._statuses.at(-1).text, 'Fast off');
-  assert.deepEqual(eligible._themeCalls.at(-1), { color: 'muted', text: 'Fast off' });
+  assert.deepEqual(displayChanges, ['active', 'inactive', 'active', 'off']);
+  assert.equal(formatFastDisplay(controller.getDisplaySnapshot(), eligible.ui.theme), 'Fast off');
+  assert.equal(eligible._statuses.length, 0);
   controller.shutdown();
   assert.equal(controller.requestedOn, false);
-  assert.equal(eligible._statuses.at(-1).text, undefined);
+  assert.equal(eligible._statuses.length, 0);
 });
 
 test('RPC activation notification stays plain and uses info type', () => {
@@ -321,12 +327,12 @@ test('a new extension factory starts Fast Off even after another instance was tu
   const first = makeHarness();
   const firstContext = context();
   await first.command?.('on', firstContext);
-  assert.equal(firstContext._statuses.at(-1)?.text, ANSI_FAST_ACTIVE);
+  assert.equal(firstContext._statuses.every((status) => status.text === undefined), true);
 
   const second = makeHarness();
   const secondContext = context();
   second.handlers.get('session_start')?.({}, secondContext);
-  assert.equal(secondContext._statuses.findLast((status) => status.key === FAST_STATUS_CONSTANTS.statusKey)?.text, 'Fast off');
+  assert.equal(secondContext._statuses.every((status) => status.text === undefined), true);
 });
 
 test('bootstrap Fast env is exact, one-shot, and deleted for every value', () => {
@@ -409,7 +415,7 @@ test('inherited JSON child starts requested On without a command, and a second f
     assert.equal(process.env.PI_CODEX_FAST, undefined);
     const firstContext = context(model('gpt-5.4'), { mode: 'json', hasUI: false });
     first.handlers.get('session_start')?.({}, firstContext);
-    assert.equal(firstContext._statuses.at(-1)?.text, ANSI_FAST_ACTIVE);
+    assert.equal(firstContext._statuses.every((status) => status.text === undefined), true);
     const inheritedPayload = { model: 'gpt-5.4', service_tier: 'default' };
     const inheritedResult = first.handlers.get('before_provider_request')?.({ payload: inheritedPayload }, firstContext);
     assert.equal(inheritedResult?.service_tier, 'priority');
@@ -423,12 +429,90 @@ test('inherited JSON child starts requested On without a command, and a second f
     const second = makeHarness();
     const secondContext = context(model('gpt-5.4'), { mode: 'json', hasUI: false });
     second.handlers.get('session_start')?.({}, secondContext);
-    assert.equal(secondContext._statuses.at(-1)?.text, 'Fast off');
+    assert.equal(secondContext._statuses.every((status) => status.text === undefined), true);
     assert.equal(second.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, secondContext), undefined);
   } finally {
     if (previous === undefined) delete process.env.PI_CODEX_FAST;
     else process.env.PI_CODEX_FAST = previous;
   }
+});
+
+test('/fast refreshes the merged widget without re-running usage work', async () => {
+  const handlers = new Map<string, Function>();
+  let command: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const api: any = {
+    on: (name: string, handler: Function) => handlers.set(name, handler),
+    events: { emit: () => {}, on: () => () => {} },
+    registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
+  };
+  extension(api);
+  const widgetRows: string[] = [];
+  let authCalls = 0;
+  let fetchCalls = 0;
+  let timerCalls = 0;
+  const ctx = context(model(), {
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => { authCalls += 1; throw new Error('pending auth'); },
+    },
+    ui: {
+      ...context().ui,
+      setWidget: (_key: string, content: unknown) => {
+        if (typeof content === 'function') widgetRows.push((content as Function)({}, ctx.ui.theme).render(200)[0]);
+      },
+    },
+  });
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.setTimeout = ((...args: Parameters<typeof setTimeout>) => { timerCalls += 1; return originalSetTimeout(...args); }) as typeof setTimeout;
+    globalThis.fetch = (async () => { fetchCalls += 1; throw new Error('Fast must not fetch usage'); }) as typeof fetch;
+    await handlers.get('session_start')?.({}, ctx);
+    const before = { authCalls, fetchCalls, timerCalls };
+    await command?.('on', ctx);
+    assert.equal(authCalls, before.authCalls);
+    assert.equal(fetchCalls, before.fetchCalls);
+    assert.equal(timerCalls, before.timerCalls);
+    assert.match(widgetRows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.fetch = originalFetch;
+    handlers.get('session_shutdown')?.({}, ctx);
+  }
+});
+
+test('lifecycle projects the updated Fast state before hiding on a gate failure', async () => {
+  const handlers = new Map<string, Function>();
+  let command: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const api: any = {
+    on: (name: string, handler: Function) => handlers.set(name, handler),
+    events: { emit: () => {}, on: () => () => {} },
+    registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
+  };
+  extension(api);
+  const rows: string[] = [];
+  const ctx = context(model(), {
+    ui: {
+      ...context().ui,
+      setWidget: (_key: string, content: unknown) => {
+        rows.push(typeof content === 'function'
+          ? (content as Function)({}, ctx.ui.theme).render(200)[0]
+          : '<cleared>');
+      },
+    },
+  });
+
+  await handlers.get('session_start')?.({}, ctx);
+  assert.match(rows.at(-1) ?? '', /Fast off/u);
+  await command?.('on', ctx);
+  assert.match(rows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
+
+  await handlers.get('model_select')?.({ model: model('gpt-5.4-mini'), previousModel: ctx.model, source: 'set' }, ctx);
+  assert.match(rows.at(-1) ?? '', /Fast inactive/u);
+  await handlers.get('model_select')?.({ model: model('other', { provider: 'other' }), previousModel: ctx.model, source: 'set' }, ctx);
+  assert.equal(rows.at(-1), '<cleared>');
+
+  handlers.get('session_shutdown')?.({}, ctx);
 });
 
 test('mismatched and malformed assistant messages fail open, and shutdown clears tickets', () => {

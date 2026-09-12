@@ -1,4 +1,5 @@
 import { truncateToWidth } from '@earendil-works/pi-tui';
+import { formatFastDisplay, type FastDisplaySnapshot, type FastDisplayTheme } from './fast.ts';
 
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const MAX_BODY_BYTES = 64 * 1024;
@@ -54,9 +55,9 @@ export interface FetchUsageOptions {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-type UsageThemeColor = 'success' | 'warning' | 'error' | 'dim';
+type UsageThemeColor = 'success' | 'warning' | 'error' | 'dim' | 'muted';
 
-export interface UsageThemeLike {
+export interface UsageThemeLike extends FastDisplayTheme {
   fg(color: UsageThemeColor, text: string): string;
 }
 
@@ -410,6 +411,7 @@ export class UsageController {
   private readonly fetcher: FetchLike | undefined;
   private context: UsageContextLike | undefined;
   private activeModel: UsageModelLike | undefined;
+  private fastDisplay: FastDisplaySnapshot = { state: 'off' };
   private snapshot: { readonly display: UsageDisplaySnapshot; readonly scopeFingerprint: string } | undefined;
   private scopeFingerprint: string | undefined;
   private scopeAccountId: string | undefined;
@@ -434,7 +436,13 @@ export class UsageController {
     this.fetcher = options.fetch;
   }
 
-  handle(context: UsageContextLike, modelOverride?: UsageModelLike, forceRevalidate = false): void {
+  handle(
+    context: UsageContextLike,
+    modelOverride?: UsageModelLike,
+    forceRevalidate = false,
+    fastDisplay?: FastDisplaySnapshot,
+  ): void {
+    if (fastDisplay) this.fastDisplay = fastDisplay;
     if (forceRevalidate) {
       this.invalidate();
       this.usageFailure = false;
@@ -453,6 +461,16 @@ export class UsageController {
     }
     this.render();
     if (this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) this.requestUsage(this.generation);
+  }
+
+  updateFastDisplay(fastDisplay: FastDisplaySnapshot): void {
+    this.fastDisplay = fastDisplay;
+    if (!this.context) return;
+    if (!isEligible(this.context, this.activeModel)) {
+      this.clearDisplay();
+      return;
+    }
+    this.render();
   }
 
   shutdown(): void {
@@ -674,14 +692,15 @@ export class UsageController {
 
   private clearDisplay(): void {
     this.context?.ui.setWidget(USAGE_STATUS_KEY, undefined);
+    this.context?.ui.setStatus('codex-fast', undefined);
     this.context?.ui.setStatus(USAGE_STATUS_KEY, undefined);
   }
 
   private setDisplay(renderText: (theme: UsageThemeLike | undefined) => string): void {
     const context = this.context;
     if (!context) return;
-    // Clear the legacy status slot before every widget projection so an older loaded
-    // instance cannot leave the same usage text duplicated in the footer.
+    // UsageController owns both the merged widget and cleanup of legacy status keys.
+    context.ui.setStatus('codex-fast', undefined);
     context.ui.setStatus(USAGE_STATUS_KEY, undefined);
     context.ui.setWidget(USAGE_STATUS_KEY, (_tui, theme) => new UsageWidget(
       renderText,
@@ -691,7 +710,7 @@ export class UsageController {
   }
 
   private renderUnavailable(): void {
-    this.setDisplay((theme) => formatUnavailable(theme));
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${formatUnavailable(theme)}`);
   }
 
   private renderUnavailableOrStale(): void {
@@ -700,7 +719,7 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.setDisplay((theme) => formatStaleSnapshot(this.snapshot!.display, theme));
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${formatStaleSnapshot(this.snapshot!.display, theme)}`);
   }
 
   private render(): void {
@@ -713,9 +732,9 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.setDisplay((theme) => this.usageFailure
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${this.usageFailure
       ? formatStaleSnapshot(this.snapshot!.display, theme)
-      : formatUsageSnapshot(this.snapshot!.display, theme));
+      : formatUsageSnapshot(this.snapshot!.display, theme)}`);
   }
 }
 

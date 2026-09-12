@@ -16,7 +16,15 @@ function asFastContext(context: ExtensionContext): FastContextLike {
   return context as unknown as FastContextLike;
 }
 
-export { FastController, FAST_ENV_NAME, FAST_MODEL_IDS, FAST_STATUS_CONSTANTS, getFastState, isFastEligible } from './fast.ts';
+export {
+  FastController,
+  FAST_ENV_NAME,
+  FAST_MODEL_IDS,
+  FAST_STATUS_CONSTANTS,
+  formatFastDisplay,
+  getFastState,
+  isFastEligible,
+} from './fast.ts';
 export {
   consumeFastBootstrap,
   FAST_REQUESTED_EVENT,
@@ -24,7 +32,7 @@ export {
   publishFastRequested,
 } from './interop.ts';
 export type { FastEventBusLike, FastRequestedEvent } from './interop.ts';
-export type { FastContextLike, FastState } from './fast.ts';
+export type { FastContextLike, FastDisplaySnapshot, FastDisplayTheme, FastState } from './fast.ts';
 export { UsageController, fetchUsageSnapshot, formatProgressBar, formatUsageSnapshot, parseUsagePayload, USAGE_STATUS_CONSTANTS } from './usage.ts';
 export type {
   Availability,
@@ -63,29 +71,33 @@ export default function codexUsageStatusExtension(pi: ExtensionAPI): void {
       if (fastController.handleCommand(args, fastContext)) {
         publishRequested(pi, fastContext, fastController.requestedOn);
       }
+      usageController.updateFastDisplay(fastController.getDisplaySnapshot());
     },
   });
 
   pi.on('session_start', (_event, context) => {
-    usageController.handle(asUsageContext(context));
     const fastContext = asFastContext(context);
     fastController.handle(fastContext);
+    usageController.handle(asUsageContext(context), undefined, false, fastController.getDisplaySnapshot());
     publishRequested(pi, fastContext, fastController.requestedOn);
   });
 
   pi.on('input', (_event, context) => {
-    usageController.handle(asUsageContext(context));
-    fastController.handle(asFastContext(context));
+    const fastContext = asFastContext(context);
+    fastController.handle(fastContext);
+    usageController.handle(asUsageContext(context), undefined, false, fastController.getDisplaySnapshot());
   });
 
   pi.on('model_select', (event, context) => {
-    usageController.handle(asUsageContext(context), event.model as UsageModelLike, true);
-    fastController.handle(asFastContext(context), event.model, true);
+    const fastContext = asFastContext(context);
+    fastController.handle(fastContext, event.model, true);
+    usageController.handle(asUsageContext(context), event.model as UsageModelLike, true, fastController.getDisplaySnapshot());
   });
 
   pi.on('agent_settled', (_event, context) => {
-    usageController.handle(asUsageContext(context));
-    fastController.handle(asFastContext(context));
+    const fastContext = asFastContext(context);
+    fastController.handle(fastContext);
+    usageController.handle(asUsageContext(context), undefined, false, fastController.getDisplaySnapshot());
   });
 
   pi.on('before_provider_request', (event, context) => {

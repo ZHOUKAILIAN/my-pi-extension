@@ -49,7 +49,7 @@ function styledTheme() {
   return { fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
 }
 
-function recordWidget(statuses: string[], theme?: { fg(color: string, text: string): string }) {
+function recordWidget(statuses: string[], theme: { fg(color: string, text: string): string } = styledTheme()) {
   return (_key: string, content: unknown) => {
     if (typeof content === 'function') statuses.push((content as Function)({}, theme).render(200)[0]);
   };
@@ -58,6 +58,66 @@ function recordWidget(statuses: string[], theme?: { fg(color: string, text: stri
 const ANSI_RESET = '\u001b[0m';
 const ANSI_ALLOWED_METRIC = '\u001b[38;2;116;217;165m';
 const ANSI_EMPTY_PROGRESS = '\u001b[38;2;89;103;124m';
+const FAST_OFF_LABEL = '<muted>Fast off</muted>';
+const SINGLE_WINDOW_METRIC = `${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET}`;
+const FAST_OFF_ALLOWED_ROW = `${FAST_OFF_LABEL} · <dim>Codex</dim> · ${SINGLE_WINDOW_METRIC}`;
+const FAST_OFF_UNAVAILABLE_ROW = `${FAST_OFF_LABEL} · <dim>Codex</dim>: unavailable`;
+
+function expectedResetTime(seconds: number): string {
+  const date = new Date(seconds * 1000);
+  const pad = (value: number) => String(value).padStart(2, '0');
+  const month = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][date.getMonth()];
+  return `${month} ${date.getDate()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+const DEFAULT_ALLOWED_QUOTA = `${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET} · <dim>${expectedResetTime(2000000000)}</dim> · ${ANSI_ALLOWED_METRIC}50% █████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░░░${ANSI_RESET} · <dim>${expectedResetTime(2000000100)}</dim>`;
+const FAST_OFF_DEFAULT_ALLOWED_ROW = `${FAST_OFF_LABEL} · <dim>Codex</dim> · ${DEFAULT_ALLOWED_QUOTA}`;
+const FAST_OFF_STALE_DEFAULT_ALLOWED_ROW = `${FAST_OFF_LABEL} · <dim>Codex</dim><warning>: stale</warning> · ${DEFAULT_ALLOWED_QUOTA}`;
+const FAST_ACTIVE_LABEL = '\u001b[38;2;217;140;63m⚡ Fast\u001b[0m';
+const FAST_DISPLAY_LABELS = {
+  off: FAST_OFF_LABEL,
+  active: FAST_ACTIVE_LABEL,
+  inactive: '<muted>Fast inactive</muted>',
+} as const;
+
+function projectionPayload(allowed: boolean | undefined): object {
+  return {
+    rate_limit: {
+      ...(allowed === undefined ? {} : { allowed }),
+      primary_window: { used_percent: 28.4 },
+    },
+  };
+}
+
+const QUOTA_PROJECTION_CASES = [
+  {
+    name: 'allowed',
+    allowed: true,
+    expectedRight: `<dim>Codex</dim> · ${SINGLE_WINDOW_METRIC}`,
+  },
+  {
+    name: 'limited',
+    allowed: false,
+    expectedRight: '<dim>Codex</dim> <error>limit reached</error>',
+  },
+  {
+    name: 'unknown',
+    allowed: undefined,
+    expectedRight: `<dim>Codex</dim> <warning>status unknown</warning> · ${SINGLE_WINDOW_METRIC}`,
+  },
+  {
+    name: 'stale',
+    allowed: true,
+    stale: true,
+    expectedRight: `<dim>Codex</dim><warning>: stale</warning> · ${SINGLE_WINDOW_METRIC}`,
+  },
+  {
+    name: 'unavailable',
+    allowed: undefined,
+    unavailable: true,
+    expectedRight: '<dim>Codex</dim>: unavailable',
+  },
+] as const;
 
 test('public entry does not expose auth scope extraction or account scope types', () => {
   assert.equal('extractCodexAuthScope' in publicEntry, false);
@@ -190,7 +250,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(statuses.at(-1)?.startsWith(`<dim>Codex</dim> · ${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET} · <dim>`));
+    assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
 
     // The scope lease and usage interval are both one minute. Move only the
     // usage attempt clock so this test stays within the active scope lease.
@@ -198,7 +258,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.ok(statuses.at(-1)?.startsWith(`<dim>Codex</dim><warning>: stale</warning> · ${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET} · <dim>`));
+    assert.equal(statuses.at(-1), FAST_OFF_STALE_DEFAULT_ALLOWED_ROW);
     assert.doesNotMatch(statuses.at(-1) ?? '', /model-x|a-first|z-last|5h|7d|left|resets/u);
   } finally {
     controller.shutdown();
@@ -234,13 +294,13 @@ test('keeps limited stale status without a progress bar after controller refresh
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(statuses.at(-1), 'Codex limit reached');
+    assert.equal(statuses.at(-1), '<muted>Fast off</muted> · <dim>Codex</dim> <error>limit reached</error>');
 
     (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(statuses.at(-1), 'Codex: stale · limit reached');
+    assert.equal(statuses.at(-1), '<muted>Fast off</muted> · <dim>Codex</dim><warning>: stale</warning> · <error>limit reached</error>');
     assert.doesNotMatch(statuses.at(-1) ?? '', /[█░]/u);
   } finally {
     controller.shutdown();
@@ -275,15 +335,13 @@ test('keeps unknown status and the primary C capsule metric after controller ref
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(statuses.at(-1), 'Codex status unknown · 72% ███████░░░');
+    assert.equal(statuses.at(-1), `<muted>Fast off</muted> · <dim>Codex</dim> <warning>status unknown</warning> · ${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET}`);
 
     (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
     controller.handle(context);
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
-    assert.equal(statuses.at(-1), 'Codex: stale · status unknown · 72% ███████░░░');
-    assert.match(statuses.at(-1) ?? '', /status unknown/u);
-    assert.match(statuses.at(-1) ?? '', /72% ███████░░░/u);
+    assert.equal(statuses.at(-1), `<muted>Fast off</muted> · <dim>Codex</dim><warning>: stale</warning> · <warning>status unknown</warning> · ${ANSI_ALLOWED_METRIC}72% ███████${ANSI_RESET}${ANSI_EMPTY_PROGRESS}░░░${ANSI_RESET}`);
   } finally {
     controller.shutdown();
   }
@@ -337,15 +395,80 @@ test('projects quota as a below-editor widget with ANSI-safe single-line renderi
     component.invalidate();
     assert.match(component.render(200)[0], /new:/u);
 
-    // The usage projection owns only its key; unrelated status entries remain untouched.
+    // UsageController owns cleanup of both legacy status keys.
     context.ui.setStatus('codex-fast', 'Fast active');
     assert.deepEqual(statusCalls.at(-1), { key: 'codex-fast', text: 'Fast active' });
 
     controller.handle(context, { provider: 'other', api: 'other', baseUrl: 'https://other.invalid' }, true);
     assert.deepEqual(widgetCalls.at(-1), { key: 'codex-usage-status', content: undefined, placement: undefined });
+    assert.deepEqual(statusCalls.at(-2), { key: 'codex-fast', text: undefined });
     assert.deepEqual(statusCalls.at(-1), { key: 'codex-usage-status', text: undefined });
   } finally {
     controller.shutdown();
+  }
+});
+
+test('projects every quota state with Fast off, active, and inactive through the widget projection', async () => {
+  for (const quotaCase of QUOTA_PROJECTION_CASES) {
+    for (const fastState of ['off', 'active', 'inactive'] as const) {
+      const clock = 1_000_000;
+      let authCalls = 0;
+      let fetchCalls = 0;
+      let timerCalls = 0;
+      const rows: string[] = [];
+      const theme = styledTheme();
+      const context = {
+        mode: 'tui',
+        model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+        modelRegistry: {
+          isUsingOAuth: () => true,
+          getProviderAuth: async () => {
+            authCalls += 1;
+            if (quotaCase.unavailable) throw new Error('auth unavailable');
+            return auth();
+          },
+        },
+        ui: {
+          theme,
+          setStatus: () => {},
+          setWidget: recordWidget(rows, theme),
+        },
+      };
+      const controller = new UsageController({
+        now: () => clock,
+        setTimeout: (handler, timeout) => {
+          timerCalls += 1;
+          return globalThis.setTimeout(handler, timeout);
+        },
+        fetch: async () => {
+          fetchCalls += 1;
+          if (quotaCase.stale && fetchCalls > 1) throw new Error('temporary failure');
+          return new Response(JSON.stringify(projectionPayload(quotaCase.allowed)), { status: 200 });
+        },
+      });
+
+      try {
+        // Exercise UsageController.handle/updateFastDisplay and the registered
+        // belowEditor widget; this matrix does not call the formatter directly.
+        controller.handle(context, undefined, false, { state: 'off' });
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+
+        if (quotaCase.stale) {
+          (controller as unknown as { lastUsageAttempt: number }).lastUsageAttempt = clock - USAGE_STATUS_CONSTANTS.usageMinIntervalMs;
+          controller.handle(context);
+          await new Promise((resolve) => setImmediate(resolve));
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+
+        const counts = { authCalls, fetchCalls, timerCalls };
+        controller.updateFastDisplay({ state: fastState });
+        assert.equal(rows.at(-1), `${FAST_DISPLAY_LABELS[fastState]} · ${quotaCase.expectedRight}`, `${quotaCase.name}/${fastState}`);
+        assert.deepEqual({ authCalls, fetchCalls, timerCalls }, counts, `${quotaCase.name}/${fastState} refresh side effects`);
+      } finally {
+        controller.shutdown();
+      }
+    }
   }
 });
 
@@ -375,6 +498,7 @@ test('clears the widget and legacy status on shutdown without reviving a late au
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.deepEqual(widgetCalls.at(-1), { key: 'codex-usage-status', content: undefined });
+  assert.deepEqual(statusCalls.at(-2), { key: 'codex-fast', text: undefined });
   assert.deepEqual(statusCalls.at(-1), { key: 'codex-usage-status', text: undefined });
   assert.equal(widgetCalls.length, callCountAfterShutdown);
 });
@@ -440,17 +564,17 @@ test('expires the scope lease before revalidating', async () => {
   assert.equal(authCalls, 1);
   resolveAuth?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
 
   clock += USAGE_STATUS_CONSTANTS.scopeLeaseMs;
   for (const [id, timer] of [...timers]) {
     if (timer.due <= clock) { timers.delete(id); timer.run(); }
   }
-  assert.equal(statuses.at(-1), 'Codex: unavailable');
+  assert.equal(statuses.at(-1), FAST_OFF_UNAVAILABLE_ROW);
   assert.equal(authCalls, 2);
   resolveAuth?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
 
   controller.shutdown();
 });
@@ -479,15 +603,15 @@ test('model_select clears a same-provider snapshot before revalidation', async (
   controller.handle(context);
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
 
   controller.handle(context, context.model, true);
-  assert.equal(statuses.at(-1), 'Codex: unavailable');
+  assert.equal(statuses.at(-1), FAST_OFF_UNAVAILABLE_ROW);
   assert.equal(authCalls, 2);
   secondAuthResolve?.(auth());
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
   controller.shutdown();
 });
 
@@ -523,7 +647,7 @@ test('replays a pending scope refresh after leaving and returning while auth is 
   resolvers[1](auth());
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
   controller.shutdown();
 });
 
@@ -566,7 +690,7 @@ test('drops stale pending scope refreshes when leaving Codex before auth settles
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(authCalls, 2);
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
   controller.shutdown();
 });
 
@@ -596,12 +720,12 @@ test('replays a pending usage refresh after a model generation changes during fe
   assert.equal(fetchCalls, 1);
   controller.handle(context, context.model, true);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(statuses.at(-1), 'Codex: unavailable');
+  assert.equal(statuses.at(-1), FAST_OFF_UNAVAILABLE_ROW);
   resolveFirstFetch?.(new Response(JSON.stringify(payload()), { status: 200 }));
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fetchCalls, 2);
-  assert.match(statuses.at(-1) ?? '', /^Codex(?: |:)/u);
+  assert.equal(statuses.at(-1), FAST_OFF_DEFAULT_ALLOWED_ROW);
   controller.shutdown();
 });
 
