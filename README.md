@@ -36,7 +36,7 @@ Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 - `@pi/workflow-contracts`：当前 Stage、Artifact、Checkpoint、Worker 和提交接口。
 - `@pi/workflow-runtime`：当前状态机、Fix Definition、Worker Session、Guard、有限重试、checkpoint 和恢复。
 - `@pi/fix`：当前 `/fix` 的策略、报告、trace 和主 Pi UI 接线。
-- `@pi/codex-usage-status`：Codex 额度状态栏与内存态 `/fast` priority processing 接线；不依赖 Workflow Runtime。
+- `@pi/codex-usage-status`：Codex 额度状态与内存态 `/fast` priority processing 接线；合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E；不依赖 Workflow Runtime。
 
 产品目标上，Feature/Fix package 各自拥有自己的可执行 Workflow Definition；共享 Runtime 不拥有入口特有流程。
 

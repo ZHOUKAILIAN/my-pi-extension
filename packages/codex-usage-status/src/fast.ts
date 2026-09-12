@@ -12,7 +12,6 @@ export const FAST_MODEL_IDS = [
 const FAST_PROVIDER = 'openai-codex';
 const FAST_API = 'openai-codex-responses';
 const FAST_BASE_URL = 'https://chatgpt.com/backend-api';
-const FAST_STATUS_KEY = 'codex-fast';
 const FAST_ORANGE = '\u001b[38;2;217;140;63m';
 const ANSI_RESET = '\u001b[0m';
 const FAST_ACTIVE_LABEL = orange('⚡ Fast');
@@ -26,10 +25,6 @@ function orange(text: string): string {
   return `${FAST_ORANGE}${text}${ANSI_RESET}`;
 }
 
-type FastTheme = {
-  fg(color: string, text: string): string;
-};
-
 export interface FastContextLike {
   readonly hasUI: boolean;
   readonly mode: string;
@@ -42,9 +37,7 @@ export interface FastContextLike {
     getSessionFile(): string | undefined;
   };
   readonly ui: {
-    setStatus(key: string, text: string | undefined): void;
     notify(message: string, type?: 'info' | 'warning' | 'error'): void;
-    readonly theme?: FastTheme;
   };
 }
 
@@ -76,19 +69,26 @@ export function getFastState(requested: boolean, eligible: boolean): FastState {
   return eligible ? 'active' : 'inactive';
 }
 
-function style(theme: FastTheme | undefined, color: string, text: string): string {
+export interface FastDisplaySnapshot {
+  readonly state: FastState;
+}
+
+export interface FastDisplayTheme {
+  fg(color: 'muted', text: string): string;
+}
+
+function style(theme: FastDisplayTheme | undefined, text: string): string {
   if (!theme) return text;
   try {
-    return theme.fg(color, text);
+    return theme.fg('muted', text);
   } catch {
     return text;
   }
 }
 
-function stateLabel(state: FastState, theme?: FastTheme): string {
-  if (state === 'active') return FAST_ACTIVE_LABEL;
-  if (state === 'inactive') return style(theme, 'muted', 'Fast inactive');
-  return style(theme, 'muted', 'Fast off');
+export function formatFastDisplay(snapshot: FastDisplaySnapshot, theme?: FastDisplayTheme): string {
+  if (snapshot.state === 'active') return FAST_ACTIVE_LABEL;
+  return style(theme, snapshot.state === 'inactive' ? 'Fast inactive' : 'Fast off');
 }
 
 function sessionIdentity(context: FastContextLike): string | undefined {
@@ -185,9 +185,25 @@ export class FastController {
   private context: FastContextLike | undefined;
   private model: FastModel | undefined;
   private pendingTickets: PendingFastTicket[] = [];
+  private readonly stateListeners = new Set<(snapshot: FastDisplaySnapshot) => void>();
 
   constructor(initialRequested = false) {
     this.requested = initialRequested;
+  }
+
+  onDisplayStateChange(listener: (snapshot: FastDisplaySnapshot) => void): () => void {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
+  getDisplaySnapshot(): FastDisplaySnapshot {
+    return { state: this.state };
+  }
+
+  private emitDisplayStateChange(previousState: FastState | undefined): void {
+    const snapshot = this.getDisplaySnapshot();
+    if (previousState === snapshot.state) return;
+    for (const listener of this.stateListeners) listener(snapshot);
   }
 
   get requestedOn(): boolean {
@@ -198,28 +214,34 @@ export class FastController {
     return getFastState(this.requested, this.context ? isFastEligible(this.context, this.model) : false);
   }
 
-  handle(context: FastContextLike, modelOverride?: FastModel, announceTransition = false): void {
-    const previousState = this.context ? this.state : undefined;
+  handle(
+    context: FastContextLike,
+    modelOverride?: FastModel,
+    announceTransition = false,
+    previousStateOverride?: FastState,
+  ): void {
+    const previousState = previousStateOverride ?? (this.context ? this.state : undefined);
     this.context = context;
     this.model = modelOverride ?? context.model;
     const state = this.state;
-    this.render();
+    this.emitDisplayStateChange(previousState);
     if (announceTransition && this.requested && previousState !== undefined && previousState !== state) {
       this.notifyState(state);
     }
   }
 
   shutdown(): void {
-    this.context?.ui.setStatus(FAST_STATUS_KEY, undefined);
     this.context = undefined;
     this.model = undefined;
     this.pendingTickets = [];
     this.requested = false;
+    this.stateListeners.clear();
   }
 
   setRequested(requested: boolean, context: FastContextLike): void {
+    const previousState = this.context ? this.state : 'off';
     this.requested = requested;
-    this.handle(context);
+    this.handle(context, undefined, false, previousState);
     this.notifyState(this.state);
   }
 
@@ -232,10 +254,6 @@ export class FastController {
     this.context = context;
     this.model = context.model;
     this.notifyState(this.state);
-  }
-
-  statusText(): string {
-    return stateLabel(this.state, this.context?.ui.theme);
   }
 
   handleCommand(args: string, context: FastContextLike): boolean {
@@ -299,10 +317,6 @@ export class FastController {
     };
   }
 
-  private render(): void {
-    this.context?.ui.setStatus(FAST_STATUS_KEY, this.statusText());
-  }
-
   private notifyState(state: FastState): void {
     const context = this.context;
     if (!context) return;
@@ -323,6 +337,5 @@ export const FAST_STATUS_CONSTANTS = {
   api: FAST_API,
   baseUrl: FAST_BASE_URL,
   serviceTier: PRIORITY_SERVICE_TIER,
-  statusKey: FAST_STATUS_KEY,
   maxPendingTickets: MAX_PENDING_TICKETS,
 } as const;

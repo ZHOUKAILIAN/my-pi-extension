@@ -1,3 +1,6 @@
+import { truncateToWidth } from '@earendil-works/pi-tui';
+import { formatFastDisplay, type FastDisplaySnapshot, type FastDisplayTheme } from './fast.ts';
+
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 const MAX_BODY_BYTES = 64 * 1024;
 const HARD_EXPIRY_MS = 10 * 60 * 1000;
@@ -52,11 +55,18 @@ export interface FetchUsageOptions {
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
-type UsageThemeColor = 'success' | 'warning' | 'error' | 'dim';
+type UsageThemeColor = 'success' | 'warning' | 'error' | 'dim' | 'muted';
 
-export interface UsageThemeLike {
+export interface UsageThemeLike extends FastDisplayTheme {
   fg(color: UsageThemeColor, text: string): string;
 }
+
+export interface UsageWidgetLike {
+  render(width: number): string[];
+  invalidate(): void;
+}
+
+export type UsageWidgetFactory = (tui: unknown, theme: UsageThemeLike) => UsageWidgetLike;
 
 export interface UsageContextLike {
   readonly mode: string;
@@ -67,6 +77,7 @@ export interface UsageContextLike {
   };
   readonly ui: {
     setStatus(key: string, text: string | undefined): void;
+    setWidget(key: string, content: UsageWidgetFactory | undefined, options?: { placement?: 'aboveEditor' | 'belowEditor' }): void;
     readonly theme?: UsageThemeLike;
   };
 }
@@ -258,6 +269,7 @@ export async function fetchUsageSnapshot(authResult: unknown, options: FetchUsag
   }
 }
 
+const USAGE_STATUS_KEY = 'codex-usage-status';
 const ANSI_RESET = '\u001b[0m';
 const ALLOWED_METRIC_COLOR = '\u001b[38;2;116;217;165m';
 const EMPTY_PROGRESS_COLOR = '\u001b[38;2;89;103;124m';
@@ -367,6 +379,31 @@ function isEligible(context: UsageContextLike, model = context.model): boolean {
   }
 }
 
+class UsageWidget implements UsageWidgetLike {
+  private readonly renderText: (theme: UsageThemeLike | undefined) => string;
+  private readonly getCurrentTheme: () => UsageThemeLike | undefined;
+  private readonly initialTheme: UsageThemeLike | undefined;
+
+  constructor(
+    renderText: (theme: UsageThemeLike | undefined) => string,
+    getCurrentTheme: () => UsageThemeLike | undefined,
+    initialTheme: UsageThemeLike | undefined,
+  ) {
+    this.renderText = renderText;
+    this.getCurrentTheme = getCurrentTheme;
+    this.initialTheme = initialTheme;
+  }
+
+  render(width: number): string[] {
+    const theme = this.getCurrentTheme() ?? this.initialTheme;
+    return [truncateToWidth(this.renderText(theme), Math.max(0, width), '')];
+  }
+
+  invalidate(): void {
+    // Rendering is intentionally stateless so the current theme is read on every render.
+  }
+}
+
 export class UsageController {
   private readonly now: () => number;
   private readonly schedule: UsageControllerOptions['setTimeout'];
@@ -374,6 +411,7 @@ export class UsageController {
   private readonly fetcher: FetchLike | undefined;
   private context: UsageContextLike | undefined;
   private activeModel: UsageModelLike | undefined;
+  private fastDisplay: FastDisplaySnapshot = { state: 'off' };
   private snapshot: { readonly display: UsageDisplaySnapshot; readonly scopeFingerprint: string } | undefined;
   private scopeFingerprint: string | undefined;
   private scopeAccountId: string | undefined;
@@ -398,7 +436,13 @@ export class UsageController {
     this.fetcher = options.fetch;
   }
 
-  handle(context: UsageContextLike, modelOverride?: UsageModelLike, forceRevalidate = false): void {
+  handle(
+    context: UsageContextLike,
+    modelOverride?: UsageModelLike,
+    forceRevalidate = false,
+    fastDisplay?: FastDisplaySnapshot,
+  ): void {
+    if (fastDisplay) this.fastDisplay = fastDisplay;
     if (forceRevalidate) {
       this.invalidate();
       this.usageFailure = false;
@@ -419,8 +463,18 @@ export class UsageController {
     if (this.now() - this.lastUsageAttempt >= USAGE_MIN_INTERVAL_MS) this.requestUsage(this.generation);
   }
 
+  updateFastDisplay(fastDisplay: FastDisplaySnapshot): void {
+    this.fastDisplay = fastDisplay;
+    if (!this.context) return;
+    if (!isEligible(this.context, this.activeModel)) {
+      this.clearDisplay();
+      return;
+    }
+    this.render();
+  }
+
   shutdown(): void {
-    this.context?.ui.setStatus('codex-usage-status', undefined);
+    this.clearDisplay();
     this.context = undefined;
     this.activeModel = undefined;
     this.pendingScopeRefresh = false;
@@ -443,7 +497,7 @@ export class UsageController {
 
   private disable(): void {
     this.clearTimers();
-    this.context?.ui.setStatus('codex-usage-status', undefined);
+    this.clearDisplay();
     this.snapshot = undefined;
     this.scopeFingerprint = undefined;
     this.scopeAccountId = undefined;
@@ -636,8 +690,27 @@ export class UsageController {
     }, delay);
   }
 
+  private clearDisplay(): void {
+    this.context?.ui.setWidget(USAGE_STATUS_KEY, undefined);
+    this.context?.ui.setStatus('codex-fast', undefined);
+    this.context?.ui.setStatus(USAGE_STATUS_KEY, undefined);
+  }
+
+  private setDisplay(renderText: (theme: UsageThemeLike | undefined) => string): void {
+    const context = this.context;
+    if (!context) return;
+    // UsageController owns both the merged widget and cleanup of legacy status keys.
+    context.ui.setStatus('codex-fast', undefined);
+    context.ui.setStatus(USAGE_STATUS_KEY, undefined);
+    context.ui.setWidget(USAGE_STATUS_KEY, (_tui, theme) => new UsageWidget(
+      renderText,
+      () => getTheme(context),
+      theme,
+    ), { placement: 'belowEditor' });
+  }
+
   private renderUnavailable(): void {
-    this.context?.ui.setStatus('codex-usage-status', formatUnavailable(getTheme(this.context)));
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${formatUnavailable(theme)}`);
   }
 
   private renderUnavailableOrStale(): void {
@@ -646,7 +719,7 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    this.context?.ui.setStatus('codex-usage-status', formatStaleSnapshot(this.snapshot.display, getTheme(this.context)));
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${formatStaleSnapshot(this.snapshot!.display, theme)}`);
   }
 
   private render(): void {
@@ -659,10 +732,9 @@ export class UsageController {
       this.renderUnavailable();
       return;
     }
-    const theme = getTheme(this.context);
-    this.context.ui.setStatus('codex-usage-status', this.usageFailure
-      ? formatStaleSnapshot(this.snapshot.display, theme)
-      : formatUsageSnapshot(this.snapshot.display, theme));
+    this.setDisplay((theme) => `${formatFastDisplay(this.fastDisplay, theme)} · ${this.usageFailure
+      ? formatStaleSnapshot(this.snapshot!.display, theme)
+      : formatUsageSnapshot(this.snapshot!.display, theme)}`);
   }
 }
 
