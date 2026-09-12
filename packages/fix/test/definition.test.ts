@@ -298,6 +298,9 @@ test('节点模型建议与当前默认模型一致且明确为非绑定说明',
     assert.ok(profile.modelRecommendation?.includes(profile.defaultModelRef.split('/')[1]));
     assert.match(profile.modelRecommendation ?? '', /非绑定说明/);
   }
+  assert.match(FIX_NODE_PROFILES.investigate.modelRecommendation ?? '', /调查使用/);
+  assert.doesNotMatch(FIX_NODE_PROFILES.investigate.modelRecommendation ?? '', /验证使用/);
+  assert.match(FIX_NODE_PROFILES.verify.modelRecommendation ?? '', /验证使用.*gpt-5\.6-terra/);
 });
 
 test('FIX_SPECIAL_NODES 定义被评审节点到评审节点的契约', () => {

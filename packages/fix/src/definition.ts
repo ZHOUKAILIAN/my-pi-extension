@@ -86,7 +86,7 @@ export const FIX_NODE_PROFILES: Record<FixNodeId, NodeProfile> = {
     defaultModelRef: 'openai-codex/gpt-5.6-sol',
     defaultSkills: [],
     context: ['problem', 'intake', 'project_knowledge'],
-    modelRecommendation: '设计建议调查/验证使用高推理模型（gpt-5.6-sol）；非绑定说明，仅记录设计意图',
+    modelRecommendation: '设计建议调查使用高推理模型（gpt-5.6-sol）；非绑定说明，仅记录设计意图',
   },
   investigation_review: {
     tools: ['read', 'submit_artifact'],
