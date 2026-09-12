@@ -34,6 +34,8 @@ export type {
   UsageDisplaySnapshot,
   UsageModelLike,
   UsageThemeLike,
+  UsageWidgetFactory,
+  UsageWidgetLike,
   UsageWindow,
 } from './usage.ts';
 

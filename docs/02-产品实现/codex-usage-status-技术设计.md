@@ -6,25 +6,25 @@
 | 层级 | 第二层（L2） |
 | L1 owner | [Codex Usage Status + Fast Extension 产品规范](../01-产品定义/扩展/codex-usage-status-扩展.md) |
 | 目标 package | `packages/codex-usage-status` / `@pi/codex-usage-status` |
-| 当前实现 | `packages/codex-usage-status` 已实现额度状态、Fast 请求/计费接线与 parent-Fast interop；focused tests 覆盖 eligibility、命令、bootstrap/env、事件发布、状态切换、payload hook、ticket/cost correction 与原有 usage 回归；真实 Pi TUI/provider E2E、local dispatcher live E2E 未执行 |
+| 当前实现 | `packages/codex-usage-status` 已实现额度状态、Fast 请求/计费接线与 parent-Fast interop；focused tests 覆盖 eligibility、命令、bootstrap/env、事件发布、状态切换、payload hook、ticket/cost correction 与额度独立行回归；本轮 `npm test`（517/517）、`npm run typecheck`、`git diff --check` 和全仓 Markdown 相对链接检查通过；真实 Pi TUI/provider E2E、local dispatcher live E2E 未执行 |
 
 ## 1. 结论先行
 
-扩展只在 TUI 的当前模型为 `openai-codex`、`ctx.modelRegistry.isUsingOAuth(ctx.model)` 为真、且模型保有原生 `openai-codex-responses` API 与 `https://chatgpt.com/backend-api` base URL 时，以 `ctx.ui.setStatus()` 写入底栏。它把授权解析、额度读取和 UI 投影拆开：每次成功 scope 确认只授予 60 秒展示 lease，lease 到期先清除旧快照；usage HTTP 单独受 5 秒超时约束；所有异步结果都以 generation 和内存 scope fingerprint 验证后才能提交。
+扩展只在 TUI 的当前模型为 `openai-codex`、`ctx.modelRegistry.isUsingOAuth(ctx.model)` 为真、且模型保有原生 `openai-codex-responses` API 与 `https://chatgpt.com/backend-api` base URL 时，以 `ctx.ui.setWidget('codex-usage-status', factory, { placement: 'belowEditor' })` 投影到输入框下方、原有 footer 上方的独立额度行。它把授权解析、额度读取和 UI 投影拆开：每次成功 scope 确认只授予 60 秒展示 lease，lease 到期先清除旧快照；usage HTTP 单独受 5 秒超时约束；所有异步结果都以 generation 和内存 scope fingerprint 验证后才能提交。额度 widget 的 `render(width)` 每次按当前 theme 生成文本并通过 ANSI-safe `truncateToWidth` 返回单行；展示前清除同 key 的旧 status，隐藏和 shutdown 同时清除 widget/status。
 
 ```mermaid
 sequenceDiagram
     participant Pi
     participant Extension
     participant Usage as https://chatgpt.com/backend-api/wham/usage
-    participant Footer as Pi footer
+    participant UsageRow as Pi belowEditor widget
 
     Pi->>Extension: session_start / input / model_select / agent_settled
     Extension->>Extension: TUI/provider gate、scope generation、single-flight
     Extension->>Usage: GET（bearer + account scope，manual redirect）
     Usage-->>Extension: snake_case usage payload
     Extension->>Extension: 当前 scope 再验证、白名单投影
-    Extension->>Footer: setStatus
+    Extension->>UsageRow: setWidget(factory, { placement: 'belowEditor' })
 ```
 
 ## 2. Package 与公开边界
@@ -33,9 +33,9 @@ sequenceDiagram
 | --- | --- |
 | `packages/codex-usage-status/src/index.ts` | Pi extension factory、`/fast` 与事件订阅、生命周期清理。 |
 | `packages/codex-usage-status/src/fast.ts` | Fast intent/effective state、严格 eligibility、`service_tier` payload hook、bounded request ticket、assistant cost correction 与 Fast footer。 |
-| `packages/codex-usage-status/src/usage.ts` | 授权 scope 提取、请求、wire DTO 解析、快照状态与格式化；不含 Fast 或 Pi UI 业务。 |
+| `packages/codex-usage-status/src/usage.ts` | 授权 scope 提取、请求、wire DTO 解析、快照状态、格式化与额度 widget 投影；不含 Fast 业务。 |
 | `packages/codex-usage-status/test/*.test.ts` | 额度解析、授权/异步状态、格式化、安全回归和 Fast 行为测试。 |
-| `packages/codex-usage-status/package.json` | Pi package manifest、运行依赖与入口；Pi peer 约束为 `>=0.84.4 <0.85.0`，直接使用的 `pi-ai` 为 dev `0.84.4`、peer `>=0.84.4 <0.85.0`。 |
+| `packages/codex-usage-status/package.json` | Pi package manifest、运行依赖与入口；`pi-ai`、`pi-tui` 和 coding-agent peer 约束为 `>=0.84.4 <0.85.0`，直接使用的 `pi-ai`/`pi-tui` dev 版本为 `0.84.4`。 |
 
 该 package 是独立的 provider-status extension，不依赖 `workflow-runtime` 或 `workflow-contracts`，也不注册 Workflow Run、Artifact、Guard 或用户决策。
 
@@ -161,24 +161,24 @@ stateDiagram-v2
     Stale --> Hidden: model_select 切离 Codex
 ```
 
-| 状态 | 底栏 | 规则 |
+| 状态 | 独立额度行 | 规则 |
 | --- | --- | --- |
-| `Hidden` | 清除 extension status | 无认证/网络/timer。 |
+| `Hidden` | 清除 `codex-usage-status` widget/status | 无认证/网络/timer。 |
 | `Current` | `Codex · 72% ███████░░░ · Sep 16 10:41` | C「胶囊额度」样式；只展示当前 scope 的默认 bucket 合法窗口。 |
 | `Limited` | `Codex limit reached` | 不显示会误导许可状态的进度条。 |
 | `Unknown` | `Codex status unknown · 72% ███████░░░` | 只展示默认窗口；不推断许可。 |
 | `Stale` | `Codex: stale <previous text>` | 仅 `now - fetchedAt < 10m` 且 scope fingerprint 相同。 |
 | `Unavailable` | `Codex: unavailable` | 不展示旧数值。 |
 
-每次成功 scope 确认授予 60 秒 scope lease，并安排 lease timer。lease timer 触发时先递增 generation、清除 snapshot 和 hard-expiry timer、显示 `unavailable`，再后台重校验；因此授权解析长期 pending 也不能使旧账户数据展示超过 lease。每次校验后都比较 fingerprint；缺失、变化或不匹配时同样清除。所有在途授权/HTTP 的晚到结果 generation 不一致时丢弃。成功 usage 快照另在 `fetchedAt + 10m` 安排 hard-expiry timer，触发时重新检查 age 与 scope 后清除旧比例；因此没有新请求结果也不会超过硬期限展示 stale。
+每次成功 scope 确认授予 60 秒 scope lease，并安排 lease timer。lease timer 触发时先递增 generation、清除 snapshot 和 hard-expiry timer、显示 `unavailable`，再后台重校验；因此授权解析长期 pending 也不能使旧账户数据展示超过 lease。每次校验后都比较 fingerprint；缺失、变化或不匹配时同样清除。所有在途授权/HTTP 的晚到结果 generation 不一致时丢弃。成功 usage 快照另在 `fetchedAt + 10m` 安排 hard-expiry timer，触发时重新检查 age 与 scope 后清除旧比例；因此没有新请求结果也不会超过硬期限展示 stale。每次额度投影先清除旧 `setStatus('codex-usage-status', undefined)`，再设置同 key 的 `belowEditor` widget；隐藏、模型切换、非 TUI 与 shutdown 同时调用 `setWidget('codex-usage-status', undefined)` 和 status 清理。
 
-`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。正常状态以受限 truecolor ANSI 输出：比例和填充块 `#74d9a5`（`38;2;116;217;165`），空块 faint `#59677c`（`38;2;89;103;124`），每个被着色片段后立即附 `reset`；不得接受服务端颜色/ANSI。`Codex`/重置时间仍通过 `ctx.ui.theme.fg("dim", …)`，`stale`/`status unknown` 用 `warning`、`limit reached` 用 `error`。`setStatus()` 不提供 extension 可用宽度。格式必须把许可状态、比例和进度条放在重置详情前，让宿主截断时保留主要信息；扩展不得声称自行适配全局 footer 宽度。
+`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。正常状态以受限 truecolor ANSI 输出：比例和填充块 `#74d9a5`（`38;2;116;217;165`），空块 faint `#59677c`（`38;2;89;103;124`），每个被着色片段后立即附 `reset`；不得接受服务端颜色/ANSI。`Codex`/重置时间仍通过 `ctx.ui.theme.fg("dim", …)`，`stale`/`status unknown` 用 `warning`、`limit reached` 用 `error`。额度 widget 的 `render(width)` 每次按当前 theme 生成完整文本，以 `truncateToWidth(text, width, '')` 返回严格一行；不缓存预着色结果，`invalidate()` 保持主题切换后的重新渲染契约。
 
 ## 6. 失败、恢复与可运营性
 
 - 所有失败仅转换为 `Unavailable` 或同 scope 的 `Stale`，不向 Agent、provider 请求和 session 流程抛出。
 - `model_select` 切离 Codex 时立即清除状态并失效在途请求；切回时后台触发 scope 校验和受限刷新。
-- `session_shutdown` 清除全部定时器、递增 generation、清除底栏；reload/new/resume 不复用旧 session 的内存快照。
+- `session_shutdown` 清除全部定时器、递增 generation、清除额度 widget/status；reload/new/resume 不复用旧 session 的内存快照。
 - 刷新触发在请求进行时合并为一个后续刷新意图；失败不立即重试。内存中可保留无敏感数据的 reason code（如 `unauthenticated`、`timeout`、`schema_invalid`、`scope_mismatch`）及最后尝试时间，供测试和未来安全诊断使用，但不写入 status、日志或 session。
 - HTTP 状态、错误文本、headers 和原始 body 不进入 status、日志、session 或测试快照。
 - 上游接口改变时解析失败是可预期状态；不引入网页抓取、浏览器自动化或 token 使用量估算。
@@ -198,11 +198,12 @@ stateDiagram-v2
 
 | 验证 | 证据 |
 | --- | --- |
+| 额度 widget UI | focused test 覆盖 `belowEditor` placement、至多一行、窄/宽度 resize、ANSI-safe 截断、当前 theme 与 `invalidate()`、旧 status/widget 清理、晚到 promise 不复活及 `codex-fast` status 共存。 |
 | 单元测试 | 仅默认 bucket（额外 bucket 永不进入投影/UI）、主窗口、多窗口、10 单元进度条、非法/零窗口、剩余比例舍入、availability、非 200、3xx、超大/伪造 content-length、流式膨胀 body、畸形 DTO、JWT base64url/expiry、账户失配。 |
 | 时序测试 | 60 秒 scope lease（含认证永久 pending、换号/登出）、5 分钟 timer、60 秒 usage 限频、single-flight、pending refresh、hard expiry、模型切换/shutdown/reload 和晚到 promise 丢弃。 |
 | 安全回归 | 固定 URL、OAuth provider/API/baseUrl integrity gate 与 manual redirect；覆盖 `openai-codex.baseUrl` 或 API 的模型均不触发授权/网络。mock response 含账户或 token-like 字符串、headers 时，状态/UI DTO/持久化数据均不含它们。 |
 | 模式测试 | TUI 外不调用授权解析、网络或 timer。 |
-| TypeScript / 全仓 | 根 `package.json` 与 lockfile 的 Pi 开发依赖为 `0.84.4`；Fast package 的 `pi-ai` dev 为精确 `0.84.4`、peer 限定在 `>=0.84.4 <0.85.0`；运行 `npm run typecheck`、`npm test`。 |
+| TypeScript / 全仓 | 根 `package.json` 与 lockfile 的 Pi 开发依赖为 `0.84.4`；本 package 的 `pi-ai`/`pi-tui` dev 为精确 `0.84.4`、peer 限定在 `>=0.84.4 <0.85.0`；运行 `npm run typecheck`、`npm test`。 |
 | Pi TUI 手工验证 | 已登录 Codex 会话可显示额度；启动/输入不等待网络，模型切换立即隐藏，失败不阻塞对话。该项不是单元测试可替代的 E2E。 |
 
 本设计与 L1 规范已作为实现输入；当前源码与测试已落地上述机制，真实 Pi TUI/provider E2E 仍待手工验证。

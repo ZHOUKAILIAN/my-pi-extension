@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { visibleWidth } from '@earendil-works/pi-tui';
 import * as publicEntry from '../src/index.ts';
 import {
   UsageController,
@@ -46,6 +47,12 @@ function payload(accountId = 'acct-test') {
 
 function styledTheme() {
   return { fg: (color: string, text: string) => `<${color}>${text}</${color}>` };
+}
+
+function recordWidget(statuses: string[], theme?: { fg(color: string, text: string): string }) {
+  return (_key: string, content: unknown) => {
+    if (typeof content === 'function') statuses.push((content as Function)({}, theme).render(200)[0]);
+  };
 }
 
 const ANSI_RESET = '\u001b[0m';
@@ -168,7 +175,7 @@ test('marks a same-scope failed refresh stale without additional windows', async
       isUsingOAuth: () => true,
       getProviderAuth: async () => auth(),
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text), theme: styledTheme() },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses, styledTheme()), theme: styledTheme() },
   };
   const controller = new UsageController({
     now: () => clock,
@@ -209,7 +216,7 @@ test('keeps limited stale status without a progress bar after controller refresh
       isUsingOAuth: () => true,
       getProviderAuth: async () => auth(),
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     now: () => clock,
@@ -251,7 +258,7 @@ test('keeps unknown status and the primary C capsule metric after controller ref
       isUsingOAuth: () => true,
       getProviderAuth: async () => auth(),
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     now: () => clock,
@@ -280,6 +287,96 @@ test('keeps unknown status and the primary C capsule metric after controller ref
   } finally {
     controller.shutdown();
   }
+});
+
+test('projects quota as a below-editor widget with ANSI-safe single-line rendering', async () => {
+  let clock = 1_000_000;
+  const statusCalls: Array<{ key: string; text: string | undefined }> = [];
+  const widgetCalls: Array<{ key: string; content: unknown; placement?: string }> = [];
+  let themeMarker = 'old';
+  const theme = {
+    fg: (color: string, text: string) => `\u001b[38;5;${color === 'dim' ? 240 : 33}m${themeMarker}:${text}\u001b[0m`,
+  };
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: async () => auth(),
+    },
+    ui: {
+      theme,
+      setStatus: (key: string, text: string | undefined) => statusCalls.push({ key, text }),
+      setWidget: (key: string, content: unknown, options?: { placement?: string }) => widgetCalls.push({ key, content, placement: options?.placement }),
+    },
+  };
+  const controller = new UsageController({
+    now: () => clock,
+    fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
+  });
+
+  try {
+    controller.handle(context);
+    await new Promise((resolve) => setImmediate(resolve));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const projection = widgetCalls.at(-1);
+    assert.equal(projection?.key, 'codex-usage-status');
+    assert.equal(projection?.placement, 'belowEditor');
+    assert.equal(typeof projection?.content, 'function');
+    assert.deepEqual(statusCalls.at(-1), { key: 'codex-usage-status', text: undefined });
+
+    const component = (projection?.content as Function)({}, theme) as { render(width: number): string[]; invalidate(): void };
+    const wide = component.render(200)[0];
+    assert.equal(component.render(16).length, 1);
+    assert.ok(visibleWidth(component.render(16)[0]) <= 16);
+    assert.doesNotMatch(component.render(16)[0], /\u001b\[[0-9;]*$/u);
+    assert.match(wide, /old:/u);
+
+    themeMarker = 'new';
+    component.invalidate();
+    assert.match(component.render(200)[0], /new:/u);
+
+    // The usage projection owns only its key; unrelated status entries remain untouched.
+    context.ui.setStatus('codex-fast', 'Fast active');
+    assert.deepEqual(statusCalls.at(-1), { key: 'codex-fast', text: 'Fast active' });
+
+    controller.handle(context, { provider: 'other', api: 'other', baseUrl: 'https://other.invalid' }, true);
+    assert.deepEqual(widgetCalls.at(-1), { key: 'codex-usage-status', content: undefined, placement: undefined });
+    assert.deepEqual(statusCalls.at(-1), { key: 'codex-usage-status', text: undefined });
+  } finally {
+    controller.shutdown();
+  }
+});
+
+test('clears the widget and legacy status on shutdown without reviving a late auth result', async () => {
+  let resolveAuth: ((value: unknown) => void) | undefined;
+  const statusCalls: Array<{ key: string; text: string | undefined }> = [];
+  const widgetCalls: Array<{ key: string; content: unknown }> = [];
+  const context = {
+    mode: 'tui',
+    model: { provider: 'openai-codex', api: 'openai-codex-responses', baseUrl: 'https://chatgpt.com/backend-api' },
+    modelRegistry: {
+      isUsingOAuth: () => true,
+      getProviderAuth: () => new Promise((resolve) => { resolveAuth = resolve; }),
+    },
+    ui: {
+      setStatus: (key: string, text: string | undefined) => statusCalls.push({ key, text }),
+      setWidget: (key: string, content: unknown) => widgetCalls.push({ key, content }),
+    },
+  };
+  const controller = new UsageController();
+
+  controller.handle(context);
+  controller.shutdown();
+  const callCountAfterShutdown = widgetCalls.length;
+  resolveAuth?.(auth());
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(widgetCalls.at(-1), { key: 'codex-usage-status', content: undefined });
+  assert.deepEqual(statusCalls.at(-1), { key: 'codex-usage-status', text: undefined });
+  assert.equal(widgetCalls.length, callCountAfterShutdown);
 });
 
 test('uses the fixed URL, manual redirects, and accepts only HTTP 200', async () => {
@@ -326,7 +423,7 @@ test('expires the scope lease before revalidating', async () => {
         return new Promise((resolve) => { resolveAuth = resolve; });
       },
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     now: () => clock,
@@ -373,7 +470,7 @@ test('model_select clears a same-provider snapshot before revalidation', async (
         return new Promise((resolve) => { secondAuthResolve = resolve; });
       },
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
@@ -409,7 +506,7 @@ test('replays a pending scope refresh after leaving and returning while auth is 
         return new Promise((resolve) => { resolvers.push(resolve); });
       },
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     fetch: async () => new Response(JSON.stringify(payload()), { status: 200 }),
@@ -445,7 +542,7 @@ test('drops stale pending scope refreshes when leaving Codex before auth settles
         return new Promise((resolve) => { resolvers.push(resolve); });
       },
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const otherModel = { ...codexModel, provider: 'other' };
   const otherContext = { ...context, model: otherModel };
@@ -484,7 +581,7 @@ test('replays a pending usage refresh after a model generation changes during fe
       isUsingOAuth: () => true,
       getProviderAuth: async () => auth(),
     },
-    ui: { setStatus: (_key: string, text: string | undefined) => statuses.push(text) },
+    ui: { setStatus: (_key: string, text: string | undefined) => { if (text !== undefined) statuses.push(text); }, setWidget: recordWidget(statuses) },
   };
   const controller = new UsageController({
     fetch: async () => {
@@ -511,7 +608,7 @@ test('replays a pending usage refresh after a model generation changes during fe
 test('does not resolve auth or create timers outside TUI/provider integrity gate', () => {
   let authCalls = 0;
   let timerCalls = 0;
-  const ui = { setStatus: () => {} };
+  const ui = { setStatus: () => {}, setWidget: () => {} };
   const controller = new UsageController({ setTimeout: () => { timerCalls += 1; return 1 as ReturnType<typeof setTimeout>; } });
   const context = {
     mode: 'rpc',

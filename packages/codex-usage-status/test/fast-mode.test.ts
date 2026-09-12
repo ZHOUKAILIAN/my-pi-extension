@@ -47,6 +47,7 @@ function context(modelValue = model(), overrides: Record<string, unknown> = {}):
     },
     ui: {
       setStatus: (key: string, text: string | undefined) => statuses.push({ key, text }),
+      setWidget: () => {},
       notify: (message: string, type?: string) => notices.push({ message, type }),
       theme: {
         fg: (color: string, text: string) => {
