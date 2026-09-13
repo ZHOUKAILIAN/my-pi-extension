@@ -2,9 +2,9 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `IMPLEMENTING` WIP / formal adoption blocked — 首版源码正在实现；正式 Reviewer `workerId` 不可核验，WIP 不可合并，当前安全 P1 等待可核验独立复核，真实 provider/TUI E2E 待验证 |
+| 状态 | `IMPLEMENTING` — 首版源码、focused tests、独立代码复审及 headless provider 创建+恢复 smoke 已完成；真实 TUI/retry/fallback/Fast child E2E 待验证。 |
 | 层级 | 第二层（L2）可视化设计页 |
-| 上游 | [Subagent Dispatcher 产品规范](../01-产品定义/扩展/subagent-扩展.md)、[Subagent Dispatcher 技术设计](subagent-dispatcher-技术设计.md)、[Adoption Decision](../归档/评审/2026-09-13-subagent-dispatcher-Adoption-Decision.md) |
+| 上游 | [Subagent Dispatcher 产品规范](../01-产品定义/扩展/subagent-扩展.md)、[Subagent Dispatcher 技术设计](subagent-dispatcher-技术设计.md) |
 | 目的 | 只呈现首版实现遵循的执行流程；源码和自动化测试已覆盖关键门禁，真实 provider/TUI E2E 仍未完成。 |
 
 ## 1. 创建与持久化决策

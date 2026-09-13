@@ -2,8 +2,8 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `BLOCKED_FORMAL_ADOPTION` — 当前源码为 WIP；正式 Reviewer `workerId` 不可核验，WIP 不可合并，待用户治理决定 |
-| 评审与采纳 | [2026-09-13 Adoption Decision](../../归档/评审/2026-09-13-subagent-dispatcher-Adoption-Decision.md)；该 Decision 引用两条独立 Review Artifact |
+| 状态 | `IMPLEMENTING` — 方案、独立代码评审与 headless Pi/provider 创建+恢复 smoke 已完成；TUI、瞬态 retry/fallback 与 Fast child E2E 待验证。 |
+| 评审记录 | [产品语义/指标 Review Artifact](../../归档/评审/2026-09-13-subagent-dispatcher-产品语义指标Review-Artifact.md)、[实现/运营 Review Artifact](../../归档/评审/2026-09-13-subagent-dispatcher-实现运营Review-Artifact.md) |
 | 层级 | 第一层（L1 Extension） |
 | 用户目标 | 委派专长子 Agent 时，默认保留其会话；模型瞬态失败后可在同一会话重试并切换备用模型，而非从头开始。 |
 | 入口 | 主 Pi Agent 的 `subagent` 工具；用户以自然语言委派、继续或要求换模型，不要求记忆 child session ID。 |
@@ -114,4 +114,4 @@ stateDiagram-v2
 
 本规范不定义 Pi CLI/RPC 参数、child session 文件路径、锁文件格式、错误正则、退避时长、JSON schema、前端渲染组件、GC 实现或测试代码。这些属于 [Subagent Dispatcher 技术设计](../../02-产品实现/subagent-dispatcher-技术设计.md)。
 
-[Adoption Decision](../../归档/评审/2026-09-13-subagent-dispatcher-Adoption-Decision.md) 保留真实 Review Artifact 和 WIP 实施方向，但当前为 `BLOCKED_FORMAL_ADOPTION`：正式 Reviewer `workerId` 不可核验，不能把本轮实现当作满足正式进入实现门禁，也不能合并 WIP；待用户治理决定。评审发生在未提交 WIP、基线 `e88085b`，没有固定 commit，且不可伪称完整原始工具逐字转录。当前安全 P1 仍是 `fixed_claimed`，需独立 code review 关闭；真实 provider、长时 TUI、PTY picker 和进程级崩溃恢复仍由 L2 明确记录为未验证。
+本 Extension 是通用 child dispatcher，不创建 Workflow Run、Node、Artifact 或 Worker；Core 中用于 Workflow Artifact 独立性的 `workerId` 不适用于此处。方案已由独立 `product_aligner` / `code_reviewer` 两轴评审，代码由 `implementer` 实现后再经独立 `code_reviewer` 复审。评审过程记录见[评审 Artifact](../../归档/评审/2026-09-13-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营 Review Artifact](../../归档/评审/2026-09-13-subagent-dispatcher-实现运营Review-Artifact.md)。headless Pi/provider 已验证默认持久 child 创建与同 handle 恢复；瞬态 retry/fallback、Fast child、长时 TUI、PTY picker 和进程级崩溃恢复仍由 L2 明确记录为未验证。

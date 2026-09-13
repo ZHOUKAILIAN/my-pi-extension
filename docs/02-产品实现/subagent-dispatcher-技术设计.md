@@ -2,11 +2,11 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `IMPLEMENTING` WIP / formal adoption blocked — `@pi/subagent` 源码与自动化实现中；正式 Reviewer `workerId` 不可核验，WIP 不可合并，当前安全 P1 等待可核验独立复核，真实 provider/TUI E2E 尚未验证 |
+| 状态 | `IMPLEMENTING` — `@pi/subagent` 源码、自动化测试与独立代码复审已完成；headless provider 创建+恢复 smoke 已验证，真实 TUI/retry/fallback/Fast child E2E 待验证。 |
 | 层级 | 第二层（L2） |
 | L1 owner | [Subagent Dispatcher Extension 产品规范](../01-产品定义/扩展/subagent-扩展.md) |
-| 目标 package | `@pi/subagent`（已新增；settings/local extension 接管待独立验证） |
-| 当前事实 | `packages/subagent/` 已提供 `@pi/subagent` package：保留单次/chain/parallel、agent discovery、project trust 和基础 UI；持久 child、临时 session、identity lock、JSON event 校验、瞬态预算/fallback、初始 partial JSONL quarantine、GC 与 Fast consumer 已有源码和 Node tests。Extension 在 `session_start` 以后台 best-effort 方式触发 30 天 GC，不阻塞主任务。尚未修改 `~/.pi/agent/settings.json`，未替换未版本化 local dispatcher。 |
+| 目标 package | `@pi/subagent`（已新增；本地安装/切换属于第五层操作） |
+| 当前事实 | `packages/subagent/` 已提供 `@pi/subagent` package：保留单次/chain/parallel、agent discovery、project trust 和基础 UI；持久 child、临时 session、identity lock、JSON event 校验、瞬态预算/fallback、初始 partial JSONL quarantine、GC 与 Fast consumer 已有源码和 Node tests。Extension 在 `session_start` 以后台 best-effort 方式触发 30 天 GC，不阻塞主任务。 |
 
 ## 1. 结论先行
 
@@ -36,16 +36,16 @@ flowchart TD
 
 | 位置 | 责任 | 当前状态 |
 | --- | --- | --- |
-| `packages/subagent/src/index.ts` | Pi extension factory、tool schema、TUI renderer、parent lifecycle。 | 已实现，未接管 settings；Pi entry 仍为 `src/index.ts` |
+| `packages/subagent/src/index.ts` | Pi extension factory、tool schema、TUI renderer、parent lifecycle。 | 已实现；Pi entry 为 `src/index.ts` |
 | `packages/subagent/src/agents.ts` | user/project agent discovery、frontmatter 和策略解析。 | 已实现并测试 |
 | `packages/subagent/src/session-identity.ts` | logical handle、child session 路径/身份派生与 parent/cwd/agent 隔离。 | 已实现并测试 |
-| `packages/subagent/src/runner.ts` | JSON-mode child lifecycle、stdout capture、完整 JSONL 校验、重试、fallback、错误分类。 | 已实现并测试（真实 child/provider E2E 待验证） |
+| `packages/subagent/src/runner.ts` | JSON-mode child lifecycle、stdout capture、完整 JSONL 校验、重试、fallback、错误分类。 | 已实现并测试；headless child/provider 创建+恢复 smoke 已通过，瞬态失败路径待真实验证。 |
 | `packages/subagent/src/session-lock.ts` | 以 identity key 原子 claim，覆盖首次 registry 创建、恢复、运行与 GC 的跨父进程互斥；记录 dispatcher 与 Pi child PID、child session identity 和恢复路径；owner 消失后只有在 starting grace 结束、PID 不存在且可读进程表未找到匹配 `--session-id`/`--session` 的 Pi child 时才接管。 | 已实现并测试；进程表不可读、身份/路径缺失或仍在 grace 窗口时一律 busy |
 | `packages/subagent/src/gc.ts` | 30 天本地 child session / metadata 清理。 | 已实现并测试 |
 | `packages/subagent/test/*.test.ts` | identity、策略、retry、fallback、lock、GC、Fast compatibility。 | 已实现：agent/dispatcher/runner/lock/GC/Fast/JSON fixtures；有 producer workspace 时通过 `@pi/codex-usage-status/interop` public subpath 验证协议可解析；无 producer 时验证 adapter 安全 Off |
-| `~/.pi/agent/extensions/subagent/` | 当前未版本化 dispatcher。 | 本轮只迁移源码能力；按任务要求保留，未修改且未与新 package 同时接管 settings。 |
+| 本地安装状态 | 不属于 Git 仓库事实。 | 同名旧 extension 必须在本机停用或移出 extension discovery 后，才能加载 `@pi/subagent`。 |
 
-迁移完成前，现有 settings 继续加载旧 local extension；新 package 不得同时注册同名 `subagent` tool。切换属于 L3 安装/配置变更，必须在独立验证后执行。
+迁移 package 已完成。真实 headless child/provider 创建+恢复 smoke 已通过；TUI、瞬态 retry/fallback 和 Fast child E2E 仍需独立验证。
 
 ## 3. Tool 与 agent 配置合同
 
@@ -163,8 +163,8 @@ GC 只处理 Dispatcher 管理的 child session/lock/metadata。Extension 在每
 | observability | Pi 0.84.4 JSON fixture 覆盖 `session`、`message_end`、`tool_execution_end.result`；provider/requestedModel/actualModel/attempt/分类诊断和脱敏 tool result 可见且无 task/prompt/cwd/path/token/Cookie/header/raw body/嵌套诊断；runner probe 覆盖 `Cookie_EQUALS_SECRET`、`Set-Cookie=`、`X-Trace-Header`、suffix `Header` 与嵌套 assistant echo。 |
 | local state | 30 天 GC 已接入 Extension `session_start` 后台路径；live child lock 不删、GC/resume 竞态锁内复核+tombstone；初始 partial/后续截断 JSONL 以 `quarantined` registry 保持 GC 可达并由同一 identity lock 清理；tombstone 存在时 dispatch 不建新 registry，GC 先删 session + metadata 后删 tombstone；stale lock 还需通过 starting grace + PID + session UUID/path 进程扫描确认 child 不存在后才接管。 |
 | Fast | producer workspace 存在时，新 logical child 的首次 spawn 才可 exact eligibility/one-shot env 继承；retry/fallback/resume 的环境均为 Off；producer 缺失时 dynamic adapter 加载失败并安全 Off；event/config/env contract 有测试。 |
-| E2E | 真实 Pi TUI + provider：制造一次可观察瞬态失败，验证 child 可恢复、模型切换、无 session 串话和 Fast 条件；单元测试不能替代。 |
+| E2E | 已完成 headless Pi JSON + provider：默认持久 child 创建及同 handle 恢复。仍需真实 Pi TUI + provider 制造一次可观察瞬态失败，验证 retry、模型切换、无 session 串话和 Fast 条件；单元测试和本 smoke 均不能替代。 |
 
 本轮 S9 证据由真实 `dispatchAgent` 路径或等价注入的 child spawn 提供：首次持久 identity 创建的 registry 只有一个 winner；持久 session resume 与 GC 共享 identity lock；`persistent:false` 的候选耗尽、非瞬态、task、cancel 都在 finally 后清理；fallback、override、resume 的 Fast 均为 Off。当前测试进程通过原子 `open(..., "wx")` 的交错验证竞态，但尚未启动两个独立 Node 进程执行首次 registry 创建/真实 Pi provider；这仍是明确的跨进程验证缺口，不把单进程证据表述为双进程 E2E。
 
-当前 `@pi/subagent` package、可恢复 child session、retry/fallback runner、lock/GC/Fast consumer 和自动化测试已经存在；30 天 GC 已由 Extension 生命周期后台触发。`@pi/codex-usage-status` 是 optional peer，Fast 通过 public `./interop` 的安全 dynamic adapter 按 producer 可用性启用；独立 packed subagent 不预装 producer 的安装与 Pi/jiti 加载已验证。当前 drift 为：正式 adoption 被 `BLOCKED_FORMAL_ADOPTION` 阻塞（当前 host 无法提供/核验正式 Reviewer `workerId`，WIP 不可合并），未修改 `~/.pi/agent/settings.json`，新 package 尚未替换 `~/.pi/agent/extensions/subagent/`；真实 provider、TUI、进程崩溃回放、跨进程首次创建和 Fast child-process/provider E2E 仍未验证。
+当前 `@pi/subagent` package、可恢复 child session、retry/fallback runner、lock/GC/Fast consumer 和自动化测试已经存在；30 天 GC 已由 Extension 生命周期后台触发。`@pi/codex-usage-status` 是 optional peer，Fast 通过 public `./interop` 的安全 dynamic adapter 按 producer 可用性启用；独立 packed subagent 不预装 producer 的安装与 Pi/jiti 加载已验证。Subagent Dispatcher 是通用 child session，不创建 Workflow Run/Artifact，因此 Workflow 的 `workerId` 采纳门禁不适用；方案和代码独立复审均已完成。headless Pi JSON + provider 已验证默认 child 创建和同 handle 恢复。当前 drift 为：真实 TUI、瞬态 retry/fallback、进程崩溃回放、跨进程首次创建和 Fast child-process/provider E2E 仍未验证。

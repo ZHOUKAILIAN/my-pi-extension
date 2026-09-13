@@ -70,7 +70,7 @@ Pi 会串行调用 `message_end` handlers。支持的组合要求：没有其他
 
 ### 3.3 Parent-Fast interop 当前机制
 
-`src/interop.ts` 定义版本化 channel `@pi/codex-usage-status:fast-requested/v1`、环境名 `PI_CODEX_FAST`、严格 plain-object parser 和安全发布 helper。`index.ts` 在 `session_start` 发布当前 requested，合法且状态改变的 `/fast on|off|toggle` 后发布刷新，`status`、非法参数和 `hasUI=false` 命令不发布，session id 读取失败时 fail closed；`session_shutdown` 发布 false。Fast 激活/模型重新变为 Active 的通知明确提示 selected user `implementer`/`code_reviewer` 的新 spawn 会继承 requested Fast，并保留紧凑 orange 通知。
+`src/interop.ts` 定义版本化 channel `@pi/codex-usage-status:fast-requested/v1`、环境名 `PI_CODEX_FAST`、严格 plain-object parser 和安全发布 helper；package 通过 `@pi/codex-usage-status/interop` public subpath 暴露这些 producer 协议符号，同时保留 Pi manifest 的 `src/index.ts` extension 入口。`index.ts` 在 `session_start` 发布当前 requested，合法且状态改变的 `/fast on|off|toggle` 后发布刷新，`status`、非法参数和 `hasUI=false` 命令不发布，session id 读取失败时 fail closed；`session_shutdown` 发布 false。Fast 激活/模型重新变为 Active 的通知明确提示 selected user `implementer`/`code_reviewer` 的新 spawn 会继承 requested Fast，并保留紧凑 orange 通知。
 
 factory 启动立即消费 `PI_CODEX_FAST`：仅精确字符串 `"1"` 初始化 requested On，随后无论取值为何删除变量；该变量不会进入 child 的 shell、grandchild 或 reload。它是 advisory trusted-launcher input，不是认证、安全边界或持久化机制。其余 provider/API/base URL/OAuth/model eligibility 仍由 child 自己判断，因此 parent requested On 的 Inactive 不会阻止 eligible child Active；child reload/new/resume/fork 由新 factory 回到 Off。
 
