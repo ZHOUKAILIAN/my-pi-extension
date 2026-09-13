@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
+import type { AttemptDiagnostics } from "./runner.ts";
 
 export const IDENTITY_VERSION = "subagent-v1";
 
@@ -35,6 +36,7 @@ export interface SessionRegistry {
     source: "initial" | "retry" | "fallback" | "user_override";
     kind?: string;
     reason?: string;
+    diagnostics?: AttemptDiagnostics;
   }>;
 }
 
@@ -73,10 +75,18 @@ const ATTEMPT_SOURCES = new Set<SessionRegistry["attempts"][number]["source"]>([
   "fallback",
   "user_override",
 ]);
-const ATTEMPT_KINDS = new Set(["success", "transient_provider", "non_transient_provider", "task_failure", "cancelled", "unknown_transport"]);
-const ATTEMPT_REASONS = new Set(["fetch failed", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "timeout", "HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504", "provider request failed", "task failure", "cancelled", "child process failed"]);
+const ATTEMPT_KINDS = new Set(["success", "incomplete", "transient_provider", "non_transient_provider", "task_failure", "cancelled", "unknown_transport"]);
+const ATTEMPT_REASONS = new Set(["fetch failed", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "timeout", "HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504", "provider request failed", "task failure", "cancelled", "output truncated", "child process failed"]);
 const REGISTRY_KEYS = new Set(["version", "key", "parentSessionId", "agentName", "handle", "childSessionId", "status", "createdAt", "lastActivityAt", "attempts"]);
-const ATTEMPT_KEYS = new Set(["requestedModel", "actualModel", "attempt", "source", "kind", "reason"]);
+const ATTEMPT_KEYS = new Set(["requestedModel", "actualModel", "attempt", "source", "kind", "reason", "diagnostics"]);
+
+function isDiagnostics(value: unknown): value is AttemptDiagnostics {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const diagnostics = value as Record<string, unknown>;
+  return Object.keys(diagnostics).every((key) => key === "toolErrorCount" || key === "providerErrorCount") &&
+    Number.isSafeInteger(diagnostics.toolErrorCount) && (diagnostics.toolErrorCount as number) >= 0 &&
+    Number.isSafeInteger(diagnostics.providerErrorCount) && (diagnostics.providerErrorCount as number) >= 0;
+}
 
 function isString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
@@ -102,7 +112,8 @@ export function isValidSessionRegistry(value: unknown): value is SessionRegistry
       ATTEMPT_SOURCES.has(item.source as SessionRegistry["attempts"][number]["source"]) &&
       isString(item.requestedModel) && isString(item.actualModel) &&
       (item.kind === undefined || ATTEMPT_KINDS.has(item.kind as string)) &&
-      (item.reason === undefined || ATTEMPT_REASONS.has(item.reason as string));
+      (item.reason === undefined || ATTEMPT_REASONS.has(item.reason as string)) &&
+      (item.diagnostics === undefined || isDiagnostics(item.diagnostics));
   });
 }
 

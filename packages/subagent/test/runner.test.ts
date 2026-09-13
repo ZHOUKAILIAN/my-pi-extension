@@ -47,6 +47,20 @@ test("attempt projection excludes task, cwd, stderr and preserves only a safe cw
   assert.equal(JSON.stringify(projected).includes("FULL PROMPT"), false);
 });
 
+test("diagnostic sanitizer allowlists counters and keeps missing legacy counters unknown", () => {
+  const base = {
+    agent: "implementer", agentSource: "user", exitCode: 0, messages: [], toolResults: [],
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
+    requestedModel: "model-a", actualModel: "unknown", source: "initial", attempt: 1, failureKind: "success",
+    phase: "finished", diagnostics: { toolErrorCount: 2, providerErrorCount: 1, leaked: "secret" },
+    cwdScope: "cwd:unknown",
+  } as any;
+  const projected = sanitizeAttemptResult(base);
+  assert.equal(projected.diagnostics, undefined);
+  const legacy = sanitizeAttemptResult({ ...base, diagnostics: undefined });
+  assert.equal(legacy.diagnostics, undefined);
+});
+
 test("session validation parses every JSONL record and rejects a truncated second row", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   const file = path.join(root, "session.jsonl");
@@ -112,11 +126,122 @@ test("tool execution events must carry the Pi result field", async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("stderr transient errors are classified by the runner", async () => {
+test("a tool error is bounded process diagnostics and does not fail a normal return", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "tool_execution_end", toolCallId: "1", toolName: "bash", result: { exitCode: 1 }, isError: true },
+    terminal("stop", { content: [{ type: "text", text: "The report is complete." }] }),
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  assert.equal(attempt.phase, "finished");
+  assert.deepEqual(attempt.diagnostics, { toolErrorCount: 1, providerErrorCount: 0 });
+  assert.equal((attempt.messages[0] as any).content[0].text, "The report is complete.");
+  assert.equal(attempt.errorMessage, undefined);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("a later tool event invalidates an earlier stop candidate", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(), terminal("stop"),
+    { type: "tool_execution_start", toolCallId: "1", toolName: "bash", args: {} },
+    { type: "tool_execution_end", toolCallId: "1", toolName: "bash", result: {}, isError: false },
+  ]));
+  assert.equal(attempt.failureKind, "unknown_transport");
+  assert.equal(attempt.phase, "finished");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("an assistant message start after stop requires a new terminal", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(), terminal("stop"), { type: "message_start", message: { role: "assistant", content: [] } },
+  ]));
+  assert.equal(attempt.failureKind, "unknown_transport");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("an assistant toolUse message after stop is not a terminal", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(), terminal("stop"), terminal("toolUse", { content: [{ type: "toolCall", id: "1", name: "bash", arguments: {} }] }),
+  ]));
+  assert.equal(attempt.failureKind, "unknown_transport");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("an aborted terminal with signal close is unknown transport, not cancelled", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [header(), terminal("aborted")], null));
+  assert.equal(attempt.failureKind, "unknown_transport");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("a tool 503 cannot override a final non-transient provider error", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "tool_execution_end", toolCallId: "1", toolName: "request", result: {}, isError: true, status: 503 },
+    terminal("error", { status: 401, errorMessage: "authentication failed" }),
+  ], 1, "HTTP 503 from an old tool result"));
+  assert.equal(attempt.failureKind, "non_transient_provider");
+  assert.equal(attempt.errorMessage, "provider request failed");
+  assert.deepEqual(attempt.diagnostics, { toolErrorCount: 1, providerErrorCount: 1 });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("a provider error followed by a new stop returns the new assistant report", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    terminal("error", { errorMessage: "fetch failed" }),
+    { type: "message_start", message: { role: "assistant", content: [] } },
+    terminal("stop", { content: [{ type: "text", text: "Recovered report" }] }),
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  assert.equal(attempt.errorMessage, undefined);
+  assert.equal(attempt.diagnostics?.providerErrorCount, 1);
+  assert.equal(finalAssistantText(attempt), "Recovered report");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("length and aborted terminal messages are not normal success", async () => {
+  for (const [stopReason, expected] of [["length", "incomplete"], ["aborted", "cancelled"]] as const) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+    const attempt = await runPiAttempt(await options(root, [header(), terminal(stopReason)], 0));
+    assert.equal(attempt.failureKind, expected);
+    assert.equal(attempt.phase, "finished");
+    assert.equal((attempt.messages[0] as any).content[0].text, "done");
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("diagnostic counts stay accurate when tool details are capped", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const toolEvents = Array.from({ length: 101 }, (_, index) => ({
+    type: "tool_execution_end", toolCallId: String(index), toolName: "bash", result: { index }, isError: true,
+  }));
+  const attempt = await runPiAttempt(await options(root, [header(), ...toolEvents, terminal()]));
+  assert.equal(attempt.failureKind, "success");
+  assert.equal(attempt.toolResults.length, 100);
+  assert.equal(attempt.diagnostics?.toolErrorCount, 101);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+function finalAssistantText(attempt: { messages: any[] }): string {
+  for (let index = attempt.messages.length - 1; index >= 0; index -= 1) {
+    const message = attempt.messages[index];
+    if (message.role === "assistant") return message.content?.[0]?.text ?? "";
+  }
+  return "";
+}
+
+test("stderr alone cannot classify a provider error", async () => {
   for (const value of ["fetch failed", "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "explicit timeout", "HTTP 429", "status 502", "code 503", "response 504"]) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
     const attempt = await runPiAttempt(await options(root, [header(), terminal("error")], 1, value));
-    assert.equal(attempt.failureKind, "transient_provider", value);
+    assert.equal(attempt.failureKind, "non_transient_provider", value);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
@@ -221,7 +346,8 @@ test("task echoes, raw bodies, headers, and nested diagnostics never cross the r
   const serialized = JSON.stringify(attempt);
   assert.equal(JSON.stringify(updates).includes(task), false);
   assert.equal(JSON.stringify(updates).includes(secret), false);
-  assert.equal(attempt.failureKind, "task_failure");
+  assert.equal(attempt.failureKind, "success");
+  assert.deepEqual(attempt.diagnostics, { toolErrorCount: 1, providerErrorCount: 0 });
   assert.equal(serialized.includes(task), false);
   assert.equal(serialized.includes(secret), false);
   assert.equal(serialized.includes("RAW_BODY_SENTINEL"), false);
@@ -231,12 +357,12 @@ test("task echoes, raw bodies, headers, and nested diagnostics never cross the r
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("raw child stderr participates in the closed transient allowlist", async () => {
-  for (const [stderr, expected] of [["fetch failed; Authorization: secret", "fetch failed"], ["provider ETIMEDOUT while connecting", "ETIMEDOUT"]] as const) {
+test("raw child stderr is never used as terminal provider classification", async () => {
+  for (const stderr of ["fetch failed; Authorization: secret", "provider ETIMEDOUT while connecting"] as const) {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
     const attempt = await runPiAttempt(await options(root, [header(), terminal("error")], 1, stderr));
-    assert.equal(attempt.failureKind, "transient_provider", stderr);
-    assert.equal(attempt.errorMessage, expected);
+    assert.equal(attempt.failureKind, "non_transient_provider", stderr);
+    assert.equal(attempt.errorMessage, "provider request failed");
     assert.equal(Object.prototype.hasOwnProperty.call(attempt, "stderr"), false);
     await fs.rm(root, { recursive: true, force: true });
   }

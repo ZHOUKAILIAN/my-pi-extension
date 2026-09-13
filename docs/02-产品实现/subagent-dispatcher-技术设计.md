@@ -115,19 +115,21 @@ runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和 P
 
 同一 identity 运行中再次委派应返回 session-busy，不允许两个 child 进程同时写同一历史。进程崩溃导致的 stale lock 只能在确认 child 已不存在后清理；不得自动删除未知存活进程的锁。当前实现的保守窗口是：`starting` 标记后默认 5 秒内不接管；窗口后检查记录 PID，并扫描同主机进程表中带匹配 `--mode json --session-id <childSessionId>` 或恢复用绝对 `--session <sessionPath>` 的 child。进程表失败、旧 lock 缺少可匹配 identity/path、PID 检查返回非 `ESRCH` 或发现匹配命令时均保持 busy；只有完整扫描成功且没有匹配 child 才允许接管。该机制只证明可观察到的同主机 Pi CLI 进程不存在，不等价于 OS sandbox，也不能覆盖进程表权限、平台命令差异或扫描竞态；真实跨进程崩溃回放仍未验证。
 
-## 5. 错误分类、重试与 fallback
+## 5. 执行结果分类、重试与 fallback
 
-错误分类仅决定 provider request 的重试控制，不替代 child 的任务结论。
+`FailureKind` 是唯一执行结果分类，表示 child 的协议/进程/模型请求是否正常结束，不表示任务目标或业务验收是否通过。错误分类仅决定 provider request 的重试控制，不替代 child 的任务结论。有效协议、退出码 0 且当前最终助手 `stop` 为 `success`；工具异常只进入有界诊断，不产生 `task_failure`。
+
+当前 attempt 的 `phase` 仅表示生命周期：调用期间为 `running`，完成裁决后为 `finished`。`diagnostics` 为可选兼容字段，包含 `toolErrorCount` 与 `providerErrorCount`；新 runner 始终输出非负安全整数，旧记录缺失时为“未提供”而不是 0。工具详情最多保留 100 条，但计数按全部 `tool_execution_end` 事件计算。
 
 | 类别 | 判定来源 | 处理 |
 | --- | --- | --- |
 | `transient_provider` | 仅 terminal provider error 的 `fetch failed`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、明确 timeout，或结构化/文本 HTTP 429/502/503/504 | 当前模型额外重试最多两次，采用有上限的退避；随后切下一个候选模型。 |
 | `non_transient_provider` | 不存在、无可用渠道、未认证、模型不可用、401/403、请求合同错误 | 不重试、不切换 fallback；持久 child 保留供用户明确继续，临时 child 返回诊断后删除。 |
-| `task_failure` | child 已得到模型响应，任务工具/测试/合同失败 | 立即返回且不得自动重试或切模型；持久 child 保留任务事实，临时 child 返回后删除。 |
+| `task_failure` | 旧历史或外部注入的兼容结果 | 继续按现有非重试失败映射读取；runner 不再由工具事件产生。child 正常返回的业务失败报告仍为 `success`。 |
 | `cancelled` | parent abort / 用户取消 | 立即停止；仅持久 child 保留，临时 child 删除；不得自动恢复。 |
 | `unknown_transport` | 无法安全归类的 launcher/process 异常、signal exit、空 stdout、缺失 terminal JSON 或截断 JSONL | 记录诊断且不无限循环；持久 child 可供明确继续，临时 child 返回诊断后删除。 |
 
-分类优先级固定为：用户 cancel → 已完成模型响应后的 task/tool failure → allowlist status/code 的 transient provider → non-transient provider → unknown transport；不得用“等”或未知错误扩大 allowlist。每次 retry/fallback 都在同一 child session 内追加新的 prompt turn；不会重新以空上下文启动。重试次数是每个候选模型独立计数。所有候选用尽时，`persistent !== false` 返回 `recoverable_failed` 并保留 session、工作树和已捕获输出；`persistent:false` 仅返回尝试诊断，finally 删除临时 storage，不返回 handle 或继续入口。
+当前 attempt 的裁决顺序固定为：本地 abort → spawn/流式 JSON/header/身份校验失败、空输出、畸形记录、signal close(code=null) 或缺当前有效最终助手候选的 `unknown_transport`（非本地 signal close 覆盖 `aborted`）→最终助手 `aborted` →最终助手 `error`（只读该消息自身的类型化 `status`/`errorMessage`，不读旧工具状态、旧错误或 stderr）→stop/length 但进程非零的 `unknown_transport`→最终 `length` 的 `incomplete`→最终 `stop` 的 `success`。最新候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除。每个 retry/fallback 都在同一 child session 内追加新的 prompt turn；不会重新以空上下文启动。重试次数是每个候选模型独立计数，原有闭集 allowlist 与每模型初始+2预算不扩大。所有候选用尽时，`persistent !== false` 返回 `recoverable_failed` 并保留 session、工作树和已捕获输出；`persistent:false` 仅返回尝试诊断，finally 删除临时 storage，不返回 handle 或继续入口。
 
 ## 6. 模型切换与 Fast 兼容
 
@@ -139,7 +141,7 @@ runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和 P
 
 ## 7. 可观测、本地状态与 GC
 
-默认 TUI 只显示用户可行动的进度；展开详情/Tool details 保存可复核记录：agent、`persistent`、logical handle、session identity 的安全引用、cwd scope、候选模型、requested/actual 模型、attempt、分类错误、child stop reason、`tool_execution_end.result` 的有限 type/length/hash 投影与 capture 截断标记。tool result 必须保留该有限摘要和短哈希，不能只保留存在性。
+默认 TUI 只显示用户可行动的进度；展开详情/Tool details 保存可复核记录：agent、`persistent`、logical handle、session identity 的安全引用、cwd scope、候选模型、requested/actual 模型、attempt、`phase`、可选诊断计数、分类错误、child stop reason、`tool_execution_end.result` 的有限 type/length/hash 投影与 capture 截断标记。registry attempt 摘要、parent metadata 与 tool details 通过同一严格白名单保留可选 diagnostics；缺字段的旧记录仍合法。tool result 必须保留该有限摘要和短哈希，不能只保留存在性。
 
 敏感 provider token、Cookie/Set-Cookie、headers、原始 HTML/error body、嵌套诊断、task/完整 prompt 与未脱敏路径不得写入 AttemptResult、retry metadata、Tool details 或渲染输出。assistant 文本中的 `Cookie=`、`Set-Cookie=`、任意 `X-...` header 和 `...Header=`/`...Header:` 形式（包括嵌套/assistant echo）也必须在投影边界严格 redaction，同时保留正常 assistant final result。tool args 只以字段白名单和哈希引用展示；cwd 只以安全 scope 展示。child 原始 Pi session 仍遵循 Pi 自身 session 安全边界；Dispatcher 只新增最小索引和尝试摘要。
 
@@ -158,9 +160,9 @@ GC 只处理 Dispatcher 管理的 child session/lock/metadata。Extension 在每
 | --- | --- |
 | 兼容 | 现有 single/parallel/chain、agent discovery、project trust、工具 allowlist、输出截断不回归。 |
 | session | 默认 `persistent: true`、新 handle、显式恢复、registry 创建双进程竞态、文件/header 缺失 fail-closed、有效 header + 截断第二行的完整 JSONL quarantine、不可 resume/空建、tombstone 存在时 `cleanup-pending` dispatch 与 GC 清理顺序、30 天删除与不可 resume、parent/cwd/agent 隔离、`persistent: false` 调用内 retry、session busy、stale lock；focused lock tests 覆盖 starting grace、不可判定扫描保持 busy，以及 session UUID/path 命中保持 busy。 |
-| retry | transient 每模型恰好初始+2次；allowlist 全量正反例与优先级；退避可注入时钟；task failure/cancel 不重试；signal exit、空 stdout、截断 JSONL 均不误报成功。 |
+| retry | transient 每模型恰好初始+2次；allowlist 全量正反例与优先级；退避可注入时钟；`incomplete`/正常工具错误/cancel 不重试；旧 tool 503 + 最终非瞬态 error 不污染 retry；signal exit、空 stdout、截断 JSONL 均不误报成功。 |
 | fallback | 候选顺序、去重、仅 transient 触发切换、每模型独立预算、耗尽后 recoverable failed、用户 override。 |
-| observability | Pi 0.84.4 JSON fixture 覆盖 `session`、`message_end`、`tool_execution_end.result`；provider/requestedModel/actualModel/attempt/分类诊断和脱敏 tool result 可见且无 task/prompt/cwd/path/token/Cookie/header/raw body/嵌套诊断；runner probe 覆盖 `Cookie_EQUALS_SECRET`、`Set-Cookie=`、`X-Trace-Header`、suffix `Header` 与嵌套 assistant echo。 |
+| observability | Pi 0.84.4 JSON fixture 覆盖 `session`、`message_end`、`tool_execution_end.result`；provider/requestedModel/actualModel/attempt/`phase`/可选诊断计数/分类诊断和脱敏 tool result 可见且无 task/prompt/cwd/path/token/Cookie/header/raw body/嵌套诊断；计数不因详情上限归零；runner probe 覆盖 `Cookie_EQUALS_SECRET`、`Set-Cookie=`、`X-Trace-Header`、suffix `Header` 与嵌套 assistant echo。 |
 | local state | 30 天 GC 已接入 Extension `session_start` 后台路径；live child lock 不删、GC/resume 竞态锁内复核+tombstone；初始 partial/后续截断 JSONL 以 `quarantined` registry 保持 GC 可达并由同一 identity lock 清理；tombstone 存在时 dispatch 不建新 registry，GC 先删 session + metadata 后删 tombstone；stale lock 还需通过 starting grace + PID + session UUID/path 进程扫描确认 child 不存在后才接管。 |
 | Fast | producer workspace 存在时，新 logical child 的首次 spawn 才可 exact eligibility/one-shot env 继承；retry/fallback/resume 的环境均为 Off；producer 缺失时 dynamic adapter 加载失败并安全 Off；event/config/env contract 有测试。 |
 | E2E | 已完成 headless Pi JSON + provider：默认持久 child 创建及同 handle 恢复。仍需真实 Pi TUI + provider 制造一次可观察瞬态失败，验证 retry、模型切换、无 session 串话和 Fast 条件；单元测试和本 smoke 均不能替代。 |

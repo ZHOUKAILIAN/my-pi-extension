@@ -45,7 +45,31 @@ function finalOutput(messages: Message[]): string {
 }
 
 function failed(result: SingleResult): boolean { return result.failureKind !== "success"; }
-function output(result: SingleResult): string { return failed(result) ? result.errorMessage || "(no output)" : finalOutput(result.messages) || "(no output)"; }
+function diagnosticSummary(result: Pick<AttemptResult, "diagnostics">): string {
+  const toolErrors = result.diagnostics?.toolErrorCount ?? "未提供";
+  const providerErrors = result.diagnostics?.providerErrorCount ?? "未提供";
+  return `[执行诊断：不代表验收结论；工具异常 ${toolErrors}；模型异常 ${providerErrors}]`;
+}
+function executionLabel(result: Pick<AttemptResult, "phase" | "failureKind">): string {
+  if (result.phase === "running") return "执行中";
+  switch (result.failureKind) {
+    case "success": return "已返回";
+    case "incomplete": return "未完整返回（长度截断）";
+    case "cancelled": return "已取消";
+    case "transient_provider": return "执行失败（瞬态模型错误）";
+    case "non_transient_provider": return "执行失败（模型错误）";
+    case "task_failure": return "旧任务失败";
+    default: return "执行失败（传输异常）";
+  }
+}
+function output(result: SingleResult): string {
+  const report = finalOutput(result.messages);
+  if (result.phase === "running") return report || "执行中";
+  const body = report || (result.errorMessage ?? "(no output)");
+  const label = executionLabel(result);
+  const failureLabel = result.failureKind === "success" || result.failureKind === "incomplete" ? label : `${label}（未完整返回）`;
+  return `${body}\n\n${failureLabel}\n${diagnosticSummary(result)}`;
+}
 function truncate(value: string): string {
   if (Buffer.byteLength(value, "utf8") <= PER_TASK_OUTPUT_CAP) return value;
   let result = value.slice(0, PER_TASK_OUTPUT_CAP);
@@ -141,6 +165,7 @@ export function subagentSessionMetadata(result: DispatchResult, agent: string): 
     attempt: attempt.attempt,
     source: attempt.source,
     kind: attempt.failureKind,
+    ...(attempt.diagnostics ? { diagnostics: attempt.diagnostics } : {}),
   };
   if (attempt.errorMessage) summary.reason = attempt.errorMessage;
   return {
@@ -194,23 +219,28 @@ export async function runSubagentModes(
     let previous = "";
     for (let index = 0; index < input.chain.length; index += 1) {
       const item = input.chain[index];
-      const nextItem = { ...item, task: item.task.replace(/\{previous\}/g, previous) };
+      const diagnostic = results.length > 0 ? diagnosticSummary(results.at(-1)!) : "";
+      const hasPrevious = item.task.includes("{previous}");
+      const nextTask = item.task.replace(/\{previous\}/g, previous);
+      const nextItem = { ...item, task: hasPrevious || results.length === 0 ? nextTask : `${nextTask}\n\n${diagnostic}` };
       const result = sanitizeSingleResult(await runOne(nextItem, index + 1), [nextItem.task]);
       results.push(result);
       if (failed(result)) return { content: [{ type: "text", text: `Chain stopped at step ${index + 1} (${item.agent}): ${output(result)}` }], details: details(results), isError: true };
-      previous = finalOutput(result.messages);
+      previous = `${finalOutput(result.messages) || "(no output)"}\n\n${diagnosticSummary(result)}`;
     }
-    return { content: [{ type: "text", text: previous || "(no output)" }], details: details(results) };
+    const last = results.at(-1);
+    const report = last ? finalOutput(last.messages) || "(no output)" : "(no output)";
+    return { content: [{ type: "text", text: last ? `${report}\n\n已返回\n${diagnosticSummary(last)}` : "(no output)" }], details: details(results) };
   }
   if (input.tasks?.length) {
     if (input.tasks.length > MAX_PARALLEL_TASKS) return { content: [{ type: "text", text: `Too many parallel tasks (${input.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.` }], details: details([]) };
     const results = await mapLimit(input.tasks, MAX_CONCURRENCY, async (item) => sanitizeSingleResult(await runOne(item), [item.task]));
-    const success = results.filter((result) => !failed(result)).length;
-    return { content: [{ type: "text", text: `Parallel: ${success}/${results.length} succeeded\n\n${results.map((result) => `### [${result.agent}] ${failed(result) ? "failed" : "completed"}\n\n${truncate(output(result))}`).join("\n\n---\n\n")}` }], details: details(results) };
+    const returned = results.filter((result) => !failed(result)).length;
+    return { content: [{ type: "text", text: `Parallel: ${returned}/${results.length} 已返回\n\n${results.map((result) => `### [${result.agent}] ${executionLabel(result)}\n\n${truncate(output(result))}`).join("\n\n---\n\n")}` }], details: details(results) };
   }
   if (!input.single) return { content: [{ type: "text", text: "Invalid parameters. Provide exactly one mode." }], details: details([]), isError: true };
   const result = sanitizeSingleResult(await runOne(input.single), [input.single.task]);
-  return { content: [{ type: "text", text: failed(result) ? `Agent ${result.failureKind}: ${output(result)}` : finalOutput(result.messages) || "(no output)" }], details: details([result]), isError: failed(result) };
+  return { content: [{ type: "text", text: output(result) }], details: details([result]), isError: failed(result) };
 }
 
 async function mapLimit<T, R>(items: T[], limit: number, fn: (item: T, index: number) => Promise<R>): Promise<R[]> {
@@ -273,7 +303,7 @@ export default function subagentExtension(pi: ExtensionAPI): void {
           const fake: DispatchResult = { ...({} as DispatchResult), attempt: { agent: item.agent, agentSource: "unknown", exitCode: null, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, requestedModel: "unknown", actualModel: "unknown", source: "initial", attempt: 0, failureKind: "unknown_transport", errorMessage: "Unknown agent", cwdScope: "cwd:unknown" }, attempts: [], persistent: item.persistent ?? DEFAULT_PERSISTENT, status: "invalid", failureKind: "unknown_transport", error: "unknown agent" };
           return toResult(fake, step, [item.task]);
         }
-        const result = await dispatchAgent({ parentSessionId: ctx.sessionManager.getSessionId(), parentModel, agent, task: item.task, cwd: path.resolve(item.cwd ?? ctx.cwd), model: item.model, session: item.session, persistent: item.persistent, defaultPersistent: params.persistent ?? DEFAULT_PERSISTENT, signal, fast: fastConsumer, onUpdate: (attempt) => onUpdate?.({ content: [{ type: "text", text: finalOutput(attempt.messages) || "(running...)" }], details: details([toResult({ attempt, attempts: [attempt], persistent: item.persistent ?? agent.persistent ?? DEFAULT_PERSISTENT, status: "failed", failureKind: attempt.failureKind }, step, [item.task])]) }) }, { rootDir: stateRoot });
+        const result = await dispatchAgent({ parentSessionId: ctx.sessionManager.getSessionId(), parentModel, agent, task: item.task, cwd: path.resolve(item.cwd ?? ctx.cwd), model: item.model, session: item.session, persistent: item.persistent, defaultPersistent: params.persistent ?? DEFAULT_PERSISTENT, signal, fast: fastConsumer, onUpdate: (attempt) => onUpdate?.({ content: [{ type: "text", text: output(toResult({ attempt, attempts: [attempt], persistent: item.persistent ?? agent.persistent ?? DEFAULT_PERSISTENT, status: "failed", failureKind: attempt.failureKind }, step, [item.task])) }], details: details([toResult({ attempt, attempts: [attempt], persistent: item.persistent ?? agent.persistent ?? DEFAULT_PERSISTENT, status: "failed", failureKind: attempt.failureKind }, step, [item.task])]) }) }, { rootDir: stateRoot });
         if (result.persistent && result.handle) pi.appendEntry("subagent-session", subagentSessionMetadata(result, agent.name));
         return toResult(result, step, [item.task]);
       };
@@ -290,16 +320,22 @@ export default function subagentExtension(pi: ExtensionAPI): void {
       if (args.tasks?.length) return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", `parallel (${args.tasks.length} tasks)`)}${theme.fg("muted", ` [${scope}]`)}`, 0, 0);
       return new Text(`${theme.fg("toolTitle", theme.bold("subagent "))}${theme.fg("accent", args.agent ?? "...")}${theme.fg("muted", ` [${scope}]`)}\n  ${theme.fg("dim", taskReference(args.task))}`, 0, 0);
     },
-    renderResult(result, { expanded }, theme) {
+    renderResult(result, { expanded, isPartial }, theme) {
       const data = result.details as SubagentDetails | undefined;
       if (!data?.results.length) return new Text(result.content[0]?.type === "text" ? result.content[0].text : "(no output)", 0, 0);
-      const renderOne = (item: SingleResult): string => `${failed(item) ? theme.fg("error", "✗") : theme.fg("success", "✓")} ${theme.fg("accent", item.agent)}${item.status === "recoverable_failed" ? theme.fg("warning", " (可继续)") : ""}\n${renderItems(displayItems(item.messages, item.toolResults), expanded, theme.fg.bind(theme))}${usageText(item.usage, item.actualModel, item.requestedModel) ? `\n${theme.fg("dim", usageText(item.usage, item.actualModel, item.requestedModel))}` : ""}`;
+      const renderOne = (item: SingleResult): string => {
+        const running = isPartial || item.phase === "running";
+        const label = running ? "执行中" : executionLabel(item);
+        const icon = running ? theme.fg("warning", "…") : failed(item) ? theme.fg("error", "✗") : theme.fg("accent", "↩");
+        const warning = item.status === "recoverable_failed" ? theme.fg("warning", " (可继续)") : "";
+        return `${icon} ${theme.fg("accent", item.agent)}${warning} · ${label}\n${renderItems(displayItems(item.messages, item.toolResults), expanded, theme.fg.bind(theme))}${usageText(item.usage, item.actualModel, item.requestedModel) ? `\n${theme.fg("dim", usageText(item.usage, item.actualModel, item.requestedModel))}` : ""}`;
+      };
       if (data.mode === "single") {
         const item = data.results[0];
         if (expanded) { const container = new Container(); container.addChild(new Text(renderOne(item), 0, 0)); const text = finalOutput(item.messages); if (text) { container.addChild(new Spacer(1)); container.addChild(new Markdown(text, 0, 0, getMarkdownTheme())); } return container; }
         return new Text(renderOne(item), 0, 0);
       }
-      return new Text(`${data.mode} ${data.results.filter((item) => !failed(item)).length}/${data.results.length} succeeded\n\n${data.results.map(renderOne).join("\n\n")}`, 0, 0);
+      return new Text(`${data.mode} ${data.results.filter((item) => !failed(item)).length}/${data.results.length} 已返回\n\n${data.results.map(renderOne).join("\n\n")}`, 0, 0);
     },
   });
 }
