@@ -26,54 +26,18 @@ Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
 完整功能差异见 [L2 已知 L1/L2 Drift](docs/02-产品实现/README.md#已知-l1--l2-drift)。目标契约不能被当作已实现行为。
 
-## 当前 Package
+## Extension 目录
 
-```text
-@pi/fix
-  └── @pi/workflow-runtime
-        └── @pi/workflow-contracts
-
-@pi/codex-usage-status
-  └── optional Fast producer for @pi/subagent
-
-@pi/subagent
-  └── isolated Pi child sessions (not a Workflow Runtime worker)
-```
-
-- `@pi/workflow-contracts`：当前 Stage、Artifact、Checkpoint、Worker 和提交接口。
-- `@pi/workflow-runtime`：当前状态机、Fix Definition、Worker Session、Guard、有限重试、checkpoint 和恢复。
-- `@pi/fix`：当前 `/fix` 的策略、报告、trace 和主 Pi UI 接线。
-- `@pi/codex-usage-status`：Codex 额度状态与内存态 `/fast` priority processing 接线；合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E；不依赖 Workflow Runtime。
-- `@pi/subagent`：通用 `subagent` 工具。默认创建可恢复 child session；每个模型最多首次加两次 allowlist 瞬态重试，随后才按 agent 配置的 fallback 模型切换；可使用返回的 opaque session handle 恢复并人工指定模型。`persistent: false` 仅在当前调用存活。它不创建 Workflow Run、Node、Artifact 或 Worker。
+| Extension / package | 入口 | 作用 | 当前状态与说明 |
+| --- | --- | --- | --- |
+| `@pi/feature` | `/feature` | Feature Workflow 入口。 | 尚未实现；见 [Feature 产品规范](docs/01-产品定义/扩展/feature-扩展.md)。 |
+| `@pi/fix` | `/fix` | Fix Workflow 的策略、报告、trace 和主 Pi UI 接线。 | 原型已实现；依赖共享 Runtime 与 Contracts。 |
+| `@pi/codex-usage-status` | 状态栏 / `/fast` | 展示 Codex 额度状态，并提供 Fast priority processing 的 producer。 | 合并行已实现；真实 Pi TUI/provider E2E 待验证；不依赖 Workflow Runtime。 |
+| `@pi/subagent` | `subagent` 工具 | 通用隔离 child-session dispatcher：默认持久会话、瞬态重试、模型 fallback 与恢复。 | 已实现；不创建 Workflow Run/Node/Artifact/Worker。具体合同和验证边界见 [L2 技术设计](docs/02-产品实现/subagent-dispatcher-技术设计.md)。 |
+| `@pi/workflow-runtime` | 共享内部依赖 | Workflow 状态机、Fix Definition、Worker Session、Guard、有限重试、checkpoint 和恢复。 | Pi SDK Runtime 原型已实现。 |
+| `@pi/workflow-contracts` | 共享内部依赖 | Stage、Artifact、Checkpoint、Worker 与提交接口合同。 | 由 Runtime 和 Workflow 入口共同使用。 |
 
 产品目标上，Feature/Fix package 各自拥有自己的可执行 Workflow Definition；共享 Runtime 不拥有入口特有流程。`@pi/subagent` 是独立的通用委派器，不属于该 Workflow 层级。
-
-## 使用 `@pi/subagent`
-
-Pi settings 在 `packages` 中加载本仓库 package（使用本机绝对路径或相对于 settings 文件的路径）：
-
-```json
-{
-  "packages": [
-    "/absolute/path/to/my-pi-extension/packages/subagent"
-  ]
-}
-```
-
-同一 Pi 配置只能注册一个名为 `subagent` 的 extension/tool；迁移前应停用旧的 local dispatcher，避免同名工具冲突。运行时本地状态（child JSONL、registry、lock、GC tombstone）位于 Pi agent 状态根的 `subagent/` 下，不进入 Git。
-
-调用时提供 `agent` 和 `task`；也可使用 `tasks`（并行，最大 8）、`chain`（以 `{previous}` 传递上一步输出），或以 `session` 恢复既有 child。人工模型接管示例：
-
-```ts
-subagent({
-  agent: "implementer",
-  session: "<opaque-session-handle>",
-  model: "openai-codex/gpt-5.6-terra",
-  task: "继续刚才的任务",
-});
-```
-
-`@pi/codex-usage-status` 是可选 peer dependency。安装并启用 producer 时，只有新 logical child 的首次 spawn 在严格条件下才可继承 Fast；retry、fallback 和 resume 一律关闭 Fast。
 
 ## 验证
 
