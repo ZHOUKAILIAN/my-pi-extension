@@ -273,7 +273,15 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
           if (registry && sessionFile) {
             registry.status = attempt.failureKind === "success" ? "settled" : "running";
             registry.lastActivityAt = now(deps).toISOString();
-            registry.attempts.push({ requestedModel: attempt.requestedModel, actualModel: attempt.actualModel, attempt: attempt.attempt, source, kind: attempt.failureKind, reason: safeReason(attempt) });
+            registry.attempts.push({
+              requestedModel: attempt.requestedModel,
+              actualModel: attempt.actualModel,
+              attempt: attempt.attempt,
+              source,
+              kind: attempt.failureKind,
+              reason: safeReason(attempt),
+              ...(attempt.diagnostics ? { diagnostics: attempt.diagnostics } : {}),
+            });
             await atomicWrite(registryFile!, registry);
           }
 

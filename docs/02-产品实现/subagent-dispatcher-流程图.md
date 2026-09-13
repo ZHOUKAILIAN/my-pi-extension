@@ -47,21 +47,20 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-  A[以候选模型 1 启动或恢复 child] --> B[解析 JSON event stream<br/>累积脱敏消息 / tool_execution_end.result 投影 / usage / 分类诊断]
-  B --> C{正常完成?}
-  C -->|是| Z[按 persistent 结束：true 保留 handle；false 删除临时 storage<br/>释放 lock / 返回结果]
-  C -->|否| D{用户中止?}
-  D -->|是| E[标记 cancelled diagnostic]
-  E --> Z
-  D -->|否| F{任务或工具失败?}
-  F -->|是| G[标记 task failure<br/>不自动重试/换模型]
-  G --> Z
-  F -->|否| H{仅瞬态 provider 错误?}
-  H -->|否| I{unknown transport?}
-  I -->|是| U[标记 unknown transport<br/>不自动重试/换模型]
-  I -->|否| V[标记 non-transient provider failure<br/>不自动重试/换模型]
+  A[以候选模型 1 启动或恢复 child] --> B[解析 JSON event stream<br/>累积助手文本 / 脱敏 tool 投影 / usage / 诊断计数]
+  B --> C{本地 abort?}
+  C -->|是| CA[标记 cancelled<br/>不重试]
+  CA --> Z
+  C -->|否| D{signal / 协议 / missing terminal?}
+  D -->|是| U[标记 unknown_transport<br/>fail closed / 不重试]
   U --> Z
-  V --> Z
+  D -->|否| E{最终助手 aborted?}
+  E -->|是| EB[标记 cancelled<br/>不重试]
+  EB --> Z
+  E -->|否| F{最终 provider error?}
+  F -->|是| H{仅瞬态 provider 错误?}
+  H -->|否| I[标记 non-transient provider failure<br/>不重试/换模型]
+  I --> Z
   H -->|是| J{当前模型 retry 次数 < 2?}
   J -->|是| K[记录 retry attempt<br/>有限退避]
   K --> L[同 child session 投递 continue prompt]
@@ -75,9 +74,19 @@ flowchart TD
   P -->|否| S[返回 attempts diagnostics<br/>删除临时 session，不可继续]
   R --> Z
   S --> Z
+  F -->|否| G{进程 exit 非零?}
+  G -->|是| U2[标记 unknown_transport<br/>不重试]
+  U2 --> Z
+  G -->|否| L2{最终 length?}
+  L2 -->|是| T[标记 incomplete：未完整返回<br/>保留捕获报告 / 不自动重试]
+  T --> Z
+  L2 -->|否：最终 stop| OK[标记 success：已返回<br/>保留助手报告与过程诊断，不代表验收通过]
+  OK --> Z
 ```
 
-只有以下闭集错误类别进入 `H`：`fetch failed`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、明确 timeout、HTTP 429、502、503、504。认证、模型配置、401/403、未知 transport、测试或命令失败不会触发 fallback。
+最终 `length` 标记 `incomplete`：保留已捕获报告、不自动重试。只有以下闭集错误类别进入 `H`：
+
+> 终态候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除。`phase=running` 的 progress 不画最终失败图标。`fetch failed`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、明确 timeout、HTTP 429、502、503、504。认证、模型配置、401/403、未知 transport、测试或命令失败不会触发 fallback。
 
 ## 3. 持久 child 候选耗尽后的继续与手动换模型
 

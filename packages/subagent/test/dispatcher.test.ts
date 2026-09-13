@@ -60,7 +60,7 @@ test("model retry budget is exactly initial+2 per model, then ordered fallback",
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("stderr transient errors receive initial+2 budget for every fallback model", async () => {
+test("stderr alone does not receive a retry budget", async () => {
   for (const stderr of ["fetch failed", "ETIMEDOUT"] as const) {
     const root = await tempRoot();
     const calls: Array<{ model?: string; source: string }> = [];
@@ -72,16 +72,13 @@ test("stderr transient errors receive initial+2 budget for every fallback model"
       return runPiAttempt({ ...options, spawn: () => fakeProcess([header, terminal], stderr) });
     });
     assert.equal(response.status, "recoverable_failed", stderr);
-    assert.deepEqual(calls, [
-      { model: "model-a", source: "initial" }, { model: "model-a", source: "retry" }, { model: "model-a", source: "retry" },
-      { model: "model-b", source: "fallback" }, { model: "model-b", source: "retry" }, { model: "model-b", source: "retry" },
-    ], stderr);
+    assert.deepEqual(calls, [{ model: "model-a", source: "initial" }], stderr);
     await fs.rm(root, { recursive: true, force: true });
   }
 });
 
-test("non-allowlisted and task failures do not retry or fallback", async () => {
-  for (const kind of ["non_transient_provider", "task_failure", "unknown_transport"] as const) {
+test("non-allowlisted and compatibility task failures do not retry or fallback", async () => {
+  for (const kind of ["non_transient_provider", "task_failure", "unknown_transport", "incomplete"] as const) {
     const root = await tempRoot(); let calls = 0;
     const response = await dispatchWithMock(root, async (options) => {
       calls += 1;
@@ -92,6 +89,43 @@ test("non-allowlisted and task failures do not retry or fallback", async () => {
     assert.equal(response.status, "recoverable_failed", kind);
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test("normal child return with a tool error remains completed and retains diagnostics", async () => {
+  const root = await tempRoot();
+  let calls = 0;
+  const response = await dispatchWithMock(root, async (options) => {
+    calls += 1;
+    await writeSession({ sessionDir: options.sessionDir, id: options.childSessionId, cwd: options.cwd });
+    return {
+      ...result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source }),
+      messages: [{ role: "assistant", content: [{ type: "text", text: "report says the test failed" }], stopReason: "stop" } as any],
+      diagnostics: { toolErrorCount: 1, providerErrorCount: 0 },
+      phase: "finished",
+    };
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, "completed");
+  assert.equal(response.failureKind, "success");
+  assert.deepEqual(response.attempt.diagnostics, { toolErrorCount: 1, providerErrorCount: 0 });
+  const identity = makeSessionIdentity({ parentSessionId: "parent-1", cwd: "/tmp/project", agentName: "implementer", handle: response.handle! });
+  const registry = JSON.parse(await fs.readFile(path.join(root, "registry", `${identity.key}.json`), "utf8"));
+  assert.deepEqual(registry.attempts[0].diagnostics, { toolErrorCount: 1, providerErrorCount: 0 });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("incomplete results never consume retry budget", async () => {
+  const root = await tempRoot();
+  let calls = 0;
+  const response = await dispatchWithMock(root, async (options) => {
+    calls += 1;
+    await writeSession({ sessionDir: options.sessionDir, id: options.childSessionId, cwd: options.cwd });
+    return result({ cwd: options.cwd, id: options.childSessionId, kind: "incomplete", model: options.model, attempt: options.attempt, source: options.source });
+  });
+  assert.equal(calls, 1);
+  assert.equal(response.status, "recoverable_failed");
+  assert.equal(response.failureKind, "incomplete");
+  await fs.rm(root, { recursive: true, force: true });
 });
 
 test("agent persistence is overridable per call and defaults to true", async () => {

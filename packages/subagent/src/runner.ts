@@ -11,8 +11,14 @@ import { markRetryClassification, retryClassificationOf } from "./retry-classifi
 export const MAX_RETRIES_PER_MODEL = 2;
 export const DEFAULT_RETRY_DELAY_MS = 50;
 
-export type FailureKind = "success" | "transient_provider" | "non_transient_provider" | "task_failure" | "cancelled" | "unknown_transport";
+export type FailureKind = "success" | "incomplete" | "transient_provider" | "non_transient_provider" | "task_failure" | "cancelled" | "unknown_transport";
+export type AttemptPhase = "running" | "finished";
 export type AttemptSource = "initial" | "retry" | "fallback" | "user_override";
+
+export interface AttemptDiagnostics {
+  toolErrorCount: number;
+  providerErrorCount: number;
+}
 
 export interface UsageStats {
   input: number;
@@ -48,6 +54,10 @@ export interface AttemptResult {
   source: AttemptSource;
   attempt: number;
   stopReason?: string;
+  /** Attempt lifecycle only; it does not represent task acceptance. */
+  phase?: AttemptPhase;
+  /** Bounded process diagnostics; raw provider/tool values never cross this boundary. */
+  diagnostics?: AttemptDiagnostics;
   /** Classification-only diagnostic; raw provider errors never cross this boundary. */
   errorMessage?: string;
   failureKind: FailureKind;
@@ -108,9 +118,9 @@ function safeError(raw: string, status?: number): string | undefined {
 type ProviderFailureClassification = "transient_provider" | "non_transient_provider";
 
 /** Closed allowlist. This raw-input classifier is intentionally not exported. */
-function classifyProviderError(value: { errorMessage?: string; stderr?: string; status?: number }): ProviderFailureClassification {
+function classifyProviderError(value: { errorMessage?: string; status?: number }): ProviderFailureClassification {
   if (value.status !== undefined) return [429, 502, 503, 504].includes(value.status) ? "transient_provider" : "non_transient_provider";
-  const text = `${value.errorMessage ?? ""}\n${value.stderr ?? ""}`;
+  const text = value.errorMessage ?? "";
   return /fetch failed|\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT)\b|\b(?:timed?\s*out|timeout)\b|\b(?:HTTP|status(?:Code)?|code|response)\s*(?:status\s*)?(?:[:=]?\s*)\b(?:429|502|503|504)\b/i.test(text)
     ? "transient_provider" : "non_transient_provider";
 }
@@ -323,14 +333,26 @@ function projectMessage(message: unknown, blockedTexts: readonly string[] = []):
 }
 
 function safeFailureMessage(value: unknown, kind: FailureKind): string | undefined {
+  if (kind === "success") return undefined;
+  if (kind === "incomplete") return "output truncated";
   if (kind === "cancelled") return "cancelled";
   if (value === "session cleanup pending" || value === "session cleanup state cannot be verified") return value;
-  if (typeof value !== "string" || !value.trim()) return undefined;
-  const classified = safeError(value);
-  if (classified) return classified;
+  if (typeof value === "string" && value.trim()) {
+    const classified = safeError(value);
+    if (classified) return classified;
+  }
   if (kind === "task_failure") return "task failure";
   if (kind === "non_transient_provider" || kind === "transient_provider") return "provider request failed";
   return "child process failed";
+}
+
+function safeDiagnostics(value: unknown): AttemptDiagnostics | undefined {
+  if (!isRecord(value) || Object.keys(value).some((key) => !["toolErrorCount", "providerErrorCount"].includes(key))) return undefined;
+  const toolErrorCount = value.toolErrorCount;
+  const providerErrorCount = value.providerErrorCount;
+  if (!Number.isSafeInteger(toolErrorCount) || (toolErrorCount as number) < 0 ||
+      !Number.isSafeInteger(providerErrorCount) || (providerErrorCount as number) < 0) return undefined;
+  return { toolErrorCount: toolErrorCount as number, providerErrorCount: providerErrorCount as number };
 }
 
 function safeUsage(value: unknown): UsageStats {
@@ -341,7 +363,7 @@ function safeUsage(value: unknown): UsageStats {
 
 /** Project an attempt through an allowlist; callers use this at every result/details boundary. */
 export function sanitizeAttemptResult(value: AttemptResult, requestedModel?: string, blockedTexts: readonly string[] = []): AttemptResult {
-  const failureKind: FailureKind = ["success", "transient_provider", "non_transient_provider", "task_failure", "cancelled", "unknown_transport"].includes(value.failureKind) ? value.failureKind : "unknown_transport";
+  const failureKind: FailureKind = ["success", "incomplete", "transient_provider", "non_transient_provider", "task_failure", "cancelled", "unknown_transport"].includes(value.failureKind) ? value.failureKind : "unknown_transport";
   const requested = safeModel(requestedModel ?? value.requestedModel) ?? "unknown";
   const actual = safeModel(value.actualModel) ?? "unknown";
   const projected: AttemptResult = {
@@ -361,6 +383,8 @@ export function sanitizeAttemptResult(value: AttemptResult, requestedModel?: str
     actualModel: actual,
     source: value.source === "retry" || value.source === "fallback" || value.source === "user_override" ? value.source : "initial",
     attempt: Number.isInteger(value.attempt) && value.attempt >= 0 ? value.attempt : 0,
+    phase: value.phase === "running" || value.phase === "finished" ? value.phase : undefined,
+    diagnostics: safeDiagnostics(value.diagnostics),
     stopReason: typeof value.stopReason === "string" && SAFE_STOP_REASONS.has(value.stopReason) ? value.stopReason : undefined,
     errorMessage: safeFailureMessage(value.errorMessage, failureKind),
     failureKind,
@@ -372,11 +396,7 @@ export function sanitizeAttemptResult(value: AttemptResult, requestedModel?: str
 }
 
 function appendMessage(result: AttemptResult, message: Message, blockedTexts: readonly string[]): void {
-  const rawError = message.role === "assistant" && typeof (message as any).errorMessage === "string"
-    ? (message as any).errorMessage as string
-    : undefined;
   result.messages.push(projectMessage(message, blockedTexts));
-  if (rawError) result.errorMessage = safeError(rawError);
   if (message.role !== "assistant") return;
   result.usage.turns += 1;
   const usage = (message as any).usage;
@@ -389,9 +409,6 @@ function appendMessage(result: AttemptResult, message: Message, blockedTexts: re
     result.usage.contextTokens = usage.totalTokens || 0;
   }
   result.stopReason = SAFE_STOP_REASONS.has((message as any).stopReason) ? (message as any).stopReason : undefined;
-  if (!rawError && typeof (message as any).errorMessage === "string") {
-    result.errorMessage = safeError((message as any).errorMessage);
-  }
 }
 
 export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptResult> {
@@ -406,6 +423,8 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     actualModel: "unknown",
     source: options.source,
     attempt: options.attempt,
+    phase: "running",
+    diagnostics: { toolErrorCount: 0, providerErrorCount: 0 },
     failureKind: "unknown_transport",
     sessionId: options.childSessionId,
     cwdScope: safeScope(options.cwd),
@@ -423,8 +442,6 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
   let headerCwd: string | undefined;
   let terminal: any;
   let malformed = false;
-  let taskToolError = false;
-  let status: number | undefined;
   let wasAborted = Boolean(options.signal?.aborted);
 
   const blockedTexts = [options.task, options.agent.systemPrompt];
@@ -441,21 +458,30 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       headerCwd = event.cwd;
       return;
     }
-    status = extractStatus(event) ?? status;
+    if (event.type === "message_start" && event.message?.role === "assistant") {
+      terminal = undefined;
+    }
+    if (event.type === "tool_execution_start" || event.type === "tool_execution_end") {
+      terminal = undefined;
+    }
     if (event.type === "message_end") {
       if (!isRecord(event.message) || typeof event.message.role !== "string") { malformed = true; return; }
       if (event.message.role === "assistant" && !Array.isArray(event.message.content)) { malformed = true; return; }
       appendMessage(result, event.message as Message, blockedTexts);
       // A tool-use assistant message is an intermediate turn, not terminal JSON.
-      if (event.message.role === "assistant" &&
-          ["stop", "length", "error", "aborted"].includes(event.message.stopReason)) {
-        terminal = event.message;
-        result.actualModel = safeModel(event.message.model) ?? "unknown";
+      if (event.message.role === "assistant") {
+        if (["stop", "length", "error", "aborted"].includes(event.message.stopReason)) {
+          terminal = event.message;
+          result.actualModel = safeModel(event.message.model) ?? "unknown";
+          if (event.message.stopReason === "error") result.diagnostics!.providerErrorCount += 1;
+        } else {
+          terminal = undefined;
+        }
       }
       notify();
     }
     if (event.type === "tool_execution_end") {
-      if (event.isError === true) taskToolError = true;
+      if (event.isError === true) result.diagnostics!.toolErrorCount += 1;
       // Pi 0.84.4 exposes the completed tool result on this event. Keep only
       // its bounded projection; presence alone is not enough for reviewable output.
       if (!Object.prototype.hasOwnProperty.call(event, "result")) malformed = true;
@@ -468,6 +494,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
 
   try {
     if (options.signal?.aborted) {
+      result.phase = "finished";
       result.failureKind = "cancelled";
       result.errorMessage = "cancelled";
       return sanitizeAttemptResult(result, options.model, blockedTexts);
@@ -490,6 +517,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
         }),
       }) as unknown as JsonProcess;
     } catch {
+      result.phase = "finished";
       result.failureKind = "unknown_transport";
       result.errorMessage = "child process could not be started";
       return sanitizeAttemptResult(result, options.model, blockedTexts);
@@ -535,15 +563,18 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     });
 
     const validHeader = sawHeader && headerId === options.childSessionId && path.resolve(headerCwd!) === path.resolve(options.cwd);
-    const rawError = result.errorMessage ?? rawStderr;
-    const diagnostic = safeError(rawError, status);
+    const finalErrorMessage = terminal?.stopReason === "error" && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;
+    const finalStatus = terminal?.stopReason === "error" ? extractStatus(terminal) : undefined;
     if (wasAborted) result.failureKind = "cancelled";
     else if (stdout.trim().length === 0 || !validHeader || malformed || !terminal || result.exitCode === null) result.failureKind = "unknown_transport";
-    else if (taskToolError) result.failureKind = "task_failure";
-    else if (terminal.stopReason === "error") result.failureKind = classifyProviderError({ errorMessage: result.errorMessage, stderr: rawStderr, status }) === "transient_provider" ? "transient_provider" : "non_transient_provider";
+    else if (terminal.stopReason === "aborted") result.failureKind = "cancelled";
+    else if (terminal.stopReason === "error") result.failureKind = classifyProviderError({ errorMessage: finalErrorMessage, status: finalStatus });
     else if (result.exitCode !== 0) result.failureKind = "unknown_transport";
+    else if (terminal.stopReason === "length") result.failureKind = "incomplete";
     else result.failureKind = "success";
-    result.errorMessage = result.failureKind === "success" ? undefined : diagnostic;
+    const diagnostic = safeError(finalErrorMessage ?? "", finalStatus);
+    result.phase = "finished";
+    result.errorMessage = result.failureKind === "success" ? undefined : diagnostic ?? safeFailureMessage(undefined, result.failureKind);
     markRetryClassification(result, result.failureKind === "transient_provider" ? "transient_provider" : "not_retryable");
     return sanitizeAttemptResult(result, options.model, blockedTexts);
   } finally {

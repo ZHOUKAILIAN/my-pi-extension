@@ -67,8 +67,8 @@ stateDiagram-v2
 | --- | --- | --- |
 | 瞬态模型请求失败 | **仅** `fetch failed`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、明确 timeout，或 HTTP 429/502/503/504 | 同模型额外重试最多 2 次；仍失败后按候选顺序切模型。其他和无法判定的错误一律不重试、不切模型。 |
 | 非瞬态模型错误 | 模型不存在、认证失败、明确不可用 | 不重试、不切备用模型；持久 child 保留供用户明确继续，临时 child 返回诊断后删除。 |
-| 任务/工具/验证失败 | 测试失败、命令 exit non-zero、缺文件、产物无效 | 不自动换模型或重试；持久 child 保留任务事实，临时 child 返回任务事实后删除。 |
-| 用户中止 | cancel / abort | 立即停止、不自动重试；仅持久 child 保留供用户明确继续，临时 child 删除。 |
+| Child 正常返回业务失败报告 | 测试失败、命令 exit non-zero、缺文件、产物无效 | 若协议有效、退出 0、最终助手为 `stop`，仍是“已返回”；工具异常只作为有界过程诊断交给主 Agent，不自动换模型或重试。 |
+| 用户中止 | cancel / abort | 立即停止、不自动重试；仅持久 child 保留供用户明确继续，临时 child 删除。非本地 signal close 按传输异常 fail closed。 |
 
 备用模型来自 agent frontmatter 的 `fallback-models`；单次调用可显式指定 `model` 覆盖本轮首选模型。用户要求“换模型”时，主 Agent 必须在恢复同一 handle 的下一次模型调用前明确记录选择的模型；不得静默改写主 Pi 默认模型、其他 child、后续新任务的默认模型或工具权限。
 
@@ -87,14 +87,33 @@ stateDiagram-v2
 
 同一持久 child session 同时只允许一个运行调用。锁冲突、stale lock 或工作目录/agent 身份不匹配时必须 fail closed，不得把新 prompt 送入未知的历史任务。
 
-## 5. 兼容与隐私边界
+## 5. 执行结果语义
+
+`FailureKind` 是唯一执行结果分类；它表示 child 的传输/模型调用是否正常结束，不表示任务目标或业务验收是否通过。有效协议、退出码 0 且当前最终助手状态为 `stop` 时为 `success`，用户反馈统一为“已返回”，即使报告描述测试失败或过程工具出错。`success` 不得被 UI、tool result、parallel 聚合或 chain 文案改写为“succeeded”“完成”或验收通过。
+
+| 情况 | `failureKind` | 反馈与控制 |
+| --- | --- | --- |
+| 有效协议、退出 0、最终 `stop` | `success` | 已返回；保留完整助手文本；过程工具错误只附有界脱敏诊断，不重试、不切模型。 |
+| 最终 `length`、退出 0 | `incomplete` | 未完整返回；保留已捕获文本；不自动重试，持久会话可由用户明确继续。 |
+| 本地取消或最终 `aborted` | `cancelled` | 已取消；不重试。非本地 signal close 优先按传输异常处理。 |
+| 最终 provider `error` | `transient_provider` / `non_transient_provider` | 只按当前终态自身的类型化 status/errorMessage 分类；沿用现有闭集 retry 预算，非瞬态不切模型。 |
+| 信号退出、协议损坏、缺终态、stop/length 非零退出 | `unknown_transport` | 执行失败；fail closed，不重试。 |
+| 历史/注入的 `task_failure` | `task_failure` | 兼容读取；runner 不再由工具事件产生。 |
+
+每个 attempt 都有可选的生命周期 `phase`（`running` / `finished`）和可选 `diagnostics`：`toolErrorCount`、`providerErrorCount`。新 runner 始终产生两个非负安全整数；历史记录缺字段表示“未提供”，不得解释成 0。工具详情有界截断不能改变计数，诊断不包含原始 payload、stderr、header、token、task/prompt 或本机路径。正常返回的助手报告优先于旧错误文本。
+
+终态按当前 attempt 固定裁决：本地 abort → 协议/进程完整性失败（非本地 signal close 优先归 `unknown_transport`）→最终助手 `aborted`→最终助手 `error`（只读该消息自身）→stop/length 非零退出→最终 `length`→最终 `stop`。最新终态候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除候选。
+
+single/chain 正常返回显示“已返回”，parallel 显示“已返回 N/M”，均不表示验收通过。chain 只因非 `success` 停止；上一步最终助手文本继续传递，并追加固定脱敏段落 `[执行诊断：不代表验收结论；工具异常 N；模型异常 M]`。若缺少旧记录计数，使用“未提供”而非 0；下游模板未使用 `{previous}` 时也在任务尾追加该段。
+
+## 6. 兼容与隐私边界
 
 - `persistent: false` 保留现有一次性并行检查、探索和评审的使用方式。
 - child 继续不会复制父 Pi 全部对话；新 child 默认仅收到委派 prompt。只有明确指定的首次 parent snapshot 才可复制，且必须在详情中可见。
 - Fast 继承继续遵循 [Codex Usage Status + Fast 规范](codex-usage-status-扩展.md#21-parent-fast-继承例外)：只有**新 logical child 的首次 spawn**且既有的精确 user-source / agent / frontmatter 条件命中时，才可传递一次性 advisory Fast intent；同一 child 的 retry、fallback 和 resume 必须清除且不重新注入 Fast。
 - Extension 必须对错误文本、Cookie/Set-Cookie、headers、token、原始 provider body、嵌套诊断和本地路径做严格结构化投影；日志、metadata、Tool details 与 UI 只能展示可归类错误、哈希引用、安全工作区 scope 和必要的脱敏 tool result。完整 task/prompt 不得进入这些输出边界。
 
-## 6. Acceptance Definition
+## 7. Acceptance Definition
 
 本 Extension 在进入 `DECIDED` / 实现前，至少应有以下可验证验收标准：
 
@@ -105,12 +124,12 @@ stateDiagram-v2
 | S3 | 闭集瞬态错误 | 仅 allowlist 中每一错误可让同一 child session 在首轮外重试最多两次；每个非 allowlist 正反例均不重试、不 fallback。 |
 | S4 | 两次重试后仍失败 | 切换到 frontmatter 的下一备用模型；模型尝试顺序完整可见。 |
 | S5 | 持久 child 候选耗尽 | `persistent !== false` 时返回 recoverable failed；同一 handle 可继续，历史和文件改动不丢失。`persistent:false` 时返回同等尝试诊断，但临时 session 删除、不可继续。 |
-| S6 | 非瞬态任务失败 | 不自动模型切换；将测试/工具/契约错误原样归类为任务失败。 |
+| S6 | Child 正常返回业务失败报告 | 完整有效协议、退出码 0、最终助手 `stop` 仍是“已返回”；测试/工具错误作为有界过程诊断交给主 Agent，不自动模型切换。 |
 | S7 | session 隔离与并发 | parent session、cwd、agent 或 handle 任一不同不串话；同一 session 的并发调用被拒绝。 |
 | S8 | Fast / 安全回归 | 仅新 logical child 首次 spawn 可满足 Fast 精确继承条件；retry/fallback/resume 一律 Off，错误与本地 session 中不持久化敏感认证材料。 |
 | S9 | 组合门禁 | `persistent:false × retry/fallback` 的结束即删除、持久 child 的候选耗尽与非瞬态/task/cancel 后继续、identity 首次创建竞态、GC/resume 竞态与 Fast 负向路径均有证据；session 串写、超预算 retry/fallback、Fast 越界次数均为 0。 |
 
-## 7. L2 交接
+## 8. L2 交接
 
 本规范不定义 Pi CLI/RPC 参数、child session 文件路径、锁文件格式、错误正则、退避时长、JSON schema、前端渲染组件、GC 实现或测试代码。这些属于 [Subagent Dispatcher 技术设计](../../02-产品实现/subagent-dispatcher-技术设计.md)。
 
