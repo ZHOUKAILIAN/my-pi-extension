@@ -17,6 +17,7 @@
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
 - [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`DECIDED`
 - [Codex Usage Status + Fast Extension](扩展/codex-usage-status-扩展.md)：`IMPLEMENTING`（合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E）
+- [Subagent Dispatcher Extension](扩展/subagent-扩展.md)：`IMPLEMENTING`（通用 child dispatcher；独立方案/代码评审与 headless 创建+恢复 smoke 已完成）
 
 ## L1 与 L2 的边界
 

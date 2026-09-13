@@ -13,6 +13,7 @@
 | Fix 的可执行 Node/状态图与业务 Guard | 状态图/边/约束在 `packages/fix/src/definition.ts`（`fixDefinitionV2`）；执行门禁（review kind 映射、`root_cause_alignment` 等 check satisfier、`DISPOSITION→IMPLEMENTING` 的 change_plan_review gate）仍在 `packages/workflow-runtime`，owner 待拆（见 drift 表） |
 | Artifact 合同与运行行为证据 | 对应 `packages/*/test/` |
 | 当前 Fix 实现机制说明 | [Fix Runtime 技术设计](fix-runtime-technical-design.md) |
+| Subagent Dispatcher 当前实现 | [Subagent Dispatcher 技术设计](subagent-dispatcher-技术设计.md)；`@pi/subagent` 是通用 child dispatcher，不属于 Workflow Run；源码、focused tests、独立代码复审及 headless 创建+恢复 smoke 已完成。 |
 
 L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语义；L2 将其落实为状态枚举、Transition 配置、Policy 解析、Artifact schema、Guard 代码、Worker 创建、存储接口和测试。
 
@@ -25,6 +26,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 | `packages/fix/src/` | `/fix` command、模型策略、UI 决策、报告、traceId、实时 Worker 输入和 Child picker 接线 | v2 主流程与 Extension 交互适配已实现；真实 provider E2E、长时 TUI 稳定性和真实崩溃回放仍待验证 |
 | `packages/*/test/` | 对应源码的行为和回归证据 | 现有自动测试可运行 |
 | `packages/codex-usage-status/` | ChatGPT Codex 额度状态与 Fast 扩展 | 已实现独立 Pi extension、固定 ChatGPT usage endpoint、OAuth scope lease、白名单 DTO、TUI 合并行、Fast priority hook/cost ticket 与 parent-Fast interop；合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E；local dispatcher role/source policy 的 live E2E 未执行，详见 [Codex Usage Status + Fast 技术设计](codex-usage-status-技术设计.md) |
+| `packages/subagent/` | 通用 child-session dispatcher、持久化、瞬态重试和模型 fallback | `IMPLEMENTING`：持久/临时 session、JSONL 完整性校验、identity lock、allowlist retry/fallback、30d GC、optional Fast consumer 与 UI 基础已实现并经独立代码复审；headless provider 创建+恢复 smoke 已通过，真实 TUI/retry/fallback/Fast child E2E 待验证。 |
 
 尚未存在 `packages/feature` 和独立 `workflow-ui` 实现。
 
