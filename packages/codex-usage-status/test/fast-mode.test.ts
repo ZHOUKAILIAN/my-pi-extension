@@ -350,6 +350,15 @@ test('bootstrap Fast env is exact, one-shot, and deleted for every value', () =>
   }
 });
 
+test('package exports interop without changing the Pi extension entry', async () => {
+  const packageJson = JSON.parse(await (await import('node:fs/promises')).readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.deepEqual(packageJson.pi.extensions, ['src/index.ts']);
+  assert.deepEqual(packageJson.exports['./interop'], {
+    types: './src/interop.ts',
+    import: './src/interop.ts',
+  });
+});
+
 test('interop payload is strict and extension publishes session-scoped intent at lifecycle boundaries', async () => {
   const previous = process.env.PI_CODEX_FAST;
   delete process.env.PI_CODEX_FAST;
