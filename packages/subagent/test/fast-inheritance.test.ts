@@ -43,6 +43,20 @@ test("Fast consumer accepts only exact producer event and exact user agent contr
   consumer.dispose();
 });
 
+test("same-session Fast rebind preserves the requested state for the first eligible child", async () => {
+  const events = bus(); const consumer = new FastInheritanceConsumer(events, "parent", await loadFastInterop());
+  events.emit(FAST_REQUESTED_EVENT, { version: 1, sessionId: "parent", requested: true });
+  await consumer.ready;
+
+  consumer.bind("parent");
+  assert.equal(consumer.environment(eligible, true)[FAST_ENV_NAME], "1");
+
+  consumer.bind("other");
+  assert.equal(consumer.requestedFast, false);
+  assert.equal(consumer.environment(eligible, true)[FAST_ENV_NAME], undefined);
+  consumer.dispose();
+});
+
 test("ambient Fast is removed and malformed/session-mismatched events fail closed", async () => {
   const base = { [FAST_ENV_NAME]: "1", KEEP: "yes" };
   const off = createChildEnvironment({ agent: eligible, firstLogicalChildSpawn: true, parentSessionRequestedFast: false, baseEnv: base });
