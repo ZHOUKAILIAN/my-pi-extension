@@ -90,6 +90,7 @@ export class FastInheritanceConsumer {
   }
 
   bind(parentSessionId: string): void {
+    if (this.parentSessionId === parentSessionId) return;
     this.parentSessionId = parentSessionId;
     this.requested = this.requestedBySession.get(parentSessionId) ?? false;
     this.requestedBySession.clear();
