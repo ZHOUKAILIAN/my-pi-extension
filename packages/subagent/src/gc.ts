@@ -3,6 +3,7 @@ import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { withIdentityLock } from "./session-lock.ts";
 import { isValidSessionRegistry, type SessionRegistry } from "./session-identity.ts";
+import { inspectPreservationPinAtLock, removePreservationPinAtLock } from "./bridge-internal.ts";
 
 export const DEFAULT_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
@@ -24,20 +25,31 @@ export interface GcResult {
   removed: number;
   skippedBusy: number;
   skippedFresh: number;
+  skippedPinned: number;
 }
 
 const TOMBSTONE_PATTERN = /^([a-f0-9]{64})\.json\.tombstone-[A-Za-z0-9-]+$/;
+
+type PinClassification = "proceed" | "pinned";
+
+async function classifyPinAtLock(rootDir: string, sourceHash: string, now: Date): Promise<PinClassification> {
+  const pin = await inspectPreservationPinAtLock({ rootDir, sourceHash }, { now: () => now });
+  if (pin.state === "valid" || pin.state === "invalid" || pin.state === "unavailable" || pin.state === "busy") return "pinned";
+  if (pin.state === "expired" && !await removePreservationPinAtLock({ rootDir, sourceHash }, { now: () => now })) return "pinned";
+  return "proceed";
+}
 
 /**
  * GC is deliberately registry-driven. It never scans or removes ordinary Pi sessions.
  * The registry is renamed to a tombstone while holding the same identity lock used by dispatch.
  */
 export async function garbageCollect(options: GcOptions): Promise<GcResult> {
-  const result: GcResult = { scanned: 0, removed: 0, skippedBusy: 0, skippedFresh: 0 };
+  const result: GcResult = { scanned: 0, removed: 0, skippedBusy: 0, skippedFresh: 0, skippedPinned: 0 };
   const registryDir = path.join(options.rootDir, "registry");
   let entries: fs.Dirent[];
   try { entries = await fs.promises.readdir(registryDir, { withFileTypes: true }); } catch { return result; }
-  const cutoff = (options.now ?? new Date()).getTime() - (options.retentionMs ?? DEFAULT_RETENTION_MS);
+  const currentTime = options.now ?? new Date();
+  const cutoff = currentTime.getTime() - (options.retentionMs ?? DEFAULT_RETENTION_MS);
 
   // A crash after rename leaves only a tombstone. Recover those first so a
   // later pass cannot silently accumulate abandoned metadata.
@@ -50,6 +62,7 @@ export async function garbageCollect(options: GcOptions): Promise<GcResult> {
     const tombstone = path.join(registryDir, entry.name);
     const locked = await withIdentityLock({ rootDir: options.rootDir, key }, async () => {
       const currentRegistryFile = path.join(registryDir, `${key}.json`);
+      if (await classifyPinAtLock(options.rootDir, key, currentTime) === "pinned") return "pinned" as const;
       try {
         // A tombstone is a deletion transaction, not evidence that a newer
         // registry is safe. Dispatch blocks this identity while it exists;
@@ -57,14 +70,15 @@ export async function garbageCollect(options: GcOptions): Promise<GcResult> {
         await fs.promises.rm(path.join(options.rootDir, "sessions", key), { recursive: true, force: true });
         await fs.promises.rm(currentRegistryFile, { force: true });
         await fs.promises.rm(tombstone, { force: true });
-        return true;
+        return "removed" as const;
       } catch {
         // Keep the tombstone as the durable retry marker for the next GC pass.
-        return false;
+        return "failed" as const;
       }
     });
     if (locked === undefined) result.skippedBusy += 1;
-    else if (locked) result.removed += 1;
+    else if (locked === "removed") result.removed += 1;
+    else if (locked === "pinned") result.skippedPinned += 1;
     else result.skippedFresh += 1;
   }
 
@@ -75,23 +89,25 @@ export async function garbageCollect(options: GcOptions): Promise<GcResult> {
     const registryFile = path.join(registryDir, entry.name);
     const locked = await withIdentityLock({ rootDir: options.rootDir, key }, async () => {
       const registry = await readRegistry(registryFile);
-      if (!registry || registry.key !== key) return false;
+      if (!registry || registry.key !== key) return "fresh" as const;
       const lastActivity = Date.parse(registry.lastActivityAt);
-      if (!Number.isFinite(lastActivity) || lastActivity > cutoff) return false;
+      if (!Number.isFinite(lastActivity) || lastActivity > cutoff) return "fresh" as const;
+      if (await classifyPinAtLock(options.rootDir, key, currentTime) === "pinned") return "pinned" as const;
       const tombstone = `${registryFile}.tombstone-${randomUUID()}`;
       await fs.promises.rename(registryFile, tombstone);
       try {
         await fs.promises.rm(path.join(options.rootDir, "sessions", key), { recursive: true, force: true });
         await fs.promises.rm(tombstone, { force: true });
-        return true;
+        return "removed" as const;
       } catch {
         // Do not delete the tombstone on a partial failure. The next GC pass
         // will safely resume deletion while holding the same identity lock.
-        return false;
+        return "failed" as const;
       }
     });
     if (locked === undefined) result.skippedBusy += 1;
-    else if (locked) result.removed += 1;
+    else if (locked === "removed") result.removed += 1;
+    else if (locked === "pinned") result.skippedPinned += 1;
     else result.skippedFresh += 1;
   }
   return result;

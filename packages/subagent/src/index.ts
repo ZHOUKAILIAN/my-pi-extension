@@ -12,6 +12,29 @@ import { FastInheritanceConsumer } from "./fast-inheritance.ts";
 import { sanitizeAttemptResult, type AttemptResult, type ToolResultProjection, type UsageStats } from "./runner.ts";
 
 export * from "./agents.ts";
+export * from "./lineage.ts";
+export {
+  DEFAULT_ROLLBACK_WINDOW_MS,
+  canAdoptExistingV1,
+  createPreservationPin,
+  inspectPreservationPin,
+  isBridgeV1Capability,
+  probeBridgeV1Capability,
+  refreshPreservationPin,
+  releasePreservationPin,
+} from "./bridge.ts";
+export type {
+  BridgeCapability,
+  PreservationPin,
+  PreservationPinCreateOptions,
+  PreservationPinInspection,
+  PreservationPinMutation,
+  PreservationPinMutationStatus,
+  PreservationPinReadOptions,
+  PreservationPinRefreshOptions,
+  PreservationPinReleaseOptions,
+  PreservationPinState,
+} from "./bridge.ts";
 export * from "./dispatcher.ts";
 export * from "./fast-inheritance.ts";
 export * from "./gc.ts";

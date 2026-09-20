@@ -10,6 +10,8 @@
 | 决策时点 | 未提交 WIP；没有固定 commit |
 | 证据限制 | 不可伪称完整原始工具逐字转录；本 Decision 只引用两条可追溯 Review Artifact |
 
+> **历史覆盖边界（2026-09-14）**：本文件只覆盖其表中所列旧基线 / 历史 WIP；不覆盖 base HEAD `e1439e4e198fe5a62c988177774c72c93b4ad4e9`、五文档 diff `6b2f6b54d1e8c45ea82e9355aa9e2782ed4677185879c2db586bc5c0fc9cb734` 固定的新方案。新版结论以 [2026-09-14 Adoption Decision](2026-09-14-subagent-dispatcher-Adoption-Decision.md) 为准。
+
 ## 结论先行
 
 1. 保留 Subagent Dispatcher 的目标边界和两条真实 Review Artifact：持久 child 默认、同一 session 的受控 retry/fallback、session integrity fail-closed、有限安全投影、可恢复本地状态和 Fast 首次 spawn 约束。

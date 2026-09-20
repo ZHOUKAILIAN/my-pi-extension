@@ -6,6 +6,7 @@ import { FastInheritanceConsumer } from "./fast-inheritance.ts";
 import { DEFAULT_RETRY_DELAY_MS, findSessionFile, MAX_RETRIES_PER_MODEL, runPiAttempt, sanitizeAttemptResult, validateSessionFile, type AttemptResult, type AttemptSource, type FailureKind } from "./runner.ts";
 import { isMatchingRegistry, isValidSessionRegistry, makeSessionIdentity, newLogicalHandle, type SessionIdentity, type SessionRegistry } from "./session-identity.ts";
 import { withIdentityLock, type LockHandle } from "./session-lock.ts";
+import { continuationTask, executionCandidates, isAbortRequested, isRetryableProviderFailure, MAX_PROVIDER_RETRIES } from "./dispatcher-policy.ts";
 
 export interface DispatchRequest {
   parentSessionId: string;
@@ -116,20 +117,6 @@ function newRegistry(identity: SessionIdentity, childSessionId: string, date: Da
   };
 }
 
-function modelCandidates(request: DispatchRequest): Array<{ model?: string; source: AttemptSource }> {
-  const raw: Array<{ model?: string; source: AttemptSource }> = [];
-  if (request.model) raw.push({ model: request.model, source: "user_override" });
-  else raw.push({ model: request.agent.model ?? request.parentModel, source: "initial" });
-  for (const model of request.agent.fallbackModels ?? []) raw.push({ model, source: "fallback" });
-  const seen = new Set<string>();
-  return raw.filter((item) => {
-    const key = item.model ?? "<default>";
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function invalidResult(request: DispatchRequest, persistent: boolean, error: string, status: DispatchResult["status"] = "invalid"): DispatchResult {
   const attempt: AttemptResult = {
     agent: request.agent.name,
@@ -212,14 +199,14 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
       }
     }
 
-    const candidates = modelCandidates(request);
+    const candidates = executionCandidates({ agent: request.agent, requestedModel: request.model, parentModel: request.parentModel });
     let attemptNumber = 0;
     let last: AttemptResult | undefined;
     try {
       for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
         const candidate = candidates[candidateIndex];
-        for (let retry = 0; retry <= MAX_RETRIES_PER_MODEL; retry += 1) {
-          if (request.signal?.aborted) {
+        for (let retry = 0; retry <= MAX_PROVIDER_RETRIES; retry += 1) {
+          if (isAbortRequested(request.signal)) {
             const cancelled = last ?? invalidResult(request, persistent, "cancelled").attempt;
             if (registry && registryFile) {
               registry.status = "cancelled";
@@ -230,7 +217,7 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
           }
           const source: AttemptSource = retry > 0 ? "retry" : candidate.source;
           const firstAttempt = attemptNumber === 0;
-          const task = retry === 0 && firstAttempt ? request.task : `Continue the same task. Preserve the existing work and respond to this instruction:\n${request.task}`;
+          const task = continuationTask(request.task, retry === 0 && firstAttempt);
           const env = request.fast?.environment(request.agent, firstLogicalChildSpawn && firstAttempt);
           await lock?.markChildStarting(childSessionId, sessionFile);
           const rawAttempt = await run({
@@ -288,7 +275,7 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
           if (attempt.failureKind === "success") {
             return { attempt, attempts, persistent, handle, status: "completed", failureKind: "success" };
           }
-          if (attempt.failureKind !== "transient_provider") {
+          if (!isRetryableProviderFailure(attempt.failureKind)) {
             const status = attempt.failureKind === "cancelled" ? "cancelled" : persistent ? "recoverable_failed" : "failed";
             if (registry && !sessionIntegrityFailed) {
               registry.status = attempt.failureKind === "cancelled" ? "cancelled" : "failed";
@@ -297,7 +284,7 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
             }
             return { attempt, attempts, persistent, handle, status, failureKind: attempt.failureKind };
           }
-          if (retry < MAX_RETRIES_PER_MODEL) {
+          if (isRetryableProviderFailure(attempt.failureKind) && retry < MAX_PROVIDER_RETRIES) {
             try { await (deps.sleep ?? sleep)(DEFAULT_RETRY_DELAY_MS, request.signal); } catch {
               const cancelled = attempts.at(-1)!;
               if (registry && registryFile) {

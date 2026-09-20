@@ -1,5 +1,6 @@
 ---
 name: code_reviewer
+aliases: [code-review]
 description: 代码评审角色。沿 Standards（仓库规范+代码坏味道）与 Spec（需求/PRD 符合度）两条轴评审改动，只报告不改代码。
 model: openai-codex/gpt-5.6-terra
 tools: read, bash, grep, find, ls, git
