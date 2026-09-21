@@ -11,6 +11,9 @@ import { appendWal, callPayload, configureRevisionPrivateValidator, dirs, ensure
 import { reconcilePrivateOrphansUnlocked } from "./delegation-orphans.ts";
 import { deriveCallOutcome, deriveViewOutcome, isCallTerminal, isCallWideCancellation } from "./wal-replay.ts";
 import type { ChildInspection } from "./delegation-types.ts";
+import { ensureInterruptedDeliveryPendingLocked, querySubagentStatusInternal, requestDeliveryAbandonInternal, executeDeliveryInternal, reconcileDeliveryStartupInternal } from "./delivery.ts";
+import type { DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry } from "./delegation-types.ts";
+import type { StatusQueryResult } from "./delivery.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 class ReconcileIntegrityError extends Error {}
@@ -110,9 +113,9 @@ export async function admitDispatchCallInternal(request: DispatchCallAdmissionRe
     if (existing.call && (existing.call.requestDigest !== expectedRequestDigest || existing.call.parentSessionId !== request.parentSessionId || existing.call.activeLineageId !== request.lineage.activeLineageId || existing.call.activeBranchAnchor !== request.lineage.activeBranchAnchor || existing.call.mode !== request.mode || existing.call.agentScope !== (request.agentScope ?? "user"))) return { state: "rejected" as const, error: "idempotency request digest mismatch" };
     if (!existing.call) {
       const callPrivateRef = `private:call-${callId}`; const projectRootRealpath = trust?.discoveryRootRealpath; const projectSnapshotDigest = trust?.snapshotDigest;
-      await writePrivate(privatePayload(d, callPrivateRef.slice(8)), { version: 1, dispatchCallId: callId, requestDigest: expectedRequestDigest, parentSessionId: request.parentSessionId, lineage: request.lineage, toolCallId: request.toolCallId, cwd: path.resolve(request.cwd), mode: request.mode, items, agentScope: request.agentScope ?? "user", persistent: request.persistent, projectTrust: trust, projectSnapshot: trustContext?.snapshot, projectRootRealpath, projectSnapshotDigest });
+      await writePrivate(privatePayload(d, callPrivateRef.slice(8)), { version: 1, dispatchCallId: callId, requestDigest: expectedRequestDigest, parentSessionId: request.parentSessionId, lineage: request.lineage, toolCallId: request.toolCallId, originalToolCallId: request.toolCallId, cwd: path.resolve(request.cwd), mode: request.mode, items, agentScope: request.agentScope ?? "user", persistent: request.persistent, projectTrust: trust, projectSnapshot: trustContext?.snapshot, projectRootRealpath, projectSnapshotDigest });
       const required = new Set(requiredIndices(request.mode, items.length)); const slots = items.map((_, index) => ({ index, order: index, required: required.has(index), kind: request.mode, state: "pending" as const }));
-      await appendWal(rootDir, callId, "call_admitted", { parentSessionId: request.parentSessionId, activeLineageId: request.lineage.activeLineageId, activeBranchAnchor: request.lineage.activeBranchAnchor, persistence: request.lineage.persistence, toolCallIdHash: toolCallHash(request.toolCallId), requestDigest: expectedRequestDigest, mode: request.mode, agentScope: request.agentScope ?? "user", projectTrustDigest: safeTrustDigest(trust), slots, privatePayloadRef: callPrivateRef, createdAt: now(deps) }, undefined, deps);
+      await appendWal(rootDir, callId, "call_admitted", { parentSessionId: request.parentSessionId, activeLineageId: request.lineage.activeLineageId, activeBranchAnchor: request.lineage.activeBranchAnchor, persistence: request.lineage.persistence, toolCallIdHash: toolCallHash(request.toolCallId), requestDigest: expectedRequestDigest, mode: request.mode, agentScope: request.agentScope ?? "user", projectTrustDigest: safeTrustDigest(trust), slots, privatePayloadRef: callPrivateRef, originalToolCallStatus: "running", normalToolResultStatus: "unobserved", createdAt: now(deps) }, undefined, deps);
       existing = await loadView(rootDir, callId);
     }
     if (existing.integrity) return pausedResult(callId, existing.integrity.reason);
@@ -149,6 +152,7 @@ async function reconcileCallCancellationLocked(rootDir: string, dispatchCallId: 
     await appendWal(rootDir, dispatchCallId, "call_finalized", { outcome: "cancelled", finalizedAt: now(deps) }, undefined, deps);
     view = await loadView(rootDir, dispatchCallId);
   }
+  view = await ensureInterruptedDeliveryPendingLocked(rootDir, view, deps);
   await materialize(rootDir, view); return view;
 }
 
@@ -178,6 +182,28 @@ export class SubagentControlService {
     return result ?? { state: "busy" as const };
   }
 }
+
+export async function markOriginalToolCallInterruptedInternal(rootDir: string, dispatchCallId: string, actor: CancelActor, deps: DelegationFoundationDependencies = {}) {
+  const result = await withCallLock(rootDir, dispatchCallId, async () => {
+    const view = await loadView(rootDir, dispatchCallId);
+    if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason);
+    if (!view.call || !deps.lineage || !validCancelActor(actor) || !lineageMatches(view.call, deps.lineage) || actor.parentSessionId !== view.call.parentSessionId || actor.activeLineageId !== view.call.activeLineageId || actor.activeBranchAnchor !== view.call.activeBranchAnchor) return { state: "rejected" as const, reason: "original call owner or active lineage cannot be proven" };
+    if (view.call.originalToolCallStatus === "interrupted") {
+      const replayed = await ensureInterruptedDeliveryPendingLocked(rootDir, view, deps);
+      await materialize(rootDir, replayed);
+      return { state: "interrupted" as const, dispatchCallId };
+    }
+    if (view.call.normalToolResultStatus === "observed") return { state: "rejected" as const, reason: "normal tool result is already durably observed" };
+    await appendWal(rootDir, dispatchCallId, "original_tool_call_interrupted", { reason: "original tool call interrupted", parentSessionId: actor.parentSessionId, activeLineageId: actor.activeLineageId, activeBranchAnchor: actor.activeBranchAnchor, actorRef: cancelActorRef(actor), interruptedAt: now(deps) }, undefined, deps);
+    let replayed = await loadView(rootDir, dispatchCallId);
+    replayed = await ensureInterruptedDeliveryPendingLocked(rootDir, replayed, deps);
+    await materialize(rootDir, replayed); return { state: "interrupted" as const, dispatchCallId };
+  });
+  return result ?? { state: "busy" as const };
+}
+
+export { querySubagentStatusInternal, requestDeliveryAbandonInternal, executeDeliveryInternal, reconcileDeliveryStartupInternal };
+export type { DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry, StatusQueryResult };
 
 const subagentControlService = new SubagentControlService();
 export function requestDelegationCancelInternal(rootDir: string, dispatchCallId: string, delegationId: string, actor: CancelActor, deps: DelegationFoundationDependencies = {}): Promise<CancelReceipt | { state: "rejected" | "paused_integrity" | "busy"; reason?: string; error?: string }> { return subagentControlService.requestCancel(rootDir, dispatchCallId, delegationId, "item", actor, deps); }
@@ -420,7 +446,7 @@ export async function reserveRecoveryCycleInternal(rootDir: string, dispatchCall
 }
 export async function acceptContinuationInternal(rootDir: string, dispatchCallId: string, delegationId: string, reason: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view) || hasCancelRequest(view, delegationId)) return { state: "rejected" as const, reason: "cancellation is durable" }; const identity = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile); const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {}, identity); if (!context.ok) return { state: "rejected" as const, reason: context.reason }; const delegation = view.delegations.get(delegationId); if (!delegation || !["paused_configuration", "recovery_ready"].includes(delegation.state)) return { state: "rejected" as const, reason: "continuation is not startable" }; if (delegation.owner && !sameOwner(delegation.owner, identity)) return { state: "rejected" as const, reason: "continuation owner fence is not current" }; const continuationEpoch = delegation.continuationEpoch + 1; await appendWal(rootDir, dispatchCallId, "continuation_accepted", { scopeId: `delegation:${delegationId}`, continuationEpoch, reason: reason.slice(0, 128) }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "accepted" as const, continuationEpoch }; }); return result ?? { state: "busy" as const }; }
 export async function admitNextChainStepInternal(rootDir: string, dispatchCallId: string, current: ActiveLineage, deps?: DelegationFoundationDependencies) { const result = await withOrphanCoordination(rootDir, async () => withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view)) return { state: "rejected" as const, reason: "call cancellation is durable" }; if (!view.call || view.call.mode !== "chain") return { state: "rejected" as const, reason: "not a chain call" }; if (!lineageMatches({ parentSessionId: view.call.parentSessionId, activeLineageId: view.call.activeLineageId, activeBranchAnchor: view.call.activeBranchAnchor }, current)) return { state: "rejected" as const, reason: "active lineage cannot be proven" }; const currentDelegation = [...view.delegations.values()].find((item) => item.slotIndex === view.call!.chainCursor); if (!currentDelegation || currentDelegation.state !== "returned") return { state: "rejected" as const, reason: "previous chain step has not durably returned" }; const next = view.call.chainCursor + 1; if (next >= view.call.slots.length) return { state: "complete" as const }; let payload: Awaited<ReturnType<typeof callPayload>>; try { payload = await callPayload(rootDir, view.call); } catch { return pausedResult(dispatchCallId, "call private payload binding cannot be proven"); } const id = delegationIdFor(dispatchCallId, next); await admitSlotPrimitive(rootDir, view.call, payload.items[next], next, payload, deps); const admitted = await loadView(rootDir, dispatchCallId); if (admitted.integrity) return pausedResult(dispatchCallId, admitted.integrity.reason); if (admitted.call?.chainCursor === view.call.chainCursor) await appendWal(rootDir, dispatchCallId, "chain_cursor_advanced", { nextIndex: next }, id, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "admitted" as const, delegationId: id, slotIndex: next }; })); return result ?? { state: "busy" as const }; }
-export async function finalizeCallInternal(rootDir: string, dispatchCallId: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (!view.call) return { state: "rejected" as const, reason: "call is not finalizable" }; if (view.call.state === "final" && view.call.finalOutcome) { await materialize(rootDir, view); return { state: "final" as const, outcome: view.call.finalOutcome }; } if (!isCallTerminal(view)) return { state: "rejected" as const, reason: "call is not finalizable" }; const outcome = deriveViewOutcome(view); await appendWal(rootDir, dispatchCallId, "call_finalized", { outcome, finalizedAt: now(deps) }, undefined, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "final" as const, outcome }; }); return result ?? { state: "busy" as const }; }
+export async function finalizeCallInternal(rootDir: string, dispatchCallId: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (!view.call) return { state: "rejected" as const, reason: "call is not finalizable" }; if (view.call.state === "final" && view.call.finalOutcome) { const withDelivery = await ensureInterruptedDeliveryPendingLocked(rootDir, view, deps); await materialize(rootDir, withDelivery); return { state: "final" as const, outcome: view.call.finalOutcome }; } if (!isCallTerminal(view)) return { state: "rejected" as const, reason: "call is not finalizable" }; const outcome = deriveViewOutcome(view); await appendWal(rootDir, dispatchCallId, "call_finalized", { outcome, finalizedAt: now(deps) }, undefined, deps); let replayed = await loadView(rootDir, dispatchCallId); replayed = await ensureInterruptedDeliveryPendingLocked(rootDir, replayed, deps); await materialize(rootDir, replayed); return { state: "final" as const, outcome }; }); return result ?? { state: "busy" as const }; }
 
 // Payload validation is injected into the low-level context so it can validate
 // accepted revision references without importing this control module.

@@ -5,6 +5,10 @@ import type { AttemptResult } from "./runner.ts";
 import type { runPiAttempt } from "./runner.ts";
 
 export type DispatchMode = "single" | "parallel" | "chain";
+export type OriginalToolCallStatus = "running" | "interrupted";
+export type NormalToolResultStatus = "unobserved" | "observed";
+export type CustomOutboxStatus = "pending" | "sending" | "receipted" | "uncertain" | "abandoned";
+export type DeliveryCustomType = "subagent-recovery-completion" | "subagent-cancelled";
 export type DelegationState = "reserved" | "admitted" | "resolving" | "resolution_ready" | "bound" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
 export type SlotState = "pending" | "admitted" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "not_admitted_due_to_call_cancel" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
 
@@ -50,17 +54,60 @@ export interface DelegationFoundationDependencies {
   recheckResolutionAfterTransfer?: (rootDir: string, callId: string, delegationId: string) => Promise<boolean>;
   /** Execution-side abort gate checked while the call fence is held. */
   signal?: AbortSignal;
+  /** Internal host seam; never wired by the public v1 extension. */
+  deliveryHostAdapter?: DeliveryHostAdapter;
 }
 export interface ConfigRevisionActor { actorId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
 export interface CancelActor { parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
 export type CancelScope = "item" | "call";
 export interface CancelReceipt { target: string; scope: CancelScope; actorRef: string; walSeq: number; status: "requested" | "already_requested" | "completed"; }
+export interface DeliveryAbandonReceipt { dispatchCallId: string; deliveryId: string; actorRef: string; walSeq?: number; status: "abandoned" | "already_abandoned" | "receipted" | "rejected"; }
+export interface HostPersistedBranchEntry {
+  entryRef: string;
+  role: "toolResult" | "customMessage";
+  parentSessionId: string;
+  activeLineageId: string;
+  activeBranchAnchor: string;
+  dispatchCallId?: string;
+  proofRef?: string;
+  toolCallId?: string;
+  toolCallIdHash?: string;
+  customType?: DeliveryCustomType;
+  deliveryId?: string;
+}
+export interface DeliveryHostAdapter {
+  scanActiveBranch: (lineage: ActiveLineage) => Promise<readonly HostPersistedBranchEntry[]>;
+  appendCustomMessage: (payload: DeliveryPayload, lineage: ActiveLineage) => Promise<void | { entryRef?: string }>;
+}
+export interface DeliveryPayload {
+  version: 1;
+  customType: DeliveryCustomType;
+  deliveryId: string;
+  dispatchCallId: string;
+  proofRef: string;
+  outcome: "success" | "failure" | "cancelled";
+  originalToolCallStatus: "interrupted";
+  deliverySemantics: "at-most-once";
+  safeRefs: string[];
+}
+export interface CustomOutboxView {
+  deliveryId: string;
+  customType: DeliveryCustomType;
+  status: CustomOutboxStatus;
+  payloadRef: string;
+  proofRef: string;
+  outcome: "success" | "failure" | "cancelled";
+  ownerGeneration?: number;
+  fencingGeneration?: number;
+  ownerRef?: string;
+}
 export type CallCancelSettlement = "returned_before_call_cancel" | "admitted_cancelled" | "not_admitted_due_to_call_cancel";
 export interface DispatchSlotView { index: number; order: number; required: boolean; kind: "single" | "parallel" | "chain"; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string; cancelSettlement?: CallCancelSettlement; }
 export interface DispatchCallView {
   version: 1; dispatchCallId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string;
   persistence: "restart-durable" | "in_process_only"; toolCallIdHash: string; requestDigest: string; mode: DispatchMode; agentScope: AgentScope;
   projectTrustDigest?: string; slots: DispatchSlotView[]; chainCursor: number; privatePayloadRef: string;
+  originalToolCallStatus: OriginalToolCallStatus; normalToolResultStatus: NormalToolResultStatus; customOutbox?: CustomOutboxView;
   state: CallState; cancelRequestedSeq?: number; cancelActorRef?: string; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
 }
 export interface DelegationView {

@@ -31,6 +31,12 @@ export {
   probeOwnerDeathStable,
   delegationFoundationCapability,
   SubagentControlService,
+  markOriginalToolCallInterruptedInternal,
+  querySubagentStatusInternal,
+  requestDeliveryAbandonInternal,
+  executeDeliveryInternal,
+  reconcileDeliveryStartupInternal,
 } from "./delegation.ts";
-export type { CancelActor, CancelReceipt, CancelScope, ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness } from "./delegation.ts";
+export type { CancelActor, CancelReceipt, CancelScope, ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry } from "./delegation.ts";
+export type { StatusQueryResult } from "./delivery.ts";
 export type { OwnerClaim, OwnerIdentityProbeSafetyAdapter } from "./execution-supervisor.ts";

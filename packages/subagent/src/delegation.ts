@@ -9,14 +9,14 @@ import type {
   CallAggregateProof, ChildInspection, ConfigRevisionActor, DelegationExecutionControl, DelegationExecutionDependencies, DelegationExecutionResult,
   DelegationFoundationDependencies, DelegationState, DelegationView, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, DispatchMode,
   DispatchSlotView, InternalDelegation, InternalView, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, ProjectTrustBinding, RevisionIntent,
-  RevisionLifecycle, RevisionObservation, SlotState, StartupNormalizationResult, TornTail, WalEvent,
+  RevisionLifecycle, RevisionObservation, SlotState, StartupNormalizationResult, TornTail, WalEvent, DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry,
 } from "./delegation-types.ts";
 
 export type {
   CallAggregateProof, CancelActor, CancelReceipt, CancelScope, ChildInspection, ConfigRevisionActor, DelegationExecutionDependencies, DelegationExecutionResult, DelegationFoundationDependencies,
   DelegationState, DelegationView, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, DispatchMode, DispatchSlotView, InternalDelegation,
   InternalView, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, ProjectTrustBinding, RevisionIntent, RevisionLifecycle, RevisionObservation,
-  SlotState, StartupNormalizationResult, TornTail, WalEvent,
+  SlotState, StartupNormalizationResult, TornTail, WalEvent, DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry,
 } from "./delegation-types.ts";
 export type { OwnerClaim, OwnerIdentityProbeSafetyAdapter } from "./execution-supervisor.ts";
 export const classifyOwnerIdentityObservation = supervisor.classifyOwnerIdentityObservation;
@@ -54,6 +54,11 @@ export const reconcileCancellationInternal = control.reconcileCancellationIntern
 export { SubagentControlService } from "./delegation-control.ts";
 export const admitNextChainStepInternal = control.admitNextChainStepInternal;
 export const finalizeCallInternal = control.finalizeCallInternal;
+export const markOriginalToolCallInterruptedInternal = control.markOriginalToolCallInterruptedInternal;
+export const querySubagentStatusInternal = control.querySubagentStatusInternal;
+export const requestDeliveryAbandonInternal = control.requestDeliveryAbandonInternal;
+export const executeDeliveryInternal = control.executeDeliveryInternal;
+export const reconcileDeliveryStartupInternal = control.reconcileDeliveryStartupInternal;
 
 export async function claimExecutionOwnerInternal(rootDir: string, dispatchCallId: string, delegationId: string, identity: OwnerIdentity, deps: DelegationFoundationDependencies = {}) {
   return supervisor.claimExecutionOwnerInternal(rootDir, dispatchCallId, delegationId, identity, ownerDeps(deps));
