@@ -10,7 +10,10 @@
   },
   "keywords": ["pi-package"],
   "pi": {
-    "extensions": ["src/index.ts"]
+    "extensions": ["src/index.ts"],
+    "recoveryFenceExtensions": [
+      { "path": "src/side-effect-fence-extension.ts", "role": "fence" }
+    ]
   },
   "peerDependencies": {
     "@pi/codex-usage-status": ">=0.1.0 <0.2.0",

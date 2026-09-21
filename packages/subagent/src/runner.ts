@@ -8,6 +8,7 @@ import type { AgentConfig } from "./agents.ts";
 import { createChildEnvironment } from "./fast-inheritance.ts";
 import { markRetryClassification, retryClassificationOf } from "./retry-classification.ts";
 import { readStableOwnerFileSync } from "./secure-fs.ts";
+import { SIDE_EFFECT_FENCE_TIMEOUT_MS, sideEffectFenceClientProofValid, sideEffectFenceEnvironment, type SideEffectFenceClientConfig } from "./side-effect-fence.ts";
 // Runner is shared by v1 and gated v2; keep its retry bound policy-neutral.
 export const MAX_RETRIES_PER_MODEL = 2;
 export const DEFAULT_RETRY_DELAY_MS = 50;
@@ -82,8 +83,10 @@ export interface RunAttemptOptions {
   firstLogicalChildSpawn: boolean;
   parentFastRequested: boolean;
   onUpdate?: (result: AttemptResult) => void;
-  onChildProcess?: (child: { pid: number; identity: string; sessionPath?: string }) => void | Promise<void>;
+  onChildProcess?: (child: { pid: number; identity: string; sessionPath?: string }) => void | boolean | Promise<void | boolean>;
   spawn?: typeof nodeSpawn;
+  /** Internal v2-only CLI fence; absent means the v1 argv path is untouched. */
+  sideEffectFence?: SideEffectFenceClientConfig;
 }
 
 interface JsonProcess {
@@ -94,6 +97,7 @@ interface JsonProcess {
   on(event: "error", listener: (error: Error) => void): JsonProcess;
   kill(signal?: NodeJS.Signals): boolean;
   killed?: boolean;
+  stdin?: NodeJS.WritableStream;
 }
 
 function emptyUsage(): UsageStats {
@@ -717,11 +721,24 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     sessionId: options.childSessionId,
     cwdScope: safeScope(options.cwd),
   };
+  const failClosed = (reason: string): AttemptResult => { result.phase = "finished"; result.failureKind = "unknown_transport"; result.errorMessage = reason; return sanitizeAttemptResult(result, options.model, [options.task, options.agent.systemPrompt]); };
+  if (options.sideEffectFence && !sideEffectFenceClientProofValid(options.sideEffectFence)) return failClosed("side-effect fence deployment proof is unavailable");
+  if (options.sideEffectFence && typeof options.onChildProcess !== "function") return failClosed("side-effect fence child callback is unavailable");
   const args = ["--mode", "json", "-p"];
   if (options.sessionFile) args.push("--session", path.resolve(options.sessionFile));
   else args.push("--session-dir", options.sessionDir, "--session-id", options.childSessionId);
   if (options.model) args.push("--model", options.model);
-  if (options.agent.tools?.length) args.push("--tools", options.agent.tools.join(","));
+  if (options.agent.tools?.length && !options.sideEffectFence) args.push("--tools", options.agent.tools.join(","));
+  if (options.sideEffectFence) {
+    args.push("--no-tools");
+    // Pi's CLI contract is explicit: --no-tools disables every active tool;
+    // repeated -e flags are loaded in argument order. The fence is appended
+    // last and the task is sent over stdin so private prompt text is absent
+    // from argv. The v1 path above remains byte-for-byte unchanged.
+    args.push("--no-extensions");
+    for (const extension of options.sideEffectFence.extensions) args.push("-e", extension);
+    args.push("-e", options.sideEffectFence.interceptor);
+  }
   let promptFile: { dir: string; file: string } | undefined;
   let stdout = "";
   let rawStderr = "";
@@ -790,7 +807,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     }
     promptFile = await writeSystemPrompt(options.agent);
     if (promptFile) args.push("--append-system-prompt", promptFile.file);
-    args.push(options.task);
+    if (!options.sideEffectFence) args.push(options.task);
     const invocation = getPiInvocation(args);
     const spawnProcess = options.spawn ?? nodeSpawn;
     let proc: JsonProcess;
@@ -798,8 +815,8 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       proc = spawnProcess(invocation.command, invocation.args, {
         cwd: options.cwd,
         shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? createChildEnvironment({
+        stdio: options.sideEffectFence ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+        env: options.sideEffectFence ? { ...(options.env ?? createChildEnvironment({ agent: options.agent, firstLogicalChildSpawn: options.firstLogicalChildSpawn, parentSessionRequestedFast: options.parentFastRequested })), ...sideEffectFenceEnvironment(options.sideEffectFence) } : options.env ?? createChildEnvironment({
           agent: options.agent,
           firstLogicalChildSpawn: options.firstLogicalChildSpawn,
           parentSessionRequestedFast: options.parentFastRequested,
@@ -811,18 +828,70 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       result.errorMessage = "child process could not be started";
       return sanitizeAttemptResult(result, options.model, blockedTexts);
     }
+    let fencedLifecycleFailed = false;
+    const fenceTimeoutMs = options.sideEffectFence?.timeoutMs ?? SIDE_EFFECT_FENCE_TIMEOUT_MS;
     await new Promise<void>((resolve) => {
       let buffer = "";
-      let childRegistration = Promise.resolve();
-      if (typeof proc.pid === "number" && proc.pid > 0) {
-        childRegistration = Promise.resolve(options.onChildProcess?.({
-          pid: proc.pid,
-          identity: options.childSessionId,
-          ...(options.sessionFile ? { sessionPath: path.resolve(options.sessionFile) } : {}),
-        })).catch(() => {
+      let processClosed = false;
+      let registrationFailed = false;
+      let settled = false;
+      let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (code: number | null = null) => {
+        if (settled) return;
+        settled = true;
+        if (forceSettleTimer) clearTimeout(forceSettleTimer);
+        result.exitCode = code;
+        if (buffer.trim()) processLine(buffer);
+        resolve();
+      };
+      const finishAfterGracefulTeardown = async (code: number | null) => {
+        if (!options.sideEffectFence || !options.sideEffectFence.awaitGraceful) { finish(code); return; }
+        const graceful = await options.sideEffectFence.awaitGraceful(fenceTimeoutMs);
+        if (!graceful) {
+          fencedLifecycleFailed = true;
           malformed = true;
-          try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
-        });
+          result.errorMessage = "child graceful shutdown cannot be proven";
+        }
+        finish(code);
+      };
+      const terminate = (reason: string, cancelled = false) => {
+        if (cancelled) wasAborted = true;
+        if (options.sideEffectFence) fencedLifecycleFailed = true;
+        registrationFailed = true;
+        malformed = true;
+        result.errorMessage = reason;
+        try { (proc.stdin as any)?.destroy?.(); } catch { /* already closed */ }
+        try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
+        forceSettleTimer = setTimeout(() => {
+          try { if (!proc.killed) proc.kill("SIGKILL"); } catch { /* process already gone */ }
+          finish(null);
+        }, 5_000);
+        forceSettleTimer.unref();
+      };
+      const lifecycle = async (): Promise<void> => {
+        if (typeof proc.pid !== "number" || proc.pid <= 0) {
+          if (options.sideEffectFence) throw new Error("child pid cannot be proven");
+          return;
+        }
+        const child = { pid: proc.pid, identity: options.childSessionId, ...(options.sessionFile ? { sessionPath: path.resolve(options.sessionFile) } : {}) };
+        const callbackResult = await options.onChildProcess?.(child);
+        if (callbackResult === false) throw new Error("child callback rejected binding");
+        if (options.sideEffectFence) {
+          const client = options.sideEffectFence;
+          const bindResult = await client.bindChild!(child.pid, child.identity);
+          if (bindResult === false) throw new Error("side-effect fence child binding rejected");
+          if (!await client.awaitHandshake!(fenceTimeoutMs)) throw new Error("side-effect fence handshake cannot be proven");
+        }
+      };
+      const lifecycleTimeout = options.sideEffectFence ? new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("child lifecycle binding timeout")), fenceTimeoutMs);
+        timer.unref();
+      }) : undefined;
+      let childRegistration = (options.sideEffectFence ? Promise.race([lifecycle(), lifecycleTimeout!]) : lifecycle()).catch((error: unknown) => {
+        terminate(error instanceof Error ? error.message : "child lifecycle binding failed");
+      });
+      if (options.sideEffectFence?.failure) {
+        void options.sideEffectFence.failure.then((reason) => terminate(typeof reason === "string" ? reason : "side-effect fence watchdog failed"), () => terminate("side-effect fence watchdog failed"));
       }
       proc.stdout.on("data", (data: Buffer | string) => {
         stdout += data.toString();
@@ -832,24 +901,32 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
         for (const line of lines) processLine(line);
       });
       proc.stderr.on("data", (data: Buffer | string) => { rawStderr += data.toString(); });
-      proc.on("error", () => { malformed = true; childRegistration.then(resolve); });
+      proc.on("error", () => { processClosed = true; malformed = true; finish(null); });
       proc.on("close", (code) => {
-        childRegistration.then(() => {
-          result.exitCode = code;
-          if (buffer.trim()) processLine(buffer);
-          resolve();
-        });
+        processClosed = true;
+        childRegistration.then(() => { void finishAfterGracefulTeardown(code); });
       });
-      const abort = () => {
-        wasAborted = true;
-        try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
-        setTimeout(() => { if (!proc.killed) try { proc.kill("SIGKILL"); } catch { /* ignore */ } }, 5000).unref();
-      };
+      // A fenced child receives no task bytes until the durable child binding,
+      // the client-owned channel bind, and the client-owned hello/ACK have all
+      // completed. The runner owns this sequence; the callback only persists
+      // the generic child binding and cannot satisfy the fence by itself.
+      childRegistration.then(() => {
+        if (registrationFailed || processClosed || proc.killed || !proc.stdin || fencedLifecycleFailed) return;
+        if (options.sideEffectFence) {
+          try { proc.stdin.write(options.task); proc.stdin.end(); } catch { terminate("fenced task delivery failed"); }
+        } else {
+          proc.stdin?.end();
+        }
+      });
+      const abort = () => terminate("cancelled", true);
       if (options.signal) {
         if (options.signal.aborted) abort();
         else options.signal.addEventListener("abort", abort, { once: true });
       }
     });
+    if (fencedLifecycleFailed) {
+      try { await options.sideEffectFence?.close?.("runner_fenced_lifecycle_failure"); } catch { /* cleanup remains fail closed */ }
+    }
 
     const validHeader = sawHeader && headerId === options.childSessionId && path.resolve(headerCwd!) === path.resolve(options.cwd);
     const finalErrorMessage = terminal?.stopReason === "error" && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;

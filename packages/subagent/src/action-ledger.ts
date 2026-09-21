@@ -39,6 +39,8 @@ function canonical(value: unknown): unknown {
 function canonicalJson(value: unknown): string { return JSON.stringify(canonical(value)); }
 export function canonicalArgsDigest(args: unknown): string { return hash(canonicalJson(args)); }
 function logicalIdentityDigest(identity: Pick<ActionIdentity, "delegationId" | "toolCallOrdinal" | "logicalCheckpoint" | "finalToolName" | "canonicalArgsDigest">): string {
+  // Stable logical coordinates only. Attempt scope, reservation, fencing and
+  // toolCallId are deliberately absent so replacement children reuse this ID.
   return hash(JSON.stringify([identity.delegationId, identity.toolCallOrdinal, identity.logicalCheckpoint, identity.finalToolName, identity.canonicalArgsDigest]));
 }
 function identityDigest(identity: ActionIdentity): string { return logicalIdentityDigest(identity); }
@@ -62,7 +64,7 @@ function projectionFromIntent(data: Record<string, unknown>): ActionProjection {
   const policy = data.policy;
   if (!validPolicy(policy)) throw new Error("action intent policy is invalid");
   return {
-    actionId: String(data.actionId), logicalActionId: String(data.logicalActionId), identityDigest: String(data.identityDigest), delegationId: String(data.delegationId), logicalCheckpoint: String(data.logicalCheckpoint), executionScopeHash: String(data.executionScopeHash), reservationIdHash: String(data.reservationIdHash), continuationEpoch: Number(data.continuationEpoch), fencingGeneration: Number(data.fencingGeneration), ownerGeneration: Number(data.ownerGeneration), spawnId: String(data.spawnId), toolCallOrdinal: Number(data.toolCallOrdinal), finalToolNameHash: String(data.finalToolNameHash), canonicalArgsDigest: String(data.canonicalArgsDigest), stableIdempotencyKey: String(data.stableIdempotencyKey), policy, status: "intent_acked",
+    actionId: String(data.actionId), logicalActionId: String(data.logicalActionId), identityDigest: String(data.identityDigest), delegationId: String(data.delegationId), logicalCheckpoint: String(data.logicalCheckpoint), executionScopeHash: String(data.executionScopeHash), reservationIdHash: String(data.reservationIdHash), continuationEpoch: Number(data.continuationEpoch), fencingGeneration: Number(data.fencingGeneration), ownerGeneration: Number(data.ownerGeneration), spawnId: String(data.spawnId), toolCallOrdinal: Number(data.toolCallOrdinal), finalToolNameHash: String(data.finalToolNameHash), canonicalArgsDigest: String(data.canonicalArgsDigest), ...(typeof data.finalArgsDigest === "string" ? { finalArgsDigest: data.finalArgsDigest } : {}), stableIdempotencyKey: String(data.stableIdempotencyKey), ...(typeof data.idempotencyParameter === "string" ? { idempotencyParameter: data.idempotencyParameter } : {}), policy, status: "intent_acked",
   };
 }
 function hasAction(view: InternalView, actionId: string): ActionProjection | undefined { return view.actions?.get(actionId); }
@@ -131,14 +133,22 @@ export async function beginActionIntentInternal(rootDir: string, dispatchCallId:
     const delegation = view.delegations.get(delegationId);
     if (!delegation || !claimMatches(delegation, claim)) return { state: "rejected" as const, handler: 0 as const, reason: "current owner claim cannot be proven" };
     if (!["initial_running", "recovery_running", "reattach_only"].includes(delegation.state) || hasCancel(view, delegationId)) return { state: "rejected" as const, handler: 0 as const, reason: "action scope is not running" };
-    let computedArgsDigest: string;
-    try { computedArgsDigest = canonicalArgsDigest(request.finalArgs); } catch { return { state: "rejected" as const, handler: 0 as const, reason: "action args cannot be canonically encoded" }; }
-    if (request.canonicalArgsDigest !== undefined && request.canonicalArgsDigest !== computedArgsDigest) return { state: "rejected" as const, handler: 0 as const, reason: "canonical args digest does not match final args" };
-    const full: ActionIntentRequest = { ...request, delegationId, reservationId: request.reservationId ?? delegation.initialReservationId ?? "", continuationEpoch: request.continuationEpoch ?? delegation.continuationEpoch, fencingGeneration: request.fencingGeneration ?? delegation.fencingGeneration, canonicalArgsDigest: computedArgsDigest } as ActionIntentRequest;
+    let finalArgsDigest: string;
+    try { finalArgsDigest = canonicalArgsDigest(request.finalArgs); } catch { return { state: "rejected" as const, handler: 0 as const, reason: "action args cannot be canonically encoded" }; }
+    // Legacy callers used canonicalArgsDigest for the exact handler input. The
+    // two-phase fence supplies preInjectionArgsDigest, making the stable key
+    // independent of the injected idempotency field.
+    const preInjectionArgsDigest = request.preInjectionArgsDigest ?? request.canonicalArgsDigest ?? finalArgsDigest;
+    if (!/^[0-9a-f]{64}$/.test(String(preInjectionArgsDigest))) return { state: "rejected" as const, handler: 0 as const, reason: "pre-injection args digest is invalid" };
+    if (!request.preInjectionArgsDigest && request.canonicalArgsDigest !== undefined && request.canonicalArgsDigest !== finalArgsDigest) return { state: "rejected" as const, handler: 0 as const, reason: "canonical args digest does not match final args" };
+    const full: ActionIntentRequest = { ...request, delegationId, reservationId: request.reservationId ?? delegation.initialReservationId ?? "", continuationEpoch: request.continuationEpoch ?? delegation.continuationEpoch, fencingGeneration: request.fencingGeneration ?? delegation.fencingGeneration, canonicalArgsDigest: preInjectionArgsDigest, finalArgsDigest } as ActionIntentRequest;
     if (!full.reservationId || full.fencingGeneration !== delegation.fencingGeneration || full.continuationEpoch !== delegation.continuationEpoch || !validPolicy(full.policy) || !Number.isSafeInteger(full.toolCallOrdinal) || full.toolCallOrdinal < 0 || !full.logicalCheckpoint || !full.finalToolName) return { state: "rejected" as const, handler: 0 as const, reason: "action identity or policy is invalid" };
-    const actionId = actionIdFor(full); const logicalActionId = actionId; const existing = hasAction(view, actionId);
+    const actionId = actionIdFor(full); const logicalActionId = actionId; const expectedStableKey = stableIdempotencyKeyFor(logicalActionId);
+    if (full.stableIdempotencyKey !== undefined && full.stableIdempotencyKey !== expectedStableKey) return { state: "paused_integrity" as const, actionId, logicalActionId, handler: 0 as const, reason: "stable idempotency key conflict" };
+    const existing = hasAction(view, actionId);
     if (existing) {
       if (!sameLogicalIdentity(existing, full, actionId)) return { state: "paused_integrity" as const, actionId, logicalActionId, handler: 0 as const, reason: "logical action identity conflict" };
+      if (existing.canonicalArgsDigest !== full.canonicalArgsDigest || existing.finalArgsDigest !== full.finalArgsDigest || existing.finalToolNameHash !== safeNameHash(full.finalToolName) || existing.policy !== full.policy || existing.stableIdempotencyKey !== expectedStableKey || (existing.idempotencyParameter ?? undefined) !== (full.idempotencyParameter ?? undefined)) return { state: "paused_integrity" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy, reason: "stable action field conflict" };
       if (existing.status === "result_acked" || existing.status === "confirmed_succeeded") return { state: "committed" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy };
       if (["unknown", "still_unknown"].includes(existing.status)) return { state: "rejected" as const, actionId, logicalActionId, handler: 0 as const, reason: "logical action outcome is unresolved" };
       const retry = full.retryPolicy;
@@ -150,10 +160,10 @@ export async function beginActionIntentInternal(rootDir: string, dispatchCallId:
     // An unsupported classification is explicit policy, never inferred from a name.
     if (full.policy === "unsupported") return { state: "rejected" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy, reason: "policy does not admit this tool" };
     const privateRef = actionPrivateRef(logicalActionId);
-    try { await writePrivate(privatePayload(dirs(rootDir), `action-${privateFileId(logicalActionId)}`), { version: 1, actionId: logicalActionId, logicalActionId, identityDigest: identityDigest(full), identity: full, stableIdempotencyKey: stableIdempotencyKeyFor(logicalActionId), rawFinalArgs: full.finalArgs, rawArgsRef: full.rawArgsRef }); } catch { return { state: "rejected" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy, reason: "action intent private durability ACK failed" }; }
+    try { await writePrivate(privatePayload(dirs(rootDir), `action-${privateFileId(logicalActionId)}`), { version: 1, actionId: logicalActionId, logicalActionId, identityDigest: identityDigest(full), identity: full, stableIdempotencyKey: expectedStableKey, preInjectionArgsDigest: full.canonicalArgsDigest, finalArgsDigest: full.finalArgsDigest, idempotencyParameter: full.idempotencyParameter, rawFinalArgs: full.finalArgs, rawArgsRef: full.rawArgsRef }); } catch { return { state: "rejected" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy, reason: "action intent private durability ACK failed" }; }
     try {
       const retryAllowed = !!existing;
-      await appendWal(rootDir, dispatchCallId, "action_intent_acked", { actionId, logicalActionId, identityDigest: identityDigest(full), delegationId, logicalCheckpoint: full.logicalCheckpoint, executionScopeHash: safeScopeHash(full.executionScope), reservationIdHash: safeReservationHash(full.reservationId), continuationEpoch: full.continuationEpoch, fencingGeneration: full.fencingGeneration, ownerGeneration: claim.ownerGeneration, spawnId: claim.spawnId, toolCallOrdinal: full.toolCallOrdinal, finalToolNameHash: safeNameHash(full.finalToolName), canonicalArgsDigest: full.canonicalArgsDigest, stableIdempotencyKey: stableIdempotencyKeyFor(logicalActionId), retryAllowed, policy: full.policy, privateRef }, delegationId, deps);
+      await appendWal(rootDir, dispatchCallId, "action_intent_acked", { actionId, logicalActionId, identityDigest: identityDigest(full), delegationId, logicalCheckpoint: full.logicalCheckpoint, executionScopeHash: safeScopeHash(full.executionScope), reservationIdHash: safeReservationHash(full.reservationId), continuationEpoch: full.continuationEpoch, fencingGeneration: full.fencingGeneration, ownerGeneration: claim.ownerGeneration, spawnId: claim.spawnId, toolCallOrdinal: full.toolCallOrdinal, finalToolNameHash: safeNameHash(full.finalToolName), canonicalArgsDigest: full.canonicalArgsDigest, finalArgsDigest: full.finalArgsDigest, stableIdempotencyKey: expectedStableKey, ...(full.idempotencyParameter ? { idempotencyParameter: full.idempotencyParameter } : {}), retryAllowed, policy: full.policy, privateRef }, delegationId, deps);
     } catch {
       return { state: "rejected" as const, actionId, logicalActionId, handler: 0 as const, policy: full.policy, reason: "action intent durability ACK failed" };
     }

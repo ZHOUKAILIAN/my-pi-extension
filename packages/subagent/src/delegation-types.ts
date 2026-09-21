@@ -3,6 +3,7 @@ import type { ActiveLineage } from "./lineage.ts";
 import type { FastInheritanceConsumer } from "./fast-inheritance.ts";
 import type { AttemptResult } from "./runner.ts";
 import type { runPiAttempt } from "./runner.ts";
+import type { SideEffectFenceBinding, SideEffectFenceConfig, SideEffectFenceReattachProof } from "./side-effect-fence.ts";
 
 export type DispatchMode = "single" | "parallel" | "chain";
 export type OriginalToolCallStatus = "running" | "interrupted";
@@ -47,20 +48,23 @@ export interface ChildControlAdapter {
   waitForDeath?: (child: ChildInspection) => Promise<ChildControlObservation | ChildControlObservation["state"]>;
 }
 export interface ActionIdentity {
-  /** Stable logical identity; never contains an attempt execution coordinate. */
+  /** Stable logical identity; never contains an attempt execution coordinate or toolCallId. */
   delegationId: string;
   /** Durable ordinal/checkpoint supplied by the internal caller; never inferred from text. */
   toolCallOrdinal: number;
   logicalCheckpoint: string;
   finalToolName: string;
+  /** Digest of canonical arguments before any idempotency field injection. */
   canonicalArgsDigest: string;
+  /** Digest of the exact arguments handed to the tool handler, when different. */
+  finalArgsDigest?: string;
   /** Current attempt coordinates, retained for fencing and audit only. */
   executionScope: string;
   reservationId: string;
   continuationEpoch: number;
   fencingGeneration: number;
 }
-export interface ActionIntentRequest extends ActionIdentity { policy: ActionPolicyClassification; finalArgs: unknown; rawArgsRef?: string; retryPolicy?: ActionRetryPolicy; }
+export interface ActionIntentRequest extends ActionIdentity { policy: ActionPolicyClassification; finalArgs: unknown; rawArgsRef?: string; retryPolicy?: ActionRetryPolicy; stableIdempotencyKey?: string; idempotencyParameter?: string; preInjectionArgsDigest?: string; }
 export interface ActionResultRequest { actionId?: string; logicalActionId?: string; resultRef: string; resultType: string; status: "success" | "failure"; rawResultRef?: string; }
 export interface ActionRetryPolicy { allow: boolean; idempotent?: boolean; externalSystemSupportsKey?: boolean; stableIdempotencyKey?: string; }
 export interface ActionProjection {
@@ -78,7 +82,9 @@ export interface ActionProjection {
   toolCallOrdinal: number;
   finalToolNameHash: string;
   canonicalArgsDigest: string;
+  finalArgsDigest?: string;
   stableIdempotencyKey: string;
+  idempotencyParameter?: string;
   policy: ActionPolicyClassification;
   status: ActionStatus;
   resultType?: string;
@@ -116,6 +122,10 @@ export interface DelegationFoundationDependencies {
   childControlAdapter?: ChildControlAdapter;
   /** Internal watchdog seam used only after an action result becomes unknown. */
   watchdogTerminate?: (request: { delegationId: string; actionId?: string; reason: string; ownerGeneration: number; fencingGeneration: number }) => Promise<void> | void;
+  /** Gated v2-only Pi side-effect fence. Public v1 callers never provide this. */
+  sideEffectFence?: SideEffectFenceConfig;
+  /** Reattach must prove it can rebuild the same fenced channel before execution. */
+  reattachFenceProof?: (options: { delegationId: string; spawnId: string; ownerGeneration: number; fencingGeneration: number }) => Promise<SideEffectFenceReattachProof | undefined>;
 }
 export interface ConfigRevisionActor { actorId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
 export interface CancelActor { parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
@@ -173,7 +183,7 @@ export interface DispatchCallView {
 export interface DelegationView {
   version: 1; delegationId: string; dispatchCallId: string; slotIndex: number; parentSessionId: string;
   activeLineageId: string; activeBranchAnchor: string; effectiveCwdHash: string; requestedTarget: string;
-  discoveryScope: AgentScope; state: DelegationState; privatePayloadRef: string;
+  discoveryScope: AgentScope; state: DelegationState; privatePayloadRef: string; sideEffectFence?: SideEffectFenceBinding;
   canonical?: { name: string; source: "user" | "project"; discoveryRootHash: string; fileHash: string; digest: string; aliases: string[] };
   pauseReason?: string; initialReservationId?: string; returnedOutcome?: "success" | "failure" | "cancelled"; resultRef?: string;
 }

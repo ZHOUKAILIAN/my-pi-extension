@@ -17,6 +17,7 @@ import { lineageMatches } from "./lineage.ts";
 import { reconcileBeforeReturnInternal } from "./action-ledger.ts";
 import { hasUnresolvedActionForDelegation } from "./action-predicate.ts";
 import { durableChildState } from "./wal-replay.ts";
+import { buildSideEffectFenceExtensions, sideEffectFenceDeploymentVerified, sideEffectFenceReattachProofValid, startSideEffectFenceServer, type SideEffectFenceServer } from "./side-effect-fence.ts";
 
 export interface OwnerClaim {
   owner: OwnerIdentity;
@@ -402,6 +403,12 @@ export async function bindChildSessionInternal(rootDir: string, dispatchCallId: 
     if (!executionContext.ok) return { state: "rejected" as const, reason: executionContext.reason };
     const delegation = view.delegations.get(delegationId);
     if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected" as const, reason: "delegation cancellation is durable" };
+    if (delegation?.sideEffectFence) {
+      let proof: ReturnType<typeof buildSideEffectFenceExtensions> | undefined;
+      try { proof = deps.sideEffectFence ? buildSideEffectFenceExtensions(deps.sideEffectFence) : undefined; } catch { proof = undefined; }
+      const valid = !!deps.sideEffectFence && !!proof && sideEffectFenceDeploymentVerified(deps.sideEffectFence, proof.manifestDigest) && delegation.sideEffectFence.manifestDigest === proof.manifestDigest && delegation.sideEffectFence.protocol === 1 && delegation.sideEffectFence.policyDigest === proof.policyDigest && delegation.sideEffectFence.toolSetDigest === proof.toolSetDigest && delegation.sideEffectFence.runnerVersion === "subagent-runner/1";
+      if (!valid) { await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "side_effect_fence_binding_proof_missing_or_changed" }, delegationId, deps); const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused); return pausedResult(dispatchCallId, "side-effect fence deployment verification or binding proof cannot be proven"); }
+    }
     // Binding is a production callback contract, not a best-effort test seam.
     // All four durable coordinates are compared while the call fence is held;
     // a stale owner therefore returns before appendWal and produces zero WAL.
@@ -422,6 +429,18 @@ export async function markSpawnStartedInternal(rootDir: string, dispatchCallId: 
     const delegation = view.delegations.get(delegationId); const expectedState = runKind === "initial" ? "initial_ready" : "cycle_ready";
     if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected" as const, reason: "delegation cancellation is durable" };
     if (!delegation || delegation.state !== expectedState || !delegation.initialReservationId) return { state: "rejected" as const, reason: "spawn lifecycle precondition is not met" };
+    const suppliedFence = deps.sideEffectFence;
+    let launchProof: ReturnType<typeof buildSideEffectFenceExtensions> | undefined;
+    if (suppliedFence) { try { launchProof = buildSideEffectFenceExtensions(suppliedFence); } catch { launchProof = undefined; } }
+    const fenceMismatch = delegation.sideEffectFence ? !launchProof || !suppliedFence || !sideEffectFenceDeploymentVerified(suppliedFence, launchProof.manifestDigest) || delegation.sideEffectFence.manifestDigest !== launchProof.manifestDigest || delegation.sideEffectFence.protocol !== 1 || delegation.sideEffectFence.policyDigest !== launchProof.policyDigest || delegation.sideEffectFence.toolSetDigest !== launchProof.toolSetDigest || delegation.sideEffectFence.runnerVersion !== "subagent-runner/1" : !!suppliedFence && (!launchProof || !sideEffectFenceDeploymentVerified(suppliedFence, launchProof.manifestDigest));
+    if (fenceMismatch || (delegation.sideEffectFence && !suppliedFence)) {
+      await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "side_effect_fence_requirement_missing_or_changed" }, delegationId, deps);
+      const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused); return pausedResult(dispatchCallId, "side-effect fence deployment verification or requirement cannot be proven");
+    }
+    if (!delegation.sideEffectFence && launchProof && deps.sideEffectFence) {
+      await appendWal(rootDir, dispatchCallId, "side_effect_fence_bound", { manifestDigest: launchProof.manifestDigest, protocol: 1, policyDigest: launchProof.policyDigest, toolSetDigest: launchProof.toolSetDigest, runnerVersion: "subagent-runner/1" }, delegationId, deps);
+      view = await loadView(rootDir, dispatchCallId);
+    }
     if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" };
     if (runKind === "recovery" && delegation.continuationEpoch < 1) return { state: "rejected" as const, reason: "recovery startup proof is incomplete" };
     const identity = deps.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile);
@@ -532,7 +551,20 @@ async function runExecutionCycle(rootDir: string, dispatchCallId: string, delega
     for (let retry = 0; retry <= MAX_PROVIDER_RETRIES; retry += 1) {
       if (isAbortRequested(deps.signal)) { const cancelled: AttemptResult = { agent: agent.name, agentSource: agent.source, exitCode: null, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, requestedModel: candidate.model ?? "unknown", actualModel: "unknown", source: "retry", attempt: ++number, failureKind: "cancelled", errorMessage: "cancelled", cwdScope: "cwd:unknown" }; attempts.push(cancelled); return { attempt: cancelled, attempts }; }
       const firstAttempt = number === 0; const prompt = continuationTask(task, firstAttempt);
-      const attemptNumber = ++number; const raw = await run({ cwd: path.resolve((await readDelegationPayload(rootDir, await loadView(rootDir, dispatchCallId), (await loadView(rootDir, dispatchCallId)).delegations.get(delegationId)!)).effectiveCwd), agent, task: prompt, model: candidate.model, attempt: attemptNumber, source: retry > 0 ? "retry" : candidate.source, sessionDir, childSessionId, sessionFile, signal: deps.signal, env: deps.fast?.environment(agent, runKind === "initial" && firstAttempt), firstLogicalChildSpawn: runKind === "initial" && firstAttempt, parentFastRequested: deps.fast?.requestedFast ?? false, onChildProcess: async (child: { pid: number; identity: string; sessionPath?: string }) => { const binding = await deps.control!.bindChildSession(rootDir, dispatchCallId, delegationId, claim, child.identity, child.sessionPath, child.pid, deps, attemptNumber); if (binding.state !== "bound") throw new Error("child binding was not durably accepted"); }, onUpdate: deps.onUpdate });
+      const attemptNumber = ++number;
+      const currentForFence = deps.sideEffectFence && run === runPiAttempt ? await loadView(rootDir, dispatchCallId) : undefined;
+      const currentDelegationForFence = currentForFence?.delegations.get(delegationId);
+      let fence: SideEffectFenceServer | undefined;
+      if (deps.sideEffectFence && run === runPiAttempt) {
+        if (!currentDelegationForFence?.initialReservationId) throw new Error("side-effect fence reservation cannot be proven");
+        fence = await startSideEffectFenceServer({ rootDir, dispatchCallId, delegationId, executionScope: `${delegationId}:${spawnId}:${attemptNumber}`, reservationId: currentDelegationForFence.initialReservationId, continuationEpoch: currentDelegationForFence.continuationEpoch, claim, config: deps.sideEffectFence, deps });
+      }
+      let raw: AttemptResult;
+      try {
+        raw = await run({ cwd: path.resolve((await readDelegationPayload(rootDir, await loadView(rootDir, dispatchCallId), (await loadView(rootDir, dispatchCallId)).delegations.get(delegationId)!)).effectiveCwd), agent, task: prompt, model: candidate.model, attempt: attemptNumber, source: retry > 0 ? "retry" : candidate.source, sessionDir, childSessionId, sessionFile, signal: deps.signal, env: deps.fast?.environment(agent, runKind === "initial" && firstAttempt), firstLogicalChildSpawn: runKind === "initial" && firstAttempt, parentFastRequested: deps.fast?.requestedFast ?? false, sideEffectFence: fence?.client, onChildProcess: async (child: { pid: number; identity: string; sessionPath?: string }) => { const binding = await deps.control!.bindChildSession(rootDir, dispatchCallId, delegationId, claim, child.identity, child.sessionPath, child.pid, deps, attemptNumber); if (binding.state !== "bound") throw new Error("child binding was not durably accepted"); }, onUpdate: deps.onUpdate });
+      } finally {
+        if (fence) await fence.close("child_exit");
+      }
       const attempt = sanitizeAttemptResult(raw); const boundView = await loadView(rootDir, dispatchCallId); const boundAttempt = boundView.events.some((event) => (event.type === "child_session_bound" || event.type === "child_session_rebound") && event.delegationId === delegationId && event.data.spawnId === spawnId && Number(event.data.fencingGeneration) === fencingGeneration && Number(event.data.ownerGeneration) === ownerGeneration && Number(event.data.attempt) === attemptNumber); if (!boundAttempt || boundView.integrity || !boundView.delegations.get(delegationId)?.childSessionId) { attempt.failureKind = "unknown_transport"; attempt.errorMessage = "child attempt binding cannot be proven"; } attempts.push(attempt); deps.onUpdate?.(attempt);
       const executionCwd = path.resolve((await readDelegationPayload(rootDir, await loadView(rootDir, dispatchCallId), (await loadView(rootDir, dispatchCallId)).delegations.get(delegationId)!)).effectiveCwd);
       const discovered = await findSessionFile(sessionDir, childSessionId); if (discovered && await validateSessionFile(discovered, childSessionId, executionCwd)) sessionFile = discovered;
@@ -587,6 +619,17 @@ export async function executeDelegationInternal(rootDir: string, dispatchCallId:
   if (before.state === "returned") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation already has a durable outcome" };
   if (isAbortRequested(deps.signal)) { const aborted = await interruptBeforeSpawn(rootDir, dispatchCallId, delegationId, agent, deps); return { state: aborted === "busy" ? "busy" : aborted === "rejected" ? "rejected" : "paused_uncertainty", dispatchCallId, delegationId, attempts: [], error: "abort requested before spawn" }; }
   if (!before.canonical || !canonicalAgentMatches(agent, before.canonical)) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "canonical execution identity cannot be proven" };
+  let launchProof: ReturnType<typeof buildSideEffectFenceExtensions> | undefined;
+  if (deps.sideEffectFence) { try { launchProof = buildSideEffectFenceExtensions(deps.sideEffectFence); } catch { launchProof = undefined; } }
+  const fenceRequired = before.sideEffectFence !== undefined;
+  const fenceSatisfied = !!deps.sideEffectFence && !!launchProof && sideEffectFenceDeploymentVerified(deps.sideEffectFence, launchProof.manifestDigest) && (!fenceRequired || (before.sideEffectFence!.manifestDigest === launchProof.manifestDigest && before.sideEffectFence!.protocol === 1 && before.sideEffectFence!.policyDigest === launchProof.policyDigest && before.sideEffectFence!.toolSetDigest === launchProof.toolSetDigest && before.sideEffectFence!.runnerVersion === "subagent-runner/1"));
+  if ((fenceRequired || deps.sideEffectFence) && !fenceSatisfied) {
+    await withCallLock(rootDir, dispatchCallId, async () => {
+      const latest = await loadView(rootDir, dispatchCallId); const current = latest.delegations.get(delegationId);
+      if (!latest.integrity && current && !["returned", "cancelled"].includes(current.state)) { await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "side_effect_fence_requirement_missing_or_changed" }, delegationId, deps); await materialize(rootDir, await loadView(rootDir, dispatchCallId)); }
+    });
+    return { state: "paused_integrity", dispatchCallId, delegationId, attempts: [], error: "side-effect fence deployment verification or requirement cannot be proven" };
+  }
   let runKind: "initial" | "recovery"; let recoveryCycle: number | undefined;
   if (before.state === "bound") { const reserved = await deps.control!.reserveInitial(rootDir, dispatchCallId, delegationId, deps); if (reserved.state !== "reserved" && reserved.state !== "ready") return { state: reserved.state === "paused_configuration" ? "paused_configuration" : "rejected", dispatchCallId, delegationId, attempts: [], error: errorText(reserved) }; runKind = "initial"; }
   else if (before.state === "initial_ready") runKind = "initial";
@@ -639,6 +682,24 @@ export async function executeReattachedDelegationInternal(rootDir: string, dispa
   const view = await loadView(rootDir, dispatchCallId); const delegation = view.delegations.get(delegationId);
   if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation cancellation is durable" };
   if (!delegation || !["reattach_only", "initial_running", "recovery_running"].includes(delegation.state) || !delegation.childSessionId || !delegation.spawnId || !delegation.childIdentity || !deps.inspectChild) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "live child identity is not reattachable" };
+  if (delegation.sideEffectFence || deps.sideEffectFence) {
+    let rebuildable: unknown;
+    let launchProof: ReturnType<typeof buildSideEffectFenceExtensions> | undefined;
+    try { launchProof = deps.sideEffectFence ? buildSideEffectFenceExtensions(deps.sideEffectFence) : undefined; } catch { launchProof = undefined; }
+    const bindingMatches = !!deps.sideEffectFence && !!launchProof && sideEffectFenceDeploymentVerified(deps.sideEffectFence, launchProof.manifestDigest) && !!delegation.sideEffectFence && delegation.sideEffectFence.manifestDigest === launchProof.manifestDigest && delegation.sideEffectFence.protocol === 1 && delegation.sideEffectFence.policyDigest === launchProof.policyDigest && delegation.sideEffectFence.toolSetDigest === launchProof.toolSetDigest && delegation.sideEffectFence.runnerVersion === "subagent-runner/1";
+    try { rebuildable = bindingMatches && deps.reattachFenceProof ? await deps.reattachFenceProof({ delegationId, spawnId: delegation.spawnId, ownerGeneration: delegation.ownerGeneration, fencingGeneration: delegation.fencingGeneration }) : undefined; } catch { rebuildable = undefined; }
+    if (!bindingMatches || !deps.reattachFenceProof || !sideEffectFenceReattachProofValid(rebuildable, { deploymentProof: deps.sideEffectFence?.deploymentVerification!, delegationId, spawnId: delegation.spawnId, ownerGeneration: delegation.ownerGeneration, fencingGeneration: delegation.fencingGeneration })) {
+      await withCallLock(rootDir, dispatchCallId, async () => {
+        const latest = await loadView(rootDir, dispatchCallId);
+        const current = latest.delegations.get(delegationId);
+        if (!latest.integrity && current && current.spawnId === delegation.spawnId && current.fencingGeneration === delegation.fencingGeneration) {
+          await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "reattach_fence_unrebuildable" }, delegationId, deps);
+          await materialize(rootDir, await loadView(rootDir, dispatchCallId));
+        }
+      });
+      return { state: "paused_integrity", dispatchCallId, delegationId, attempts: [], error: "reattach side-effect fence cannot be rebuilt" };
+    }
+  }
   const observed = await deps.inspectChild({ state: "unknown", childSessionId: delegation.childSessionId, identity: delegation.childIdentity }); if (observed !== "live") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "live child cannot be proven" };
   if (isAbortRequested(deps.signal)) { const interrupted = await withCallLock(rootDir, dispatchCallId, async () => { const current = await loadView(rootDir, dispatchCallId); const identity = deps.owner ?? currentOwnerIdentity(current.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile); const context = await validateCurrentExecutionContext(rootDir, current, deps, identity); if (!context.ok) return "rejected" as const; const item = current.delegations.get(delegationId); if (!current.integrity && item?.owner && !sameOwner(item.owner, identity)) return "rejected" as const; if (!current.integrity && item?.owner && item.spawnId && item.spawnStarted) await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "abort requested before reattach", failureKind: "unknown_transport", resultRef: "", spawnId: item.spawnId, fencingGeneration: item.fencingGeneration, ownerGeneration: item.ownerGeneration }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return replayed.delegations.get(delegationId)?.state; }); return { state: interrupted === "paused_integrity" ? "paused_integrity" : interrupted === "rejected" ? "rejected" : "paused_uncertainty", dispatchCallId, delegationId, attempts: [], error: "abort requested before reattach" }; }
   const owned = await deps.control!.claimOwner(rootDir, dispatchCallId, delegationId, deps.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile), { ...deps, allowLiveReattach: true });
@@ -704,7 +765,19 @@ export async function normalizeExecutionStartupInternal(rootDir: string, current
     } });
     const call = await deps.control!.readCall(rootDir, callId, current); if (!call || call.state === "paused_integrity" || call.parentSessionId !== current.parentSessionId || call.activeLineageId !== current.activeLineageId || !current.branchIds.includes(call.activeBranchAnchor)) continue;
     for (const slot of call.slots) {
-      if (!slot.delegationId || !["initial_running", "recovery_running"].includes(slot.state)) continue;
+      if (!slot.delegationId || !["bound", "initial_ready", "cycle_ready", "recovery_ready", "initial_running", "recovery_running", "reattach_only"].includes(slot.state)) continue;
+      const startupDelegation = (await loadView(rootDir, callId)).delegations.get(slot.delegationId);
+      if (startupDelegation?.sideEffectFence) {
+        let startupProof: ReturnType<typeof buildSideEffectFenceExtensions> | undefined;
+        try { startupProof = deps.sideEffectFence ? buildSideEffectFenceExtensions(deps.sideEffectFence) : undefined; } catch { startupProof = undefined; }
+        const validStartupFence = !!deps.sideEffectFence && !!startupProof && sideEffectFenceDeploymentVerified(deps.sideEffectFence, startupProof.manifestDigest) && startupDelegation.sideEffectFence.manifestDigest === startupProof.manifestDigest && startupDelegation.sideEffectFence.policyDigest === startupProof.policyDigest && startupDelegation.sideEffectFence.toolSetDigest === startupProof.toolSetDigest && startupDelegation.sideEffectFence.protocol === 1 && startupDelegation.sideEffectFence.runnerVersion === "subagent-runner/1";
+        if (!validStartupFence) {
+          const paused = await withCallLock(rootDir, callId, async () => { const latest = await loadView(rootDir, callId); const currentDelegation = latest.delegations.get(slot.delegationId!); if (!latest.integrity && currentDelegation?.sideEffectFence) await appendWal(rootDir, callId, "delegation_integrity_paused", { reasonCode: "side_effect_fence_startup_proof_missing_or_changed" }, slot.delegationId, deps); const replayed = await loadView(rootDir, callId); await materialize(rootDir, replayed); return replayed.integrity !== undefined; });
+          if (paused) pausedIntegrity += 1;
+          continue;
+        }
+      }
+      if (!["initial_running", "recovery_running"].includes(slot.state)) continue;
       const result = await reconcileRunningChildInternal(rootDir, callId, slot.delegationId, inspect, { ...deps, lineage: current, inspectChild: deps.inspectChild ?? (async (child: ChildInspection) => inspect(child)) });
       if (result.state === "reattach_only" || result.state === "recovery_ready") normalized += 1; else if (result.state === "paused_integrity") pausedIntegrity += 1;
     }

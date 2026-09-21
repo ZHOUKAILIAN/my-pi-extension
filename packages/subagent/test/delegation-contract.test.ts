@@ -5,6 +5,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDiscoverySnapshot } from "../src/agents.ts";
+import { appendWal, loadView } from "../src/delegation-context.ts";
 import {
   admitDispatchCallInternal,
   bindChildSessionInternal as bindChildSessionInternalBase,
@@ -14,6 +15,7 @@ import {
   markSpawnStartedInternal as markSpawnStartedInternalBase,
   markDelegationReturnedInternal as markDelegationReturnedInternalBase,
   normalizeExecutionStartupInternal,
+  finalizeCallInternal,
   readDelegationInternal,
   readDispatchCallInternal,
   resolveDelegationInternal,
@@ -35,7 +37,7 @@ async function projectAgents(directory: string): Promise<void> {
   await fs.mkdir(directory, { recursive: true, mode: 0o755 });
   await fs.writeFile(path.join(directory, "agent.md"), definition, { mode: 0o644 });
 }
-async function setup(toolCallId: string, persistent = true, requestLineage: ActiveLineage = lineage) {
+async function setup(toolCallId: string, persistent = true, requestLineage: ActiveLineage = lineage, resolve = true) {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "subagent-contract-"));
   const project = path.join(rootDir, "agents"); await projectAgents(project);
   const snapshot = getAgentDiscoverySnapshot(project)!;
@@ -43,7 +45,7 @@ async function setup(toolCallId: string, persistent = true, requestLineage: Acti
   const request: DispatchCallAdmissionRequest = { parentSessionId, lineage: requestLineage, toolCallId, cwd: project, mode: "single", single: { agent: "implement", task: "private contract task", persistent }, agentScope: "project", projectTrust };
   const admitted = await admitDispatchCallInternal(request, rootDir);
   const delegationId = admitted.delegationIds![0];
-  assert.equal((await resolveDelegationInternal(rootDir, admitted.dispatchCallId!, delegationId)).state, "resolved");
+  if (resolve) assert.equal((await resolveDelegationInternal(rootDir, admitted.dispatchCallId!, delegationId)).state, "resolved");
   return { rootDir, project, callId: admitted.dispatchCallId!, delegationId };
 }
 function owner(name: string, pid: number): OwnerIdentity { return { host: os.hostname(), pid, birth: name, parentSessionId, parentSessionPath: "/tmp/contract-parent", argvProof: name.padEnd(64, "0").slice(0, 64) }; }
@@ -63,6 +65,74 @@ const acceptContinuationInternal = (rootDir: string, callId: string, delegationI
 async function wal(rootDir: string, callId: string): Promise<any[]> { return (await fs.readFile(path.join(rootDir, "v2", "wal", `${callId}.jsonl`), "utf8")).trim().split("\n").map((line) => JSON.parse(line)); }
 async function walBytes(rootDir: string, callId: string): Promise<Buffer> { return fs.readFile(path.join(rootDir, "v2", "wal", `${callId}.jsonl`)); }
 async function appendWalForTest(rootDir: string, callId: string, type: string, data: Record<string, unknown>, delegationId: string): Promise<void> { const file = path.join(rootDir, "v2", "wal", `${callId}.jsonl`); const events = await wal(rootDir, callId); const previous = events.at(-1)!; const body = { version: 1, seq: previous.seq + 1, type, callId, delegationId, data, prevChecksum: previous.checksum }; const event = { ...body, checksum: createHash("sha256").update(JSON.stringify(body)).digest("hex") }; await fs.appendFile(file, `${JSON.stringify(event)}\n`); }
+
+test("delegation integrity pause WAL round-trips every writable prior state", async (t) => {
+  const pause = async (state: Awaited<ReturnType<typeof setup>>, reason: string) => {
+    await appendWal(state.rootDir, state.callId, "delegation_integrity_paused", { reasonCode: reason }, state.delegationId);
+    const call = await readDispatchCallInternal(state.rootDir, state.callId);
+    assert.equal(call?.state, "paused_integrity", reason);
+    assert.equal((await loadView(state.rootDir, state.callId)).delegations.get(state.delegationId)?.state, "paused_integrity", reason);
+    assert.equal((call as any)?.integrityReason, reason);
+  };
+
+  const initial = await setup("integrity-initial-ready"); t.after(() => fs.rm(initial.rootDir, { recursive: true, force: true }));
+  assert.equal((await reserveInitialInternal(initial.rootDir, initial.callId, initial.delegationId)).state, "reserved");
+  await pause(initial, "roundtrip_initial_ready");
+
+  const recovery = await setup("integrity-recovery-ready"); t.after(() => fs.rm(recovery.rootDir, { recursive: true, force: true }));
+  const recoveryOwner = owner("a301", process.pid + 301);
+  assert.equal((await reserveInitialInternal(recovery.rootDir, recovery.callId, recovery.delegationId, { owner: recoveryOwner })).state, "reserved");
+  const recoveryStarted = await markSpawnStartedInternal(recovery.rootDir, recovery.callId, recovery.delegationId, "initial", { owner: recoveryOwner });
+  assert.equal(recoveryStarted.state, "initial_running");
+  await bindChildSessionInternal(recovery.rootDir, recovery.callId, recovery.delegationId, claimFrom(recoveryStarted), "child-a302", undefined, process.pid + 302, { owner: recoveryOwner, childIdentity: child("a302", process.pid + 302) });
+  assert.equal((await reconcileRunningChildInternal(recovery.rootDir, recovery.callId, recovery.delegationId, async () => "dead", { owner: recoveryOwner })).state, "recovery_ready");
+  await pause(recovery, "roundtrip_recovery_ready");
+
+  const cycle = await setup("integrity-cycle-ready"); t.after(() => fs.rm(cycle.rootDir, { recursive: true, force: true }));
+  const cycleOwner = owner("a303", process.pid + 303);
+  assert.equal((await reserveInitialInternal(cycle.rootDir, cycle.callId, cycle.delegationId, { owner: cycleOwner })).state, "reserved");
+  const cycleStarted = await markSpawnStartedInternal(cycle.rootDir, cycle.callId, cycle.delegationId, "initial", { owner: cycleOwner });
+  await bindChildSessionInternal(cycle.rootDir, cycle.callId, cycle.delegationId, claimFrom(cycleStarted), "child-a304", undefined, process.pid + 304, { owner: cycleOwner, childIdentity: child("a304", process.pid + 304) });
+  assert.equal((await reconcileRunningChildInternal(cycle.rootDir, cycle.callId, cycle.delegationId, async () => "dead", { owner: cycleOwner })).state, "recovery_ready");
+  assert.equal((await acceptContinuationInternal(cycle.rootDir, cycle.callId, cycle.delegationId, "roundtrip", { owner: cycleOwner })).state, "accepted");
+  assert.equal((await reserveRecoveryCycleInternal(cycle.rootDir, cycle.callId, cycle.delegationId, { owner: cycleOwner, lineage })).state, "reserved");
+  await pause(cycle, "roundtrip_cycle_ready");
+
+  const reattach = await setup("integrity-reattach-only"); t.after(() => fs.rm(reattach.rootDir, { recursive: true, force: true }));
+  const reattachOwner = owner("a305", process.pid + 305);
+  assert.equal((await reserveInitialInternal(reattach.rootDir, reattach.callId, reattach.delegationId, { owner: reattachOwner })).state, "reserved");
+  const reattachStarted = await markSpawnStartedInternal(reattach.rootDir, reattach.callId, reattach.delegationId, "initial", { owner: reattachOwner });
+  const reattachClaim = claimFrom(reattachStarted);
+  await bindChildSessionInternal(reattach.rootDir, reattach.callId, reattach.delegationId, reattachClaim, "child-a306", undefined, process.pid + 306, { owner: reattachOwner, childIdentity: child("a306", process.pid + 306) });
+  await appendWal(reattach.rootDir, reattach.callId, "delegation_reattach_verified", { childSessionId: "child-a306", spawnId: reattachStarted.spawnId!, fencingGeneration: reattachStarted.fencingGeneration!, ownerGeneration: reattachStarted.ownerGeneration! }, reattach.delegationId);
+  await pause(reattach, "roundtrip_reattach_only");
+
+  const uncertainty = await setup("integrity-paused-uncertainty"); t.after(() => fs.rm(uncertainty.rootDir, { recursive: true, force: true }));
+  const uncertaintyOwner = owner("a308", process.pid + 308);
+  const uncertaintyReserved = await reserveInitialInternal(uncertainty.rootDir, uncertainty.callId, uncertainty.delegationId, { owner: uncertaintyOwner });
+  assert.equal(uncertaintyReserved.state, "reserved");
+  const uncertaintyStarted = await markSpawnStartedInternal(uncertainty.rootDir, uncertainty.callId, uncertainty.delegationId, "initial", { owner: uncertaintyOwner });
+  assert.equal(uncertaintyStarted.state, "initial_running");
+  await appendWal(uncertainty.rootDir, uncertainty.callId, "paused_uncertainty", { reason: "spawn outcome unknown", spawnId: uncertaintyStarted.spawnId!, fencingGeneration: uncertaintyStarted.fencingGeneration!, ownerGeneration: uncertaintyStarted.ownerGeneration! }, uncertainty.delegationId);
+  assert.equal((await loadView(uncertainty.rootDir, uncertainty.callId)).delegations.get(uncertainty.delegationId)?.state, "paused_uncertainty");
+  await pause(uncertainty, "roundtrip_paused_uncertainty");
+});
+
+test("delegation integrity pause remains rejected for illegal and terminal states", async (t) => {
+  const admitted = await setup("integrity-illegal-admitted", true, lineage, false); t.after(() => fs.rm(admitted.rootDir, { recursive: true, force: true }));
+  await assert.rejects(() => appendWal(admitted.rootDir, admitted.callId, "delegation_integrity_paused", { reasonCode: "illegal_admitted" }, admitted.delegationId), /invalid delegation_integrity_paused transition/);
+  assert.equal((await wal(admitted.rootDir, admitted.callId)).some((event) => event.type === "delegation_integrity_paused"), false);
+
+  const terminal = await setup("integrity-illegal-terminal"); t.after(() => fs.rm(terminal.rootDir, { recursive: true, force: true }));
+  const terminalOwner = owner("a307", process.pid + 307);
+  assert.equal((await reserveInitialInternal(terminal.rootDir, terminal.callId, terminal.delegationId, { owner: terminalOwner })).state, "reserved");
+  const terminalStarted = await markSpawnStartedInternal(terminal.rootDir, terminal.callId, terminal.delegationId, "initial", { owner: terminalOwner });
+  assert.equal(terminalStarted.state, "initial_running");
+  await markDelegationReturnedInternal(terminal.rootDir, terminal.callId, terminal.delegationId, "success", "result:terminal", claimFrom(terminalStarted), { owner: terminalOwner });
+  assert.equal((await finalizeCallInternal(terminal.rootDir, terminal.callId)).state, "final");
+  await assert.rejects(() => appendWal(terminal.rootDir, terminal.callId, "delegation_integrity_paused", { reasonCode: "illegal_terminal" }, terminal.delegationId), /invalid delegation_integrity_paused transition/);
+  assert.equal((await wal(terminal.rootDir, terminal.callId)).some((event) => event.type === "delegation_integrity_paused"), false);
+});
 
 test("stateful execution actions require a current lineage and durable parent proof", async (t) => {
   const state = await setup("lineage-required"); t.after(() => fs.rm(state.rootDir, { recursive: true, force: true }));

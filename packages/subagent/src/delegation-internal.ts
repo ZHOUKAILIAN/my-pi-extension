@@ -38,6 +38,26 @@ export {
   reconcileDeliveryStartupInternal,
 } from "./delegation.ts";
 export {
+  buildSideEffectFenceExtensions,
+  startSideEffectFenceServer,
+  cleanupSideEffectFenceOrphans,
+  sideEffectFenceExtensionPath,
+  sideEffectFenceExtensionDigest,
+  sideEffectFenceEnvironment,
+  sideEffectFenceToolSetDigest,
+  sideEffectFencePolicyDigest,
+  sideEffectFenceBinding,
+  sideEffectFenceBindingMatches,
+  sideEffectFencePackageManifestDigest,
+  sideEffectFenceSnapshotDigest,
+  createSideEffectFenceTestSnapshot,
+  createSideEffectFenceTestDeploymentProof,
+  createSideEffectFenceTestReattachProof,
+  sideEffectFenceReattachChannelDigest,
+  createSideEffectFenceTestClientProof,
+} from "./side-effect-fence.ts";
+export type { SideEffectFenceConfig, SideEffectFenceClientConfig, SideEffectFenceExtensionSpec, SideEffectFenceInterceptorSpec, SideEffectFenceBinding, SideEffectFencePolicyDescriptor, SideEffectFencePolicySnapshot, SideEffectFenceServer, SideEffectFenceDeploymentProof, SideEffectFenceReattachProof, SideEffectFenceHandshakeBinding, SideEffectFenceLifecycleMetadata, SideEffectFenceCleanupOptions } from "./side-effect-fence.ts";
+export {
   beginActionIntentInternal,
   finishActionResultInternal,
   replayActionPolicy,
