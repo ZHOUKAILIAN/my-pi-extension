@@ -6,13 +6,14 @@ import { getAgentDiscoverySnapshot, validAgentDiscoverySnapshot, type AgentDisco
 import { lineageMatches, type ActiveLineage } from "./lineage.ts";
 import { resolveAgentWithAudit, type CanonicalProvenance } from "./resolver.ts";
 import { claimExecutionOwnerUnlocked, currentOwnerIdentity, makeOwnerSupervisorContext, sameOwner, validOwnerIdentity, validateCurrentExecutionContext, type OwnerClaim } from "./execution-supervisor.ts";
-import type { CancelActor, CancelReceipt, CancelScope, DelegationFoundationDependencies, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, InternalDelegation, InternalView, ProjectTrustBinding, RevisionIntent, RevisionObservation, StartupNormalizationResult, ConfigRevisionActor, OwnerIdentity, DispatchMode, WalEvent } from "./delegation-types.ts";
+import type { CancelActor, CancelReceipt, CancelScope, DelegationFoundationDependencies, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, InternalDelegation, InternalView, ProjectTrustBinding, RevisionIntent, RevisionObservation, StartupNormalizationResult, ConfigRevisionActor, OwnerIdentity, DispatchMode, WalEvent, ChildInspection } from "./delegation-types.ts";
 import { appendWal, callPayload, configureRevisionPrivateValidator, dirs, ensureStore, hash, hashPath, isHex, loadView, materialize, privatePayload, readCurrentDelegationPayload, readDelegationPayload, readPrivate, readStableOwnerFileSync, validProjectTrust, writePrivate, withCallLock, withOrphanCoordination, pausedResult, exactObject, validResultRef, toolCallHash } from "./delegation-context.ts";
 import { reconcilePrivateOrphansUnlocked } from "./delegation-orphans.ts";
-import { deriveCallOutcome, deriveViewOutcome, isCallTerminal, isCallWideCancellation } from "./wal-replay.ts";
-import type { ChildInspection } from "./delegation-types.ts";
+import { deriveCallOutcome, deriveViewOutcome, durableChildState, isCallTerminal, isCallWideCancellation } from "./wal-replay.ts";
 import { ensureInterruptedDeliveryPendingLocked, querySubagentStatusInternal, requestDeliveryAbandonInternal, executeDeliveryInternal, reconcileDeliveryStartupInternal } from "./delivery.ts";
-import type { DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry } from "./delegation-types.ts";
+import type { DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry, ChildControlObservation } from "./delegation-types.ts";
+import { reconcileActionUnknownLocked } from "./action-ledger.ts";
+import { hasUnresolvedActionForDelegation, unresolvedActionsForDelegation } from "./action-predicate.ts";
 import type { StatusQueryResult } from "./delivery.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -29,10 +30,6 @@ async function resolveCallTarget(rootDir: string, target: string): Promise<strin
   for (const entry of entries.filter((name) => name.endsWith(".jsonl"))) { const callId = entry.slice(0, -6); const view = await loadView(rootDir, callId); if (view.call && [...view.delegations.keys()].includes(target)) return callId; }
   return undefined;
 }
-/** The slice4a WAL has no external side-effect action ledger yet.  A logical
- * spawn_intent is deliberately not an external action intent: it is only the
- * durable input to the spawn_started fence. */
-function hasExternalActionIntent(_view: InternalView, _delegationId: string): boolean { return false; }
 function hasHistoricalSpawnStarted(view: InternalView, delegationId: string): boolean {
   return view.events.some((event) => event.delegationId === delegationId && event.type === "spawn_started");
 }
@@ -48,6 +45,11 @@ function hasCurrentLiveChildRef(delegation: InternalDelegation): boolean {
   return !!delegation.childSessionId || !!delegation.childSessionPathHash || delegation.childPid !== undefined;
 }
 function reservationEvent(view: InternalView, delegationId: string, reservationId: string): WalEvent | undefined { return view.events.find((event) => (event.type === "initial_reserved" || event.type === "cycle_reserved") && event.delegationId === delegationId && event.data.reservationId === reservationId); }
+function historicalSpawnEvent(view: InternalView, delegationId: string): WalEvent | undefined {
+  const unresolvedSpawnIds = new Set(unresolvedActionsForDelegation(view, delegationId).map((action) => action.spawnId));
+  const events = view.events.filter((event) => event.delegationId === delegationId && event.type === "spawn_started");
+  return events.slice().reverse().find((event) => unresolvedSpawnIds.has(String(event.data.spawnId))) ?? events.at(-1);
+}
 function isPreSpawnCancellationState(state: InternalDelegation["state"]): boolean { return ["admitted", "resolving", "resolution_ready", "bound", "initial_ready", "cycle_ready", "paused_configuration"].includes(state); }
 function hasDurableCancellation(view: InternalView, delegationId: string): boolean { return !!hasCancelRequest(view, delegationId); }
 function delegationIdFor(callId: string, index: number): string { return hash(JSON.stringify(["delegation-v3", callId, index])); }
@@ -217,9 +219,74 @@ type CancelReconciliationResult =
   | { state: "rejected"; reason: string }
   | ReturnType<typeof pausedResult>;
 
+function sameChildIdentity(left: NonNullable<InternalDelegation["childIdentity"]>, right: NonNullable<InternalDelegation["childIdentity"]>): boolean {
+  return left.host === right.host && left.pid === right.pid && left.birth === right.birth && left.sessionPathHash === right.sessionPathHash && left.argvProof === right.argvProof;
+}
+function normalizeChildControlObservation(value: ChildControlObservation | ChildControlObservation["state"], expected: NonNullable<InternalDelegation["childIdentity"]>): "live" | "dead" | "unknown" {
+  if (value === "live" || value === "dead" || value === "unknown") return value === "live" ? "unknown" : value;
+  if (!value || (value.state !== "live" && value.state !== "dead" && value.state !== "unknown")) return "unknown";
+  if (value.state === "unknown") return "unknown";
+  if (value.state === "dead") return "dead";
+  return value.identity && sameChildIdentity(value.identity, expected) ? "live" : "dead";
+}
+async function reconcilePostSpawnCancelLocked(rootDir: string, dispatchCallId: string, delegationId: string, deps: DelegationFoundationDependencies): Promise<CancelReconciliationResult> {
+  let view = await loadView(rootDir, dispatchCallId); const delegation = view.delegations.get(delegationId);
+  if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason);
+  if (!delegation || delegation.state !== "cancel_requested") return { state: "rejected", reason: "delegation is not awaiting post-spawn cancellation" };
+  const deathAlreadyProved = view.events.some((event) => event.type === "child_death_proved" && event.delegationId === delegationId);
+  const historicalSpawn = historicalSpawnEvent(view, delegationId);
+  const historicalReservationId = historicalSpawn ? String(historicalSpawn.data.reservationId) : delegation.initialReservationId;
+  const historicalOwnerGeneration = historicalSpawn ? Number(historicalSpawn.data.ownerGeneration) : delegation.ownerGeneration;
+  const historicalFencingGeneration = historicalSpawn ? Number(historicalSpawn.data.fencingGeneration) : delegation.fencingGeneration;
+  if (deathAlreadyProved) {
+    if (hasUnresolvedActionForDelegation(view, delegationId)) { await reconcileActionUnknownLocked(rootDir, dispatchCallId, delegationId, deps, "child_death"); return { state: "cancel_requested", reason: "outstanding action remains uncertain" }; }
+    if (!view.events.some((event) => event.type === "delegation_cancelled" && event.delegationId === delegationId)) await appendWal(rootDir, dispatchCallId, "delegation_cancelled", { reason: "post_spawn_child_death_reconciled" }, delegationId, deps);
+    const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "cancelled", reason: "post_spawn_child_death_reconciled" };
+  }
+  const adapter = deps.childControlAdapter; const child = delegation.childIdentity;
+  if (!adapter || !child || !historicalReservationId) {
+    // A known historical child identity without a liveness adapter is not a
+    // safe no-op: the post-spawn child state is unknown and must be fenced.
+    if (child && !adapter) {
+      if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "cancel_requested", reason: "child liveness is unavailable while an action remains unresolved" };
+      await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "child_identity_or_liveness_unreadable" }, delegationId, { ...deps, fault: undefined });
+      return pausedResult(dispatchCallId, "child identity/liveness cannot be proven");
+    }
+    return { state: "cancel_requested", reason: "child control/death proof adapter is not available" };
+  }
+  const childHash = hash(JSON.stringify(child)); const base = { reservationIdHash: hash(historicalReservationId).slice(0, 32), ownerGeneration: historicalOwnerGeneration, fencingGeneration: historicalFencingGeneration, childIdentityHash: childHash, ...(historicalSpawn ? { spawnId: String(historicalSpawn.data.spawnId) } : {}) };
+  const hasTerminateIntent = view.events.some((event) => event.type === "terminate_intent" && event.delegationId === delegationId);
+  if (!hasTerminateIntent) await appendWal(rootDir, dispatchCallId, "terminate_intent", { delegationId, ...base }, delegationId, deps);
+  view = await loadView(rootDir, dispatchCallId); const current = view.delegations.get(delegationId);
+  const currentChild = current?.childIdentity;
+  if (!current || current.state !== "cancel_requested" || !currentChild || current.ownerGeneration !== historicalOwnerGeneration) return { state: "rejected", reason: "stale child terminate fence" };
+  const inspect = async (): Promise<"live" | "dead" | "unknown"> => { try { return normalizeChildControlObservation(await adapter.inspect({ state: "unknown", childSessionId: current.childSessionId ?? "", identity: currentChild }), currentChild); } catch { return "unknown"; } };
+  let state = await inspect();
+  if (state === "unknown") { await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "child_identity_or_liveness_unreadable" }, delegationId, { ...deps, fault: undefined }); return pausedResult(dispatchCallId, "child identity/liveness cannot be proven"); }
+  if (state === "live") {
+    const hasSignal = view.events.some((event) => event.type === "terminate_signal_requested" && event.delegationId === delegationId);
+    if (!hasSignal) {
+      await appendWal(rootDir, dispatchCallId, "terminate_signal_requested", { delegationId, ...base }, delegationId, deps);
+      try { const ack = adapter.requestTerminate ? await adapter.requestTerminate({ child, delegationId, reservationId: historicalReservationId, ownerGeneration: historicalOwnerGeneration, fencingGeneration: historicalFencingGeneration }) : { acknowledged: false }; if (typeof ack === "boolean" ? !ack : !ack.acknowledged) return { state: "cancel_requested", reason: "terminate ACK was not received" }; } catch { return { state: "cancel_requested", reason: "terminate request failed" }; }
+    }
+    state = adapter.waitForDeath ? normalizeChildControlObservation(await adapter.waitForDeath({ state: "live", childSessionId: current.childSessionId ?? "", identity: child }), child) : await inspect();
+  }
+  if (state !== "dead") { if (state === "unknown") { await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "child_death_unreadable" }, delegationId, { ...deps, fault: undefined }); return pausedResult(dispatchCallId, "child death cannot be proven"); } return { state: "cancel_requested", reason: "terminate ACK does not prove death" }; }
+  const first = view.events.filter((event) => event.type === "child_death_observed" && event.delegationId === delegationId).length;
+  if (first === 0) await appendWal(rootDir, dispatchCallId, "child_death_observed", { ...base, observationOrdinal: 1, state: "dead" }, delegationId, deps);
+  view = await loadView(rootDir, dispatchCallId); const secondState = adapter.waitForDeath ? normalizeChildControlObservation(await adapter.waitForDeath({ state: "dead", childSessionId: current.childSessionId ?? "", identity: child }), child) : await inspect();
+  if (secondState !== "dead") { if (secondState === "unknown") { await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "child_death_unstable" }, delegationId, { ...deps, fault: undefined }); return pausedResult(dispatchCallId, "child death is not stable"); } return { state: "cancel_requested", reason: "child death is not stable" }; }
+  view = await loadView(rootDir, dispatchCallId); if (!view.events.some((event) => event.type === "child_death_observed" && event.delegationId === delegationId && Number(event.data.observationOrdinal) === 2)) await appendWal(rootDir, dispatchCallId, "child_death_observed", { ...base, observationOrdinal: 2, state: "dead" }, delegationId, deps);
+  view = await loadView(rootDir, dispatchCallId); if (!view.events.some((event) => event.type === "child_death_proved" && event.delegationId === delegationId)) await appendWal(rootDir, dispatchCallId, "child_death_proved", { ...base, observation1: "dead", observation2: "dead" }, delegationId, deps);
+  view = await loadView(rootDir, dispatchCallId); const unresolved = hasUnresolvedActionForDelegation(view, delegationId);
+  if (unresolved) { await reconcileActionUnknownLocked(rootDir, dispatchCallId, delegationId, deps, "child_death"); const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused); return { state: "cancel_requested", reason: "outstanding action remains uncertain" }; }
+  if (!view.events.some((event) => event.type === "delegation_cancelled" && event.delegationId === delegationId)) await appendWal(rootDir, dispatchCallId, "delegation_cancelled", { reason: "post_spawn_child_death_reconciled" }, delegationId, deps);
+  const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "cancelled", reason: "post_spawn_child_death_reconciled" };
+}
+
 /** Must only be called while the call lock is held.  All cancel entry points
  * use this one primitive so their history tests and WAL order cannot drift. */
-async function reconcileDelegationCancelLocked(rootDir: string, dispatchCallId: string, delegationId: string, deps: DelegationFoundationDependencies): Promise<CancelReconciliationResult> {
+export async function reconcileDelegationCancelLocked(rootDir: string, dispatchCallId: string, delegationId: string, deps: DelegationFoundationDependencies): Promise<CancelReconciliationResult> {
   let view = await loadView(rootDir, dispatchCallId);
   if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason);
   const delegation = view.delegations.get(delegationId);
@@ -229,15 +296,16 @@ async function reconcileDelegationCancelLocked(rootDir: string, dispatchCallId: 
   const historicalSpawn = hasHistoricalSpawnStarted(view, delegationId);
   const currentScopeSpawn = hasSpawnStartedForCurrentReservation(view, delegation);
   const currentLiveChildRef = hasCurrentLiveChildRef(delegation);
-  const externalAction = hasExternalActionIntent(view, delegationId);
-  // spawn_intent is a logical execution fact.  It is not an external action
-  // intent, and with currentScopeSpawn=0 the cancel fence prevents it
-  // completing.  A paused_configuration delegation is the explicit
-  // exception: its full history must still prove that it never spawned.
+  const unresolvedAction = hasUnresolvedActionForDelegation(view, delegationId);
+  // Any historical spawn, or any action ledger entry that is not durably
+  // settled, is post-spawn history.  The current reservation is not allowed to
+  // erase that history and must never select the pre-spawn fast path.
   const pausedConfigurationEverSpawned = priorState === "paused_configuration" && historicalSpawn;
-  if (pausedConfigurationEverSpawned || currentScopeSpawn || currentLiveChildRef || externalAction || !isPreSpawnCancellationState(priorState as InternalDelegation["state"])) {
+  const deathProofExists = view.events.some((event) => event.type === "child_death_proved" && event.delegationId === delegationId);
+  if (pausedConfigurationEverSpawned || currentScopeSpawn || currentLiveChildRef || unresolvedAction || !isPreSpawnCancellationState(priorState as InternalDelegation["state"])) {
+    if (unresolvedAction || currentScopeSpawn || currentLiveChildRef || (historicalSpawn && (deathProofExists || !!deps.childControlAdapter))) return reconcilePostSpawnCancelLocked(rootDir, dispatchCallId, delegationId, deps);
     await materialize(rootDir, view);
-    return { state: "cancel_requested", reason: pausedConfigurationEverSpawned || historicalSpawn ? "post-spawn reconciliation is not implemented" : "execution action cannot be disproved" };
+    return { state: "cancel_requested", reason: pausedConfigurationEverSpawned || historicalSpawn ? "post-spawn reconciliation requires child control adapter" : "execution action cannot be disproved" };
   }
   const hasReservation = !!delegation.initialReservationId || view.events.some((event) => (event.type === "initial_reserved" || event.type === "cycle_reserved") && event.delegationId === delegationId);
   const sealed = view.events.some((event) => ["reservation_cancelled", "pre_spawn_no_reservation"].includes(event.type) && event.delegationId === delegationId);
@@ -421,11 +489,13 @@ export async function acceptConfigRevisionInternal(rootDir: string, dispatchCall
 export async function reserveInitialInternal(rootDir: string, dispatchCallId: string, delegationId: string, deps?: DelegationFoundationDependencies) {
   const result = await withOrphanCoordination(rootDir, async () => withCallLock(rootDir, dispatchCallId, async () => {
     let view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view)) return { state: "rejected" as const, reason: "call cancellation is durable" };
+    if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" };
     const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {});
     if (!context.ok) return { state: "rejected" as const, reason: context.reason };
     const existing = view.delegations.get(delegationId); if (hasCancelRequest(view, delegationId) || existing?.state === "cancel_requested" || existing?.state === "cancelled") return { state: "rejected" as const, reason: "delegation cancellation is durable" }; if (existing?.state === "initial_ready" && existing.initialReservationId) { await materialize(rootDir, view); return { state: "ready" as const, reservationId: existing.initialReservationId }; }
     view = await reconcileAcceptedRevision(rootDir, view); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason);
     let delegation = view.delegations.get(delegationId); if (!delegation) return { state: "rejected" as const, reason: "delegation is not reserveable" };
+    if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" };
     if (delegation.state === "paused_configuration" && delegation.revisionObservation) {
       let observationState: CurrentBindingState; try { observationState = await validateCurrentBindingState(rootDir, view, delegation); } catch (error) { return pausedResult(dispatchCallId, error instanceof Error ? error.message : "current delegation binding cannot be proven"); }
       if (observationState.state === "unchanged") { await appendObservationSuperseded(rootDir, dispatchCallId, delegationId, delegation.revisionObservation, deps); view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); delegation = view.delegations.get(delegationId)!; }
@@ -442,9 +512,9 @@ export async function reserveInitialInternal(rootDir: string, dispatchCallId: st
   })); return result ?? { state: "busy" as const };
 }
 export async function reserveRecoveryCycleInternal(rootDir: string, dispatchCallId: string, delegationId: string, deps?: DelegationFoundationDependencies) {
-  const result = await withCallLock(rootDir, dispatchCallId, async () => { let view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view)) return { state: "rejected" as const, reason: "call cancellation is durable" }; if (hasDurableCancellation(view, delegationId)) return { state: "rejected" as const, reason: "delegation cancellation is durable" }; view = await reconcileAcceptedRevision(rootDir, view); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {}); if (!context.ok) return { state: "rejected" as const, reason: context.reason }; const delegation = view.delegations.get(delegationId); if (!delegation || delegation.state !== "recovery_ready") return { state: "rejected" as const, reason: "recovery reservation precondition is not met" }; if (delegation.continuationEpoch < 1) return { state: "rejected" as const, reason: "recovery continuation is not accepted" }; if (delegation.recoveryCyclesUsed >= 3) return { state: "rejected" as const, reason: "recovery cycle budget exhausted" }; const owner = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile); const claimed = await claimExecutionOwnerUnlocked(rootDir, dispatchCallId, delegationId, owner, deps ?? {}, view, OWNER_CONTEXT); if (claimed.state === "rejected" || claimed.state === "paused_integrity") return claimed; const cycle = delegation.recoveryCyclesUsed + 1; const reservationId = randomUUID(); const generation = delegation.fencingGeneration + 1; await appendWal(rootDir, dispatchCallId, "cycle_reserved", { reservationId, scopeId: `recovery:${delegationId}:cycle-${cycle}`, cycle, generation }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "reserved" as const, reservationId, cycle, generation }; }); return result ?? { state: "busy" as const };
+  const result = await withCallLock(rootDir, dispatchCallId, async () => { let view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view)) return { state: "rejected" as const, reason: "call cancellation is durable" }; if (hasDurableCancellation(view, delegationId)) return { state: "rejected" as const, reason: "delegation cancellation is durable" }; if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" }; view = await reconcileAcceptedRevision(rootDir, view); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {}); if (!context.ok) return { state: "rejected" as const, reason: context.reason }; const delegation = view.delegations.get(delegationId); if (!delegation || delegation.state !== "recovery_ready") return { state: "rejected" as const, reason: "recovery reservation precondition is not met" }; if (durableChildState(view, delegation) !== "death_proved") return { state: "rejected" as const, reason: "current recovery scope lacks qualified child death proof" }; if (delegation.continuationEpoch < 1) return { state: "rejected" as const, reason: "recovery continuation is not accepted" }; if (delegation.recoveryCyclesUsed >= 3) return { state: "rejected" as const, reason: "recovery cycle budget exhausted" }; const owner = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile); const claimed = await claimExecutionOwnerUnlocked(rootDir, dispatchCallId, delegationId, owner, deps ?? {}, view, OWNER_CONTEXT); if (claimed.state === "rejected" || claimed.state === "paused_integrity") return claimed; const cycle = delegation.recoveryCyclesUsed + 1; const reservationId = randomUUID(); const generation = delegation.fencingGeneration + 1; await appendWal(rootDir, dispatchCallId, "cycle_reserved", { reservationId, scopeId: `recovery:${delegationId}:cycle-${cycle}`, cycle, generation }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "reserved" as const, reservationId, cycle, generation }; }); return result ?? { state: "busy" as const };
 }
-export async function acceptContinuationInternal(rootDir: string, dispatchCallId: string, delegationId: string, reason: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view) || hasCancelRequest(view, delegationId)) return { state: "rejected" as const, reason: "cancellation is durable" }; const identity = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile); const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {}, identity); if (!context.ok) return { state: "rejected" as const, reason: context.reason }; const delegation = view.delegations.get(delegationId); if (!delegation || !["paused_configuration", "recovery_ready"].includes(delegation.state)) return { state: "rejected" as const, reason: "continuation is not startable" }; if (delegation.owner && !sameOwner(delegation.owner, identity)) return { state: "rejected" as const, reason: "continuation owner fence is not current" }; const continuationEpoch = delegation.continuationEpoch + 1; await appendWal(rootDir, dispatchCallId, "continuation_accepted", { scopeId: `delegation:${delegationId}`, continuationEpoch, reason: reason.slice(0, 128) }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "accepted" as const, continuationEpoch }; }); return result ?? { state: "busy" as const }; }
+export async function acceptContinuationInternal(rootDir: string, dispatchCallId: string, delegationId: string, reason: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view) || hasCancelRequest(view, delegationId)) return { state: "rejected" as const, reason: "cancellation is durable" }; if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" }; const identity = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile); const context = await validateCurrentExecutionContext(rootDir, view, deps ?? {}, identity); if (!context.ok) return { state: "rejected" as const, reason: context.reason }; const delegation = view.delegations.get(delegationId); if (!delegation || !["paused_configuration", "recovery_ready"].includes(delegation.state)) return { state: "rejected" as const, reason: "continuation is not startable" }; if (delegation.owner && !sameOwner(delegation.owner, identity)) return { state: "rejected" as const, reason: "continuation owner fence is not current" }; const continuationEpoch = delegation.continuationEpoch + 1; await appendWal(rootDir, dispatchCallId, "continuation_accepted", { scopeId: `delegation:${delegationId}`, continuationEpoch, reason: reason.slice(0, 128) }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "accepted" as const, continuationEpoch }; }); return result ?? { state: "busy" as const }; }
 export async function admitNextChainStepInternal(rootDir: string, dispatchCallId: string, current: ActiveLineage, deps?: DelegationFoundationDependencies) { const result = await withOrphanCoordination(rootDir, async () => withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (hasCallCancelRequest(view)) return { state: "rejected" as const, reason: "call cancellation is durable" }; if (!view.call || view.call.mode !== "chain") return { state: "rejected" as const, reason: "not a chain call" }; if (!lineageMatches({ parentSessionId: view.call.parentSessionId, activeLineageId: view.call.activeLineageId, activeBranchAnchor: view.call.activeBranchAnchor }, current)) return { state: "rejected" as const, reason: "active lineage cannot be proven" }; const currentDelegation = [...view.delegations.values()].find((item) => item.slotIndex === view.call!.chainCursor); if (!currentDelegation || currentDelegation.state !== "returned") return { state: "rejected" as const, reason: "previous chain step has not durably returned" }; const next = view.call.chainCursor + 1; if (next >= view.call.slots.length) return { state: "complete" as const }; let payload: Awaited<ReturnType<typeof callPayload>>; try { payload = await callPayload(rootDir, view.call); } catch { return pausedResult(dispatchCallId, "call private payload binding cannot be proven"); } const id = delegationIdFor(dispatchCallId, next); await admitSlotPrimitive(rootDir, view.call, payload.items[next], next, payload, deps); const admitted = await loadView(rootDir, dispatchCallId); if (admitted.integrity) return pausedResult(dispatchCallId, admitted.integrity.reason); if (admitted.call?.chainCursor === view.call.chainCursor) await appendWal(rootDir, dispatchCallId, "chain_cursor_advanced", { nextIndex: next }, id, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "admitted" as const, delegationId: id, slotIndex: next }; })); return result ?? { state: "busy" as const }; }
 export async function finalizeCallInternal(rootDir: string, dispatchCallId: string, deps?: DelegationFoundationDependencies) { const result = await withCallLock(rootDir, dispatchCallId, async () => { const view = await loadView(rootDir, dispatchCallId); if (view.integrity) return pausedResult(dispatchCallId, view.integrity.reason); if (!view.call) return { state: "rejected" as const, reason: "call is not finalizable" }; if (view.call.state === "final" && view.call.finalOutcome) { const withDelivery = await ensureInterruptedDeliveryPendingLocked(rootDir, view, deps); await materialize(rootDir, withDelivery); return { state: "final" as const, outcome: view.call.finalOutcome }; } if (!isCallTerminal(view)) return { state: "rejected" as const, reason: "call is not finalizable" }; const outcome = deriveViewOutcome(view); await appendWal(rootDir, dispatchCallId, "call_finalized", { outcome, finalizedAt: now(deps) }, undefined, deps); let replayed = await loadView(rootDir, dispatchCallId); replayed = await ensureInterruptedDeliveryPendingLocked(rootDir, replayed, deps); await materialize(rootDir, replayed); return { state: "final" as const, outcome }; }); return result ?? { state: "busy" as const }; }
 

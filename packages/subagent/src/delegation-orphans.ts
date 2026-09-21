@@ -24,6 +24,10 @@ export async function reconcilePrivateOrphansUnlocked(rootDir: string): Promise<
         if (["delegation_reserved", "call_delegation_reference_added", "delegation_admitted"].includes(event.type) && event.delegationId) keep.add(`${event.delegationId}.json`);
         if (["delegation_bound", "config_revision_accepted"].includes(event.type) && event.delegationId) { keep.add(`binding-${event.delegationId}.json`); if (typeof event.data.auditRef === "string") keep.add(`${event.data.auditRef.slice("private:".length)}.json`); if (typeof event.data.revisionRef === "string") keep.add(`${event.data.revisionRef.slice("private:".length)}.json`); }
         if (event.type === "delivery_pending" && typeof event.data.payloadRef === "string" && event.data.payloadRef.startsWith("private:")) keep.add(`${event.data.payloadRef.slice("private:".length)}.json`);
+        if (event.type === "action_intent_acked" && typeof event.data.privateRef === "string" && event.data.privateRef.startsWith("private:")) keep.add(`${event.data.privateRef.slice("private:".length)}.json`);
+        if (event.type === "action_result_acked" && typeof event.data.actionId === "string" && /^action:[0-9a-f]{64}$/.test(event.data.actionId)) keep.add(`action-${event.data.actionId.slice(7)}-result.json`);
+        if (event.type === "action_unknown" && typeof event.data.resultPrivateRef === "string" && /^private:action-[0-9a-f]{64}-result$/.test(event.data.resultPrivateRef)) keep.add(`${event.data.resultPrivateRef.slice("private:".length)}.json`);
+        if (event.type === "action_disposition" && typeof event.data.actionId === "string" && /^action:[0-9a-f]{64}$/.test(event.data.actionId)) keep.add(`action-${event.data.actionId.slice(7)}-result.json`);
         if (event.type === "delegation_paused" && event.delegationId && typeof event.data.auditRef === "string") keep.add(`${event.data.auditRef.slice("private:".length)}.json`);
       }
     } catch { isolated.push(callId); return orphanFailure("orphan_wal_untrusted", isolated); }
@@ -32,7 +36,7 @@ export async function reconcilePrivateOrphansUnlocked(rootDir: string): Promise<
   try { privateFiles = await fs.readdir(d.private, { withFileTypes: true }); } catch { return orphanFailure("orphan_private_untrusted"); }
   for (const entry of privateFiles) { const file = path.join(d.private, entry.name); if (!entry.isFile() || entry.isSymbolicLink() || !ownerFileSync(file)) return orphanFailure("orphan_private_untrusted"); }
   let deletedPayloads = 0;
-  for (const entry of privateFiles) { const base = entry.name.endsWith(".pending") ? entry.name.slice(0, -".pending".length) : entry.name; if (!/^(call-[0-9a-f]{64}|delivery-[0-9a-f]{32}|[0-9a-f]{64}|binding-[0-9a-f]{64}|audit-[0-9a-f]{64}|revision-[0-9a-f]{64}-[0-9]+)\.json$/.test(base)) continue; if (!keep.has(base)) { await fs.unlink(path.join(d.private, entry.name)); deletedPayloads += 1; } }
+  for (const entry of privateFiles) { const base = entry.name.endsWith(".pending") ? entry.name.slice(0, -".pending".length) : entry.name; if (!/^(call-[0-9a-f]{64}|delivery-[0-9a-f]{32}|action-[0-9a-f]{64}(-result)?|[0-9a-f]{64}|binding-[0-9a-f]{64}|audit-[0-9a-f]{64}|revision-[0-9a-f]{64}-[0-9]+)\.json$/.test(base)) continue; if (!keep.has(base)) { await fs.unlink(path.join(d.private, entry.name)); deletedPayloads += 1; } }
   return { state: "clean", isolatedCallIds: [], deletedPayloads };
 }
 async function withOrphanCoordination<T>(rootDir: string, fn: () => Promise<T>): Promise<T | undefined> { const d = await ensureStore(rootDir); return withIdentityLock({ rootDir: d.root, key: "private-orphan-reconcile" }, fn); }

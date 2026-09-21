@@ -6,7 +6,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getAgentDiscoverySnapshot } from "../src/agents.ts";
-import { acceptConfigRevisionInternal, admitDispatchCallInternal, admitNextChainStepInternal, bindChildSessionInternal as bindChildSessionInternalBase, claimExecutionOwnerInternal as claimExecutionOwnerInternalBase, executeDelegationInternal as executeDelegationInternalBase, executeReattachedDelegationInternal as executeReattachedDelegationInternalBase, finalizeCallInternal, markDelegationReturnedInternal as markDelegationReturnedInternalBase, markSpawnStartedInternal as markSpawnStartedInternalBase, normalizeExecutionStartupInternal, normalizeStartupInternal, readDelegationInternal, readDispatchCallInternal, reconcilePrivateOrphans, resolveDelegationInternal, reserveInitialInternal as reserveInitialInternalBase, reserveRecoveryCycleInternal as reserveRecoveryCycleInternalBase, delegationFoundationCapability } from "../src/delegation-internal.ts";
+import { acceptConfigRevisionInternal, admitDispatchCallInternal, admitNextChainStepInternal, beginActionIntentInternal, bindChildSessionInternal as bindChildSessionInternalBase, claimExecutionOwnerInternal as claimExecutionOwnerInternalBase, executeDelegationInternal as executeDelegationInternalBase, executeReattachedDelegationInternal as executeReattachedDelegationInternalBase, finalizeCallInternal, finishActionResultInternal, markDelegationReturnedInternal as markDelegationReturnedInternalBase, markSpawnStartedInternal as markSpawnStartedInternalBase, normalizeExecutionStartupInternal, normalizeStartupInternal, readDelegationInternal, readDispatchCallInternal, reconcilePrivateOrphans, resolveDelegationInternal, reserveInitialInternal as reserveInitialInternalBase, reserveRecoveryCycleInternal as reserveRecoveryCycleInternalBase, delegationFoundationCapability } from "../src/delegation-internal.ts";
 import type { ChildIdentity, ConfigRevisionActor, DelegationFoundationDependencies, DispatchCallAdmissionRequest, OwnerClaim, OwnerIdentity, ProjectTrustBinding } from "../src/delegation.ts";
 import { ActiveLineageTracker, lineageMatches, type ActiveLineage } from "../src/lineage.ts";
 import { resolveAgent, resolveAgentWithAudit } from "../src/resolver.ts";
@@ -208,6 +208,37 @@ test("slice 3 persistent:false cleanup completes before durable return", async (
   const agent = { name: "implement", description: "implement", source: "project" as const, filePath: path.join(project, "agent.md"), systemPrompt: "Instructions" };
   const result = await executeDelegationInternal(rootDir, admitted.dispatchCallId!, id, agent, { runAttempt: async (options: any) => { await options.onChildProcess?.({ pid: 12347, identity: options.childSessionId }); await fs.writeFile(path.join(options.sessionDir, "session.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`); return { agent: "implement", agentSource: "project", exitCode: 0, messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }], toolResults: [], usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1 }, requestedModel: "model", actualModel: "model", source: options.source, attempt: options.attempt, failureKind: "success", sessionId: options.childSessionId, cwdScope: "cwd:opaque" }; } });
   assert.equal(result.state, "completed"); assert.equal(await exists(path.join(rootDir, "v2", "sessions", id)), false); assert.equal((await readDelegationInternal(rootDir, admitted.dispatchCallId!, id))?.state, "returned");
+});
+
+test("terminal execution preserves an unresolved action pause and keeps guard rejection", async (t) => {
+  const rootDir = await root(); t.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const project = path.join(rootDir, "terminal-action-agents"); await projectAgents(project, { "agent.md": definition("implement") });
+  const admitted = await admitDispatchCallInternal(projectRequest(project, await trust(project), { toolCallId: "terminal-action-pause" }), rootDir); const id = admitted.delegationIds![0]; await resolveDelegationInternal(rootDir, admitted.dispatchCallId!, id);
+  const agent = { name: "implement", description: "implement", source: "project" as const, filePath: path.join(project, "agent.md"), systemPrompt: "Instructions" };
+  const owner: OwnerIdentity = { host: os.hostname(), pid: process.pid, birth: "terminal-action-owner", parentSessionId, parentSessionPath: "/tmp/parent", argvProof: "a".repeat(64) };
+  const result = await executeDelegationInternal(rootDir, admitted.dispatchCallId!, id, agent, {
+    owner,
+    runAttempt: async (options: any) => {
+      await options.onChildProcess?.({ pid: 12360, identity: options.childSessionId });
+      await fs.writeFile(path.join(options.sessionDir, "session.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`);
+      const started = (await readWal(rootDir, admitted.dispatchCallId!)).find((event) => event.type === "spawn_started"); assert.ok(started);
+      const claim = { owner, ownerGeneration: Number(started.data.ownerGeneration), fencingGeneration: Number(started.data.fencingGeneration), spawnId: String(started.data.spawnId) };
+      const intent = await beginActionIntentInternal(rootDir, admitted.dispatchCallId!, id, claim, { executionScope: `scope:${id}`, toolCallOrdinal: 0, logicalCheckpoint: "checkpoint:terminal", finalToolName: "publish", finalArgs: { terminal: true }, policy: "fenced_mutating" }, { lineage: inProcessLineage() });
+      assert.equal(intent.state, "allowed", JSON.stringify(intent));
+      const actionResult = await finishActionResultInternal(rootDir, admitted.dispatchCallId!, id, claim, { logicalActionId: intent.logicalActionId!, resultRef: "result:ack-fault", resultType: "tool", status: "success" }, { lineage: inProcessLineage(), watchdogTerminate: async () => {}, fault: (point) => { if (point === "before:action_result_acked") throw new Error("result ACK unavailable"); } });
+      assert.equal(actionResult.state, "unknown");
+      return { agent: "implement", agentSource: "project", exitCode: 0, messages: [], toolResults: [], usage: { input: 0, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1 }, requestedModel: "model", actualModel: "model", source: options.source, attempt: options.attempt, failureKind: "success", sessionId: options.childSessionId, cwdScope: "cwd:opaque" };
+    },
+  });
+  assert.equal(result.state, "paused_uncertainty"); assert.equal((await readDelegationInternal(rootDir, admitted.dispatchCallId!, id))?.state, "paused_uncertainty");
+  assert.equal(result.error, "outstanding action prevents terminal outcome");
+  const events = await readWal(rootDir, admitted.dispatchCallId!); const unknown = events.find((event) => event.type === "action_unknown"); assert.equal(unknown?.data.reason, "result_ack_failed"); assert.equal((await readDispatchCallInternal(rootDir, admitted.dispatchCallId!))?.state, "paused_uncertainty");
+
+  const guardRoot = await root(); t.after(() => fs.rm(guardRoot, { recursive: true, force: true }));
+  const guardProject = path.join(guardRoot, "terminal-guard-agents"); await projectAgents(guardProject, { "agent.md": definition("implement") });
+  const guardLineage = inProcessLineage(); const guardCall = await admitDispatchCallInternal(projectRequest(guardProject, await trust(guardProject), { toolCallId: "terminal-guard-rejection" }), guardRoot); const guardId = guardCall.delegationIds![0]; await resolveDelegationInternal(guardRoot, guardCall.dispatchCallId!, guardId);
+  const guardResult = await executeDelegationInternal(guardRoot, guardCall.dispatchCallId!, guardId, { name: "implement", description: "implement", source: "project" as const, filePath: path.join(guardProject, "agent.md"), systemPrompt: "Instructions" }, { lineage: guardLineage, runAttempt: async (options: any) => { await options.onChildProcess?.({ pid: 12361, identity: options.childSessionId }); await fs.writeFile(path.join(options.sessionDir, "session.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`); guardLineage.activeLineageId = "changed-after-spawn"; return { agent: "implement", agentSource: "project", exitCode: 0, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 1, turns: 1 }, requestedModel: "model", actualModel: "model", source: options.source, attempt: options.attempt, failureKind: "success", sessionId: options.childSessionId, cwdScope: "cwd:opaque" }; } });
+  assert.equal(guardResult.state, "rejected"); assert.match(guardResult.error ?? "", /lineage/);
 });
 
 test("slice 3 unknown transport pauses uncertainty and never respawns", async (t) => {

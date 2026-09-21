@@ -14,6 +14,9 @@ import type { ChildInspection, DelegationExecutionDependencies, DelegationExecut
 import { appendWal, callPayload, ensureStore, hash, hashPath, isHex, loadView, loadViewForOwnerClaimPreflight, materialize, pausedResult, privatePayload, readDelegationPayload, readPrivate, validResultRef, WalAppendGuardRejected, withCallLock, withOrphanCoordination } from "./delegation-context.ts";
 import { ownerFileSync, readStableOwnerFileSync } from "./secure-fs.ts";
 import { lineageMatches } from "./lineage.ts";
+import { reconcileBeforeReturnInternal } from "./action-ledger.ts";
+import { hasUnresolvedActionForDelegation } from "./action-predicate.ts";
+import { durableChildState } from "./wal-replay.ts";
 
 export interface OwnerClaim {
   owner: OwnerIdentity;
@@ -40,6 +43,7 @@ export function currentOwnerIdentity(parentSessionId: string, parentSessionPath?
   return { host: os.hostname(), pid, birth: PROCESS_BIRTH, parentSessionId, parentSessionPath: path.resolve(parentSessionPath ?? process.argv[1] ?? process.cwd()), argvProof: createHash("sha256").update(JSON.stringify(process.argv)).digest("hex") };
 }
 
+function errorText(value: unknown): string | undefined { if (!value || typeof value !== "object") return undefined; const record = value as Record<string, unknown>; return typeof record.reason === "string" ? record.reason : typeof record.error === "string" ? record.error : undefined; }
 export function sameOwner(left: OwnerIdentity | undefined, right: OwnerIdentity): boolean {
   return !!left && left.host === right.host && left.pid === right.pid && left.birth === right.birth && left.parentSessionId === right.parentSessionId && left.parentSessionPath === right.parentSessionPath && left.argvProof === right.argvProof;
 }
@@ -200,6 +204,7 @@ function hasCurrentPreSpawnAbsenceProof(view: InternalView, delegationId: string
 export async function claimExecutionOwnerUnlocked(rootDir: string, dispatchCallId: string, delegationId: string, identity: OwnerIdentity, deps: DelegationFoundationDependencies, view: InternalView, context: OwnerSupervisorContext): Promise<{ state: "claimed" | "already_owned" | "transferred" | "rejected" | "paused_integrity"; ownerGeneration?: number; fencingGeneration?: number; reason?: string }> {
   const delegation = view.delegations.get(delegationId);
   if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected", reason: "delegation cancellation is durable" };
+  if (delegation && hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected", reason: "Delegation has an unresolved action" };
   if (!delegation || !context.validOwnerIdentity(identity)) return { state: "rejected", reason: "owner identity is invalid" };
   const executionContext = await validateCurrentExecutionContext(rootDir, view, deps, identity);
   if (!executionContext.ok) return { state: "rejected", reason: executionContext.reason };
@@ -231,6 +236,7 @@ export async function claimExecutionOwnerUnlocked(rootDir: string, dispatchCallI
   const resolutionPreSpawn = strictPreSpawn && delegation.state === "paused_configuration" && delegation.pauseReason === "resolution";
   const postSpawnTransfer = historicalSpawn && ["initial_running", "recovery_running", "reattach_only", "recovery_ready"].includes(delegation.state);
   if (!resolutionPreSpawn && !postSpawnTransfer) return { state: "rejected", reason: "owner transfer is not allowed in the current state" };
+  if (delegation.state === "recovery_ready" && durableChildState(view, delegation) !== "death_proved") return { state: "rejected", reason: "recovery child death proof is missing or a current child is live" };
   const inspect = deps.inspectOwner ?? inspectOwnerDefault;
   const delay = deps.ownerDeathObservationDelayMs ?? 1;
   if (deps.inspectOwnerIdentity) {
@@ -326,7 +332,7 @@ export async function reconcileRunningChildInternal(rootDir: string, dispatchCal
     const executionContext = await validateCurrentExecutionContext(rootDir, view, deps ?? {}, deps?.owner);
     if (!executionContext.ok) return { state: "rejected" as const, reason: executionContext.reason };
     const delegation = view.delegations.get(delegationId);
-    if (!delegation || !["initial_running", "recovery_running"].includes(delegation.state) || !delegation.childSessionId) return { state: "rejected" as const, reason: "running child is not reconcilable" };
+    if (!delegation || (!["initial_running", "recovery_running"].includes(delegation.state) && !(delegation.state === "paused_uncertainty" && hasUnresolvedActionForDelegation(view, delegationId))) || !delegation.childSessionId) return { state: "rejected" as const, reason: "running child is not reconcilable" };
     const expected: ChildIntegrityObservation = { state: delegation.state, childSessionId: delegation.childSessionId, childIdentity: delegation.childIdentity, fencingGeneration: delegation.fencingGeneration, ownerGeneration: delegation.ownerGeneration, spawnId: delegation.spawnId };
     const pause = async (reasonCode: string, reason: string) => {
       // This observer is a CAS on the complete child/fence tuple. It never
@@ -354,6 +360,15 @@ export async function reconcileRunningChildInternal(rootDir: string, dispatchCal
     if (!second.readable) return first.state === "dead" ? pause("child_death_unstable", "child death is not stable") : pause("child_liveness_unproven", "child liveness cannot be proven");
     if (first.state === "live" && second.state !== "live") return pause("child_liveness_unproven", "child liveness is not stable");
     if (first.state === "dead" && second.state !== "dead") return pause("child_death_unstable", "child death is not stable");
+    // An unresolved action forbids an owner claim.  Still persist a stable
+    // child-death fact when the already-owned child is observed dead; death is
+    // evidence for reconciliation, never permission to enter recovery.
+    if (first.state === "dead" && hasUnresolvedActionForDelegation(view, delegationId)) {
+      const current = (await loadView(rootDir, dispatchCallId)).delegations.get(delegationId);
+      if (!current || current.state !== delegation.state || current.spawnId !== delegation.spawnId || current.ownerGeneration !== delegation.ownerGeneration || current.fencingGeneration !== delegation.fencingGeneration || !current.initialReservationId || !current.childIdentity) return { state: "rejected" as const, reason: "child death fence is stale" };
+      await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "child dead during startup", failureKind: "transient_provider", resultRef: "", spawnId: current.spawnId!, fencingGeneration: current.fencingGeneration, ownerGeneration: current.ownerGeneration, childDeathProof: "dead", reservationIdHash: hash(String(current.initialReservationId)).slice(0, 32), childIdentityHash: hash(JSON.stringify(current.childIdentity)), deathObservation1: "dead", deathObservation2: "dead" }, delegationId, deps);
+      const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused); return { state: "paused_uncertainty" as const };
+    }
     const identity = deps?.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps?.lineage?.parentSessionFile);
     // All child observations are complete before this claim. Reusing the
     // stable result prevents claim-time inspection from creating an
@@ -367,7 +382,7 @@ export async function reconcileRunningChildInternal(rootDir: string, dispatchCal
       const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "reattach_only" as const, childSessionId: current.childSessionId! };
     }
     const owned = await loadView(rootDir, dispatchCallId); const current = owned.delegations.get(delegationId)!;
-    await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "child dead during startup", failureKind: "transient_provider", resultRef: "", spawnId: current.spawnId!, fencingGeneration: current.fencingGeneration, ownerGeneration: current.ownerGeneration }, delegationId, deps);
+    await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "child dead during startup", failureKind: "transient_provider", resultRef: "", spawnId: current.spawnId!, fencingGeneration: current.fencingGeneration, ownerGeneration: current.ownerGeneration, childDeathProof: "dead", reservationIdHash: hash(String(current.initialReservationId)).slice(0, 32), childIdentityHash: hash(JSON.stringify(current.childIdentity!)), deathObservation1: "dead", deathObservation2: "dead" }, delegationId, deps);
     const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "recovery_ready" as const };
   }); return result ?? { state: "busy" as const };
 }
@@ -407,11 +422,13 @@ export async function markSpawnStartedInternal(rootDir: string, dispatchCallId: 
     const delegation = view.delegations.get(delegationId); const expectedState = runKind === "initial" ? "initial_ready" : "cycle_ready";
     if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected" as const, reason: "delegation cancellation is durable" };
     if (!delegation || delegation.state !== expectedState || !delegation.initialReservationId) return { state: "rejected" as const, reason: "spawn lifecycle precondition is not met" };
+    if (hasUnresolvedActionForDelegation(view, delegationId)) return { state: "rejected" as const, reason: "Delegation has an unresolved action" };
     if (runKind === "recovery" && delegation.continuationEpoch < 1) return { state: "rejected" as const, reason: "recovery startup proof is incomplete" };
     const identity = deps.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile);
     const claimed = await claimExecutionOwnerUnlocked(rootDir, dispatchCallId, delegationId, identity, deps, view, makeOwnerSupervisorContext());
     if (claimed.state === "rejected" || claimed.state === "paused_integrity") return claimed;
     view = await loadView(rootDir, dispatchCallId); const current = view.delegations.get(delegationId)!;
+    if (runKind === "recovery" && durableChildState(view, current) !== "death_proved") return { state: "rejected" as const, reason: "recovery spawn requires qualified child death proof" };
     const reservationId = current.initialReservationId!; const continuationEpoch = current.continuationEpoch; const fencingGeneration = current.fencingGeneration; const ownerGeneration = current.ownerGeneration;
     const priorIntent = view.events.find((event) => event.type === "spawn_intent" && event.delegationId === delegationId && event.data.reservationId === reservationId && event.data.continuationEpoch === continuationEpoch && event.data.fencingGeneration === fencingGeneration && event.data.ownerGeneration === ownerGeneration);
     const spawnId = priorIntent ? String(priorIntent.data.spawnId) : randomUUID();
@@ -465,6 +482,11 @@ export async function markDelegationReturnedInternal(rootDir: string, dispatchCa
     // since the callback was created.  The complete claim is a CAS under the
     // call lock, so every rejected stale callback performs zero WAL writes.
     if (!validOwnerIdentity(claim?.owner) || !Number.isSafeInteger(claim?.ownerGeneration) || claim.ownerGeneration < 1 || !Number.isSafeInteger(claim?.fencingGeneration) || claim.fencingGeneration < 0 || typeof claim.spawnId !== "string" || claim.spawnId.length === 0 || (deps.owner !== undefined && !sameOwner(deps.owner, claim.owner)) || !delegation || !delegation.owner || !["initial_running", "recovery_running", "reattach_only"].includes(delegation.state) || !delegation.initialReservationId || !delegation.spawnStarted || outcome === "cancelled" || !validResultRef(resultRef) || !ownerClaimMatches(claim, delegation.owner, delegation.ownerGeneration, delegation.fencingGeneration, delegation.spawnId, sameOwner)) return { state: "rejected" as const, reason: "delegation return owner claim is not current" };
+    if (hasUnresolvedActionForDelegation(view, delegationId)) {
+      await reconcileBeforeReturnInternal(rootDir, dispatchCallId, delegationId, deps);
+      const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused);
+      return { state: "rejected" as const, reason: "outstanding action prevents normal returned" };
+    }
     await appendWal(rootDir, dispatchCallId, "delegation_returned", { outcome, resultRef, spawnId: claim.spawnId, fencingGeneration: claim.fencingGeneration, ownerGeneration: claim.ownerGeneration }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return { state: "returned" as const };
   }); return result ?? { state: "busy" as const };
 }
@@ -530,6 +552,11 @@ async function commitTerminalOutcome(rootDir: string, dispatchCallId: string, de
     const executionContext = await validateCurrentExecutionContext(rootDir, view, deps, claim.owner);
     if (!executionContext.ok) return { state: "rejected" as const, error: executionContext.reason };
     if (!delegation || !ownerClaimMatches(claim, delegation.owner, delegation.ownerGeneration, delegation.fencingGeneration, delegation.spawnId, sameOwner) || view.events.some((event) => event.type === "execution_outcome_captured" && event.delegationId === delegationId && event.data.spawnId === spawnId)) return { state: "rejected" as const, error: "terminal commit fenced by a newer owner or spawn" };
+    if (hasUnresolvedActionForDelegation(view, delegationId)) {
+      await reconcileBeforeReturnInternal(rootDir, dispatchCallId, delegationId, deps);
+      const paused = await loadView(rootDir, dispatchCallId); await materialize(rootDir, paused);
+      return { state: "paused_uncertainty" as const, error: "outstanding action prevents terminal outcome" };
+    }
     if (ephemeral) {
       return capturePersistentFalseOutcome({
         rootDir,
@@ -549,6 +576,11 @@ async function commitTerminalOutcome(rootDir: string, dispatchCallId: string, de
 }
 
 export async function executeDelegationInternal(rootDir: string, dispatchCallId: string, delegationId: string, agent: AgentConfig, deps: DelegationExecutionDependencies = {}): Promise<DelegationExecutionResult> {
+  const entrance = await withCallLock(rootDir, dispatchCallId, async () => {
+    const latest = await loadView(rootDir, dispatchCallId);
+    return latest.integrity || hasUnresolvedActionForDelegation(latest, delegationId) || latest.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) ? "blocked" as const : "allowed" as const;
+  });
+  if (entrance !== "allowed") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "execution entrance is fenced" };
   let view = await loadView(rootDir, dispatchCallId); if (view.integrity) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: view.integrity.reason }; const before = view.delegations.get(delegationId);
   if (!before) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation not found" };
   if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || before.state === "cancel_requested" || before.state === "cancelled") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation cancellation is durable" };
@@ -556,12 +588,12 @@ export async function executeDelegationInternal(rootDir: string, dispatchCallId:
   if (isAbortRequested(deps.signal)) { const aborted = await interruptBeforeSpawn(rootDir, dispatchCallId, delegationId, agent, deps); return { state: aborted === "busy" ? "busy" : aborted === "rejected" ? "rejected" : "paused_uncertainty", dispatchCallId, delegationId, attempts: [], error: "abort requested before spawn" }; }
   if (!before.canonical || !canonicalAgentMatches(agent, before.canonical)) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "canonical execution identity cannot be proven" };
   let runKind: "initial" | "recovery"; let recoveryCycle: number | undefined;
-  if (before.state === "bound") { const reserved = await deps.control!.reserveInitial(rootDir, dispatchCallId, delegationId, deps); if (reserved.state !== "reserved" && reserved.state !== "ready") return { state: reserved.state === "paused_configuration" ? "paused_configuration" : "rejected", dispatchCallId, delegationId, attempts: [], error: (reserved as any).reason ?? (reserved as any).error }; runKind = "initial"; }
+  if (before.state === "bound") { const reserved = await deps.control!.reserveInitial(rootDir, dispatchCallId, delegationId, deps); if (reserved.state !== "reserved" && reserved.state !== "ready") return { state: reserved.state === "paused_configuration" ? "paused_configuration" : "rejected", dispatchCallId, delegationId, attempts: [], error: errorText(reserved) }; runKind = "initial"; }
   else if (before.state === "initial_ready") runKind = "initial";
-  else if (before.state === "recovery_ready") { if (!deps.lineage || !lineageMatches(before, deps.lineage)) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "active lineage cannot be proven for recovery" }; const reserved = await deps.control!.reserveRecoveryCycle(rootDir, dispatchCallId, delegationId, deps); if (reserved.state !== "reserved") return { state: reserved.state === "busy" ? "busy" : "rejected", dispatchCallId, delegationId, attempts: [], error: (reserved as any).reason }; runKind = "recovery"; recoveryCycle = reserved.cycle; }
+  else if (before.state === "recovery_ready") { if (!deps.lineage || !lineageMatches(before, deps.lineage)) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "active lineage cannot be proven for recovery" }; const reserved = await deps.control!.reserveRecoveryCycle(rootDir, dispatchCallId, delegationId, deps); if (reserved.state !== "reserved") return { state: reserved.state === "busy" ? "busy" : "rejected", dispatchCallId, delegationId, attempts: [], error: errorText(reserved) }; runKind = "recovery"; recoveryCycle = reserved.cycle; }
   else if (before.state === "cycle_ready") { if (!deps.lineage || !lineageMatches(before, deps.lineage)) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "active lineage cannot be proven for recovery" }; runKind = "recovery"; recoveryCycle = before.recoveryCyclesUsed; }
   else return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation is not executable" };
-  const started = await deps.control!.markSpawnStarted(rootDir, dispatchCallId, delegationId, runKind, deps); if (started.state !== "initial_running" && started.state !== "recovery_running") return { state: started.state === "busy" ? "busy" : started.state === "paused_uncertainty" ? "paused_uncertainty" : "rejected", dispatchCallId, delegationId, runKind, recoveryCycle, attempts: [], error: (started as any).reason ?? (started as any).error };
+  const started = await deps.control!.markSpawnStarted(rootDir, dispatchCallId, delegationId, runKind, deps); if (started.state !== "initial_running" && started.state !== "recovery_running") return { state: started.state === "busy" ? "busy" : started.state === "paused_uncertainty" ? "paused_uncertainty" : "rejected", dispatchCallId, delegationId, runKind, recoveryCycle, attempts: [], error: errorText(started) };
   const spawnId = String((started as { spawnId: string }).spawnId); const fencingGeneration = Number((started as { fencingGeneration?: number }).fencingGeneration ?? 0); const ownerGeneration = Number((started as { ownerGeneration?: number }).ownerGeneration ?? 0); const startupClaim: OwnerClaim = { owner: (started as { owner: OwnerIdentity }).owner, ownerGeneration, fencingGeneration, spawnId }; const childSessionId = randomUUID(); let cycle: { attempt: AttemptResult; attempts: AttemptResult[] };
   try { const current = await loadView(rootDir, dispatchCallId); const payload = await readDelegationPayload(rootDir, current, current.delegations.get(delegationId)!); cycle = await runExecutionCycle(rootDir, dispatchCallId, delegationId, runKind, agent, payload.item.task, deps, childSessionId, startupClaim); }
   catch { const fallback: AttemptResult = { agent: agent.name, agentSource: agent.source, exitCode: null, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, requestedModel: deps.model ?? agent.model ?? "unknown", actualModel: "unknown", source: "initial", attempt: 1, failureKind: "unknown_transport", errorMessage: "child process failed", cwdScope: "cwd:unknown", sessionId: childSessionId }; cycle = { attempt: fallback, attempts: [fallback] }; }
@@ -590,13 +622,20 @@ export async function executeDelegationInternal(rootDir: string, dispatchCallId:
     return { state: "paused_uncertainty", dispatchCallId, delegationId, runKind, recoveryCycle, attempt: cycle.attempt, attempts: cycle.attempts, error: paused ?? "child binding cannot be proven" };
   }
   const terminal = ["success", "incomplete", "task_failure"].includes(cycle.attempt.failureKind);
-  if (terminal) { const committed = await commitTerminalOutcome(rootDir, dispatchCallId, delegationId, cycle.attempt, resultRef, startupClaim, ephemeral, deps); return { state: committed.state === "completed" ? "completed" : "rejected", dispatchCallId, delegationId, runKind, recoveryCycle, attempt: cycle.attempt, attempts: cycle.attempts, error: committed.error }; }
+  if (terminal) { const committed = await commitTerminalOutcome(rootDir, dispatchCallId, delegationId, cycle.attempt, resultRef, startupClaim, ephemeral, deps); return { state: committed.state, dispatchCallId, delegationId, runKind, recoveryCycle, attempt: cycle.attempt, attempts: cycle.attempts, error: committed.error }; }
   const interruptionState = await withCallLock(rootDir, dispatchCallId, async () => { const latest = await loadView(rootDir, dispatchCallId); const context = await validateCurrentExecutionContext(rootDir, latest, deps, startupClaim.owner); const latestDelegation = latest.delegations.get(delegationId); if (context.ok && !latest.integrity && latestDelegation?.state === (runKind === "initial" ? "initial_running" : "recovery_running") && latestDelegation.spawnId === spawnId && latestDelegation.fencingGeneration === fencingGeneration && latestDelegation.ownerGeneration === ownerGeneration) await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: durableInterruptionReason(cycle.attempt.failureKind, isAbortRequested(deps.signal)), failureKind: durableInterruptionFailureKind(cycle.attempt.failureKind, isAbortRequested(deps.signal)), resultRef, spawnId, fencingGeneration, ownerGeneration }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return context.ok ? replayed.delegations.get(delegationId)?.state : "rejected" as const; });
   const state = interruptionState === "rejected" ? "rejected" : interruptionState === "paused_configuration" || cycle.attempt.failureKind === "non_transient_provider" ? "paused_configuration" : interruptionState === "paused_integrity" ? "paused_integrity" : interruptionState === "paused_uncertainty" ? "paused_uncertainty" : "recoverable_failed";
   return { state, dispatchCallId, delegationId, runKind, recoveryCycle, attempt: cycle.attempt, attempts: cycle.attempts, error: cycle.attempt.errorMessage };
 }
 
 export async function executeReattachedDelegationInternal(rootDir: string, dispatchCallId: string, delegationId: string, executor: (options: { childSessionId: string; sessionPath?: string; spawnId: string; ownerGeneration: number; fencingGeneration: number }) => Promise<AttemptResult>, deps: DelegationExecutionDependencies = {}): Promise<DelegationExecutionResult> {
+  const entrance = await withCallLock(rootDir, dispatchCallId, async () => {
+    const latest = await loadView(rootDir, dispatchCallId);
+    if (latest.integrity || hasUnresolvedActionForDelegation(latest, delegationId)) return "blocked" as const;
+    if (latest.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || ["cancel_requested", "cancelled"].includes(latest.delegations.get(delegationId)?.state ?? "")) return "blocked" as const;
+    return "allowed" as const;
+  });
+  if (entrance !== "allowed") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "reattach entrance is fenced" };
   const view = await loadView(rootDir, dispatchCallId); const delegation = view.delegations.get(delegationId);
   if (view.events.some((event) => event.type === "cancel_requested" && event.delegationId === delegationId) || delegation?.state === "cancel_requested" || delegation?.state === "cancelled") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "delegation cancellation is durable" };
   if (!delegation || !["reattach_only", "initial_running", "recovery_running"].includes(delegation.state) || !delegation.childSessionId || !delegation.spawnId || !delegation.childIdentity || !deps.inspectChild) return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "live child identity is not reattachable" };
@@ -604,12 +643,18 @@ export async function executeReattachedDelegationInternal(rootDir: string, dispa
   if (isAbortRequested(deps.signal)) { const interrupted = await withCallLock(rootDir, dispatchCallId, async () => { const current = await loadView(rootDir, dispatchCallId); const identity = deps.owner ?? currentOwnerIdentity(current.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile); const context = await validateCurrentExecutionContext(rootDir, current, deps, identity); if (!context.ok) return "rejected" as const; const item = current.delegations.get(delegationId); if (!current.integrity && item?.owner && !sameOwner(item.owner, identity)) return "rejected" as const; if (!current.integrity && item?.owner && item.spawnId && item.spawnStarted) await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "abort requested before reattach", failureKind: "unknown_transport", resultRef: "", spawnId: item.spawnId, fencingGeneration: item.fencingGeneration, ownerGeneration: item.ownerGeneration }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return replayed.delegations.get(delegationId)?.state; }); return { state: interrupted === "paused_integrity" ? "paused_integrity" : interrupted === "rejected" ? "rejected" : "paused_uncertainty", dispatchCallId, delegationId, attempts: [], error: "abort requested before reattach" }; }
   const owned = await deps.control!.claimOwner(rootDir, dispatchCallId, delegationId, deps.owner ?? currentOwnerIdentity(view.call?.parentSessionId ?? "unknown", deps.lineage?.parentSessionFile), { ...deps, allowLiveReattach: true });
   if (owned.state === "busy") return { state: "busy", dispatchCallId, delegationId, attempts: [], error: "execution owner lock is busy" };
-  if (owned.state === "rejected" || owned.state === "paused_integrity") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: (owned as any).reason ?? (owned as any).error ?? "execution owner claim rejected" };
+  if (owned.state === "rejected" || owned.state === "paused_integrity") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: errorText(owned) ?? "execution owner claim rejected" };
   const current = await loadView(rootDir, dispatchCallId); const currentDelegation = current.delegations.get(delegationId)!; const revalidated = await deps.inspectChild({ state: "unknown", childSessionId: currentDelegation.childSessionId!, identity: currentDelegation.childIdentity! }); if (revalidated !== "live") { const reconciled = await withCallLock(rootDir, dispatchCallId, async () => { const latest = await loadView(rootDir, dispatchCallId); const item = latest.delegations.get(delegationId); if (!latest.integrity && item?.ownerGeneration === currentDelegation.ownerGeneration && item.spawnId === currentDelegation.spawnId && ["reattach_only", "initial_running", "recovery_running"].includes(item.state)) { if (revalidated === "dead") await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: "reattached child died", failureKind: "transient_provider", resultRef: "", spawnId: item.spawnId!, fencingGeneration: item.fencingGeneration, ownerGeneration: item.ownerGeneration }, delegationId, deps); else await appendWal(rootDir, dispatchCallId, "delegation_integrity_paused", { reasonCode: "reattached_child_liveness_unproven" }, delegationId, deps); } const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return replayed.delegations.get(delegationId)?.state; }); return { state: revalidated === "dead" ? "recoverable_failed" : "paused_integrity", dispatchCallId, delegationId, attempts: [], error: reconciled === "paused_configuration" ? "reattached child liveness is unproven" : "reattached child is no longer live" }; }
+  const executionGate = await withCallLock(rootDir, dispatchCallId, async () => {
+    const latest = await loadView(rootDir, dispatchCallId);
+    const latestDelegation = latest.delegations.get(delegationId);
+    return !latest.integrity && !!latestDelegation && latestDelegation.state === currentDelegation.state && latestDelegation.spawnId === currentDelegation.spawnId && latestDelegation.ownerGeneration === currentDelegation.ownerGeneration && latestDelegation.fencingGeneration === currentDelegation.fencingGeneration && !hasUnresolvedActionForDelegation(latest, delegationId) ? "allowed" as const : "blocked" as const;
+  });
+  if (executionGate !== "allowed") return { state: "rejected", dispatchCallId, delegationId, attempts: [], error: "reattach execution is fenced by unresolved action or stale child view" };
   let attempt: AttemptResult;
   try { attempt = sanitizeAttemptResult(await executor({ childSessionId: currentDelegation.childSessionId!, spawnId: currentDelegation.spawnId!, ownerGeneration: currentDelegation.ownerGeneration, fencingGeneration: currentDelegation.fencingGeneration })); } catch { attempt = { agent: "unknown", agentSource: "unknown", exitCode: null, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, requestedModel: "unknown", actualModel: "unknown", source: "initial", attempt: 1, failureKind: "unknown_transport", errorMessage: "child process failed", cwdScope: "cwd:unknown", sessionId: currentDelegation.childSessionId }; }
   const resultRef = executionRef(attempt); if (isAbortRequested(deps.signal)) attempt.failureKind = "cancelled"; const payload = current.call ? await readDelegationPayload(rootDir, current, currentDelegation).catch(() => undefined) : undefined; const persistent = current.call ? (await callPayload(rootDir, current.call).catch(() => undefined))?.persistent !== false && payload?.item.persistent !== false : true;
-  if (["success", "incomplete", "task_failure"].includes(attempt.failureKind)) { const startupClaim: OwnerClaim = { owner: currentDelegation.owner!, ownerGeneration: currentDelegation.ownerGeneration, fencingGeneration: currentDelegation.fencingGeneration, spawnId: currentDelegation.spawnId! }; const committed = await commitTerminalOutcome(rootDir, dispatchCallId, delegationId, attempt, resultRef, startupClaim, !persistent, deps); return { state: committed.state === "completed" ? "completed" : "rejected", dispatchCallId, delegationId, attempt, attempts: [attempt], error: committed.error }; }
+  if (["success", "incomplete", "task_failure"].includes(attempt.failureKind)) { const startupClaim: OwnerClaim = { owner: currentDelegation.owner!, ownerGeneration: currentDelegation.ownerGeneration, fencingGeneration: currentDelegation.fencingGeneration, spawnId: currentDelegation.spawnId! }; const committed = await commitTerminalOutcome(rootDir, dispatchCallId, delegationId, attempt, resultRef, startupClaim, !persistent, deps); return { state: committed.state, dispatchCallId, delegationId, attempt, attempts: [attempt], error: committed.error }; }
   const interrupted = await withCallLock(rootDir, dispatchCallId, async () => { const latest = await loadView(rootDir, dispatchCallId); const context = await validateCurrentExecutionContext(rootDir, latest, deps, currentDelegation.owner); const item = latest.delegations.get(delegationId); if (context.ok && !latest.integrity && item && item.spawnId === currentDelegation.spawnId && item.ownerGeneration === currentDelegation.ownerGeneration) await appendWal(rootDir, dispatchCallId, "execution_interrupted", { reason: durableInterruptionReason(attempt.failureKind, isAbortRequested(deps.signal)), failureKind: durableInterruptionFailureKind(attempt.failureKind, isAbortRequested(deps.signal)), resultRef, spawnId: item.spawnId!, fencingGeneration: item.fencingGeneration, ownerGeneration: item.ownerGeneration }, delegationId, deps); const replayed = await loadView(rootDir, dispatchCallId); await materialize(rootDir, replayed); return context.ok ? replayed.delegations.get(delegationId)?.state : "rejected" as const; });
   return { state: interrupted === "paused_integrity" ? "paused_integrity" : interrupted === "rejected" ? "rejected" : "paused_uncertainty", dispatchCallId, delegationId, attempt, attempts: [attempt], error: attempt.errorMessage };
 }

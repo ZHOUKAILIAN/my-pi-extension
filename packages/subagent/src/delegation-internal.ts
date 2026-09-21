@@ -37,6 +37,21 @@ export {
   executeDeliveryInternal,
   reconcileDeliveryStartupInternal,
 } from "./delegation.ts";
+export {
+  beginActionIntentInternal,
+  finishActionResultInternal,
+  replayActionPolicy,
+  reconcileActionUnknownInternal,
+  reconcileActionUnknownLocked,
+  decideUncertaintyDispositionInternal,
+  reconcileBeforeReturnInternal,
+  readActionLedgerInternal,
+  readActionPrivateInternal,
+  actionIdFor,
+  stableIdempotencyKeyFor,
+  canonicalArgsDigest,
+} from "./action-ledger.ts";
 export type { CancelActor, CancelReceipt, CancelScope, ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry } from "./delegation.ts";
 export type { StatusQueryResult } from "./delivery.ts";
 export type { OwnerClaim, OwnerIdentityProbeSafetyAdapter } from "./execution-supervisor.ts";
+export type { ActionIdentity, ActionIntentRequest, ActionPolicyClassification, ActionProjection, ActionReplayPolicy, ActionRetryPolicy, ActionResultRequest, ActionStatus, UncertaintyDisposition, ChildControlAdapter, ChildControlObservation } from "./delegation-types.ts";
