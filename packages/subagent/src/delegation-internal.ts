@@ -8,6 +8,10 @@ export {
   claimExecutionOwnerInternal,
   executeReattachedDelegationInternal,
   acceptContinuationInternal,
+  requestDelegationCancelInternal,
+  requestDelegationCancelScopedInternal,
+  reconcileDelegationCancelInternal,
+  reconcileCancellationInternal,
   bindChildSessionInternal,
   reconcileRunningChildInternal,
   executeDelegationInternal,
@@ -24,6 +28,7 @@ export {
   classifyOwnerIdentityObservation,
   probeOwnerDeathStable,
   delegationFoundationCapability,
+  SubagentControlService,
 } from "./delegation.ts";
-export type { ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness } from "./delegation.ts";
+export type { CancelActor, CancelReceipt, CancelScope, ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness } from "./delegation.ts";
 export type { OwnerClaim, OwnerIdentityProbeSafetyAdapter } from "./execution-supervisor.ts";

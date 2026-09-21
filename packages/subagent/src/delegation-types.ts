@@ -5,8 +5,8 @@ import type { AttemptResult } from "./runner.ts";
 import type { runPiAttempt } from "./runner.ts";
 
 export type DispatchMode = "single" | "parallel" | "chain";
-export type DelegationState = "reserved" | "admitted" | "resolving" | "resolution_ready" | "bound" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
-export type SlotState = "pending" | "admitted" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
+export type DelegationState = "reserved" | "admitted" | "resolving" | "resolution_ready" | "bound" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
+export type SlotState = "pending" | "admitted" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
 
 export interface DispatchItemInput { agent: string; task: string; cwd?: string; model?: string; persistent?: boolean; }
 export interface ProjectTrustBinding { parentSessionId: string; discoveryRootRealpath: string; snapshotDigest: string; }
@@ -52,6 +52,9 @@ export interface DelegationFoundationDependencies {
   signal?: AbortSignal;
 }
 export interface ConfigRevisionActor { actorId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
+export interface CancelActor { parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
+export type CancelScope = "item";
+export interface CancelReceipt { target: string; scope: CancelScope; actorRef: string; walSeq: number; status: "requested" | "already_requested" | "completed"; }
 export interface DispatchSlotView { index: number; order: number; required: boolean; kind: "single" | "parallel" | "chain"; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string; }
 export interface DispatchCallView {
   version: 1; dispatchCallId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string;
@@ -70,6 +73,7 @@ export interface CallAggregateProof { version: 1; dispatchCallId: string; mode: 
 export interface StartupNormalizationResult { scanned: number; normalized: number; pausedIntegrity: number; spawnCount: 0; sendCount: 0; }
 export interface InternalDelegation extends DelegationView {
   provenanceRef?: string; requiredIdentity: string; revisionIntent?: RevisionIntent; revisionObservation?: RevisionObservation; resolutionReasonCode?: string;
+  cancelRequestedSeq?: number; cancelActorRef?: string;
   spawnId?: string; spawnStarted?: boolean; childSessionId?: string; childSessionPathHash?: string; childPid?: number; childIdentity?: ChildIdentity;
   runKind?: "initial" | "recovery"; recoveryCyclesUsed: number; logicalSpawnCount: number; continuationEpoch: number; fencingGeneration: number; ownerGeneration: number; owner?: OwnerIdentity;
   cleanupPending?: boolean; cleanupSessionRef?: string;
@@ -105,6 +109,6 @@ export interface DelegationExecutionControl {
   bindChildSession: (rootDir: string, dispatchCallId: string, delegationId: string, claim: import("./execution-supervisor.ts").OwnerClaim, childSessionId: string, sessionPath?: string, pid?: number, deps?: DelegationFoundationDependencies, attempt?: number) => Promise<any>;
   claimOwner: (rootDir: string, dispatchCallId: string, delegationId: string, identity: OwnerIdentity, deps?: DelegationFoundationDependencies) => Promise<any>;
   readCall: (rootDir: string, dispatchCallId: string, current?: ActiveLineage) => Promise<any>;
-  reconcileStartup: (rootDir: string, view: InternalView) => Promise<InternalView>;
+  reconcileStartup: (rootDir: string, view: InternalView, deps?: DelegationFoundationDependencies) => Promise<InternalView>;
 }
 type CallState = "admitted" | "repair_required" | "final" | "paused_integrity" | "paused_configuration" | "paused_uncertainty";

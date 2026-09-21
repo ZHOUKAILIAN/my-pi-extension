@@ -13,7 +13,7 @@ import type {
 } from "./delegation-types.ts";
 
 export type {
-  CallAggregateProof, ChildInspection, ConfigRevisionActor, DelegationExecutionDependencies, DelegationExecutionResult, DelegationFoundationDependencies,
+  CallAggregateProof, CancelActor, CancelReceipt, CancelScope, ChildInspection, ConfigRevisionActor, DelegationExecutionDependencies, DelegationExecutionResult, DelegationFoundationDependencies,
   DelegationState, DelegationView, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, DispatchMode, DispatchSlotView, InternalDelegation,
   InternalView, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, ProjectTrustBinding, RevisionIntent, RevisionLifecycle, RevisionObservation,
   SlotState, StartupNormalizationResult, TornTail, WalEvent,
@@ -29,7 +29,7 @@ const executionControl: DelegationExecutionControl = {
   bindChildSession: supervisor.bindChildSessionInternal,
   claimOwner: supervisor.claimExecutionOwnerInternal,
   readCall: control.readDispatchCallInternal,
-  reconcileStartup: control.reconcileAcceptedRevision,
+  reconcileStartup: control.reconcileStartupInternal,
 };
 
 function executionDeps(deps: DelegationExecutionDependencies = {}): DelegationExecutionDependencies {
@@ -45,6 +45,11 @@ export const acceptConfigRevisionInternal = control.acceptConfigRevisionInternal
 export const reserveInitialInternal = control.reserveInitialInternal;
 export const reserveRecoveryCycleInternal = control.reserveRecoveryCycleInternal;
 export const acceptContinuationInternal = control.acceptContinuationInternal;
+export const requestDelegationCancelInternal = control.requestDelegationCancelInternal;
+export const requestDelegationCancelScopedInternal = control.requestDelegationCancelScopedInternal;
+export const reconcileDelegationCancelInternal = control.reconcileDelegationCancelInternal;
+export const reconcileCancellationInternal = control.reconcileCancellationInternal;
+export { SubagentControlService } from "./delegation-control.ts";
 export const admitNextChainStepInternal = control.admitNextChainStepInternal;
 export const finalizeCallInternal = control.finalizeCallInternal;
 
