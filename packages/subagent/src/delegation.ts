@@ -47,7 +47,9 @@ export const reserveRecoveryCycleInternal = control.reserveRecoveryCycleInternal
 export const acceptContinuationInternal = control.acceptContinuationInternal;
 export const requestDelegationCancelInternal = control.requestDelegationCancelInternal;
 export const requestDelegationCancelScopedInternal = control.requestDelegationCancelScopedInternal;
+export const requestCallCancelInternal = control.requestCallCancelInternal;
 export const reconcileDelegationCancelInternal = control.reconcileDelegationCancelInternal;
+export const reconcileCallCancellationInternal = control.reconcileCallCancellationInternal;
 export const reconcileCancellationInternal = control.reconcileCancellationInternal;
 export { SubagentControlService } from "./delegation-control.ts";
 export const admitNextChainStepInternal = control.admitNextChainStepInternal;

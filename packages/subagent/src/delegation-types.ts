@@ -6,7 +6,7 @@ import type { runPiAttempt } from "./runner.ts";
 
 export type DispatchMode = "single" | "parallel" | "chain";
 export type DelegationState = "reserved" | "admitted" | "resolving" | "resolution_ready" | "bound" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
-export type SlotState = "pending" | "admitted" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
+export type SlotState = "pending" | "admitted" | "initial_ready" | "initial_running" | "recovery_ready" | "cycle_ready" | "recovery_running" | "reattach_only" | "cancel_requested" | "cancelled" | "returned" | "not_admitted_due_to_call_cancel" | "paused_configuration" | "paused_integrity" | "paused_uncertainty";
 
 export interface DispatchItemInput { agent: string; task: string; cwd?: string; model?: string; persistent?: boolean; }
 export interface ProjectTrustBinding { parentSessionId: string; discoveryRootRealpath: string; snapshotDigest: string; }
@@ -53,14 +53,15 @@ export interface DelegationFoundationDependencies {
 }
 export interface ConfigRevisionActor { actorId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
 export interface CancelActor { parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
-export type CancelScope = "item";
+export type CancelScope = "item" | "call";
 export interface CancelReceipt { target: string; scope: CancelScope; actorRef: string; walSeq: number; status: "requested" | "already_requested" | "completed"; }
-export interface DispatchSlotView { index: number; order: number; required: boolean; kind: "single" | "parallel" | "chain"; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string; }
+export type CallCancelSettlement = "returned_before_call_cancel" | "admitted_cancelled" | "not_admitted_due_to_call_cancel";
+export interface DispatchSlotView { index: number; order: number; required: boolean; kind: "single" | "parallel" | "chain"; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string; cancelSettlement?: CallCancelSettlement; }
 export interface DispatchCallView {
   version: 1; dispatchCallId: string; parentSessionId: string; activeLineageId: string; activeBranchAnchor: string;
   persistence: "restart-durable" | "in_process_only"; toolCallIdHash: string; requestDigest: string; mode: DispatchMode; agentScope: AgentScope;
   projectTrustDigest?: string; slots: DispatchSlotView[]; chainCursor: number; privatePayloadRef: string;
-  state: CallState; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
+  state: CallState; cancelRequestedSeq?: number; cancelActorRef?: string; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
 }
 export interface DelegationView {
   version: 1; delegationId: string; dispatchCallId: string; slotIndex: number; parentSessionId: string;
@@ -69,7 +70,7 @@ export interface DelegationView {
   canonical?: { name: string; source: "user" | "project"; discoveryRootHash: string; fileHash: string; digest: string; aliases: string[] };
   pauseReason?: string; initialReservationId?: string; returnedOutcome?: "success" | "failure" | "cancelled"; resultRef?: string;
 }
-export interface CallAggregateProof { version: 1; dispatchCallId: string; mode: DispatchMode; slots: Array<{ index: number; order: number; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string }>; outcome: "success" | "failure" | "cancelled"; createdAt: string; finalizedAt: string; }
+export interface CallAggregateProof { version: 1; dispatchCallId: string; mode: DispatchMode; slots: Array<{ index: number; order: number; state: SlotState; delegationId?: string; terminalOutcome?: "success" | "failure" | "cancelled"; resultRef?: string; cancelSettlement?: CallCancelSettlement }>; outcome: "success" | "failure" | "cancelled"; createdAt: string; finalizedAt: string; }
 export interface StartupNormalizationResult { scanned: number; normalized: number; pausedIntegrity: number; spawnCount: 0; sendCount: 0; }
 export interface InternalDelegation extends DelegationView {
   provenanceRef?: string; requiredIdentity: string; revisionIntent?: RevisionIntent; revisionObservation?: RevisionObservation; resolutionReasonCode?: string;
@@ -111,4 +112,4 @@ export interface DelegationExecutionControl {
   readCall: (rootDir: string, dispatchCallId: string, current?: ActiveLineage) => Promise<any>;
   reconcileStartup: (rootDir: string, view: InternalView, deps?: DelegationFoundationDependencies) => Promise<InternalView>;
 }
-type CallState = "admitted" | "repair_required" | "final" | "paused_integrity" | "paused_configuration" | "paused_uncertainty";
+type CallState = "admitted" | "cancel_requested" | "repair_required" | "final" | "paused_integrity" | "paused_configuration" | "paused_uncertainty";
