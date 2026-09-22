@@ -2,7 +2,7 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `DECIDED / v2 未完成、未启用` — 2026-09-14 已正式采纳本 L1 产品契约与对应 L2 目标设计；S1–S43 连续。slice0–3 的 gated foundation 已有源码与测试，但 capability disabled，未接入 v1；真实 Darwin、跨进程与 provider E2E 尚未验证，不能声称产品级 v2 完成。 |
+| 状态 | `DECIDED / v2 未完成、未启用` — 2026-09-14 已正式采纳本 L1 产品契约与对应 L2 目标设计；S1–S43 连续。slice0–7 gated internal foundations 已有源码/测试（admission/recovery、cancel/call orchestration、delivery、action ledger/fence、cleanup、bridge adoption/rollback foundations）；这只是 L2 当前事实摘要，不改变 L1 产品契约。产品级 v2 未完成/未启用，capability disabled，root/v1 wiring=0；真实 bridge-v1 binary+30d、side-fence production proof、Darwin/跨进程/power-loss/provider/TUI/delivery host/control adapters E2E 均未完成，不得声称 production ready。 |
 | 正式评审与采纳 | [2026-09-14 产品语义/指标 Review Artifact](../../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)、[实现/运营 Review Artifact](../../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)、[Adoption Decision](../../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)；2026-09-13 文件只覆盖旧基线/历史 WIP，不覆盖本方案。 |
 | 层级 | 第一层（L1 Extension） |
 | 用户目标 | 调用者按稳定角色意图委派，不必记住脆弱 Agent 文件名或 Child Session ID；每个已受理委派都可诊断、可恢复且默认自动续跑，同时不重复不可确认的外部副作用。 |
@@ -512,6 +512,8 @@ single orphan Delegation（经 WAL/replay 证明不存在任何 live Call→Dele
 
 1. `bridge-v1` 必须在采用任何既有 v1 session 前先发布、安装并验证；未满足时 adoption=0，旧 session 保持 legacy explicit-handle-only；
 2. 每个 coding 切片保持当前 v1 基线事实不变，按 `implementer → code_reviewer` 关闭实现 Finding，并同步 L2 当前事实与剩余 drift；
-3. 最终完成必须逐项满足 S1–S43 及 L2 真实 E2E/安全门禁。当前只有 slice0–3 gated foundation 的源码与测试；产品级 v2 仍未完成、未启用，capability disabled、未接 v1，且真实 Darwin/跨进程/provider/TUI E2E 与运行证据未完成前不得声称完成或验证通过。
+3. 最终完成必须逐项满足 S1–S43 及 L2 真实 E2E/安全门禁。
 
-当前实现与已采纳目标的 drift 见 [L2 §9](../../02-产品实现/subagent-dispatcher-技术设计.md#9-目标设计尚未实现)。明确边界：产品级 v2 仍未完成、未启用；slice0–3 仅提供 gated foundation 的源码/测试，`delegationFoundationCapability()` 仍为 disabled，未接现行 v1 execute，真实 Darwin birth/PID reuse、跨进程生命周期与真实 provider/TUI E2E 均未验证。上述状态与 L2 当前源码事实一致。
+当前 L2 事实摘要：slice0–7 gated internal foundations 已有源码/测试（admission/recovery、cancel/call orchestration、delivery、action ledger/fence、cleanup、bridge adoption/rollback foundations）；这只是 L2 当前事实摘要，不改变 L1 产品契约。产品级 v2 仍未完成/未启用，capability disabled，root/v1 wiring=0；真实 bridge-v1 binary+30d、side-fence production proof、Darwin/跨进程/power-loss/provider/TUI/delivery host/control adapters E2E 均未完成，不得声称 production ready。
+
+详细当前事实与 drift 以 [L2 §9](../../02-产品实现/subagent-dispatcher-技术设计.md#9-目标设计尚未实现) 及其源码/测试为准；本节不重复实现细节，避免形成 L1/L2 双 owner。
