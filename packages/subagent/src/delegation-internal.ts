@@ -37,6 +37,21 @@ export {
   executeDeliveryInternal,
   reconcileDeliveryStartupInternal,
 } from "./delegation.ts";
+export { observeCustomReceiptInternal } from "./delivery.ts";
+export {
+  requestDelegationDeleteInternal,
+  subagentDeleteInternal,
+  requestCallCleanupInternal,
+  subagentCallCleanupInternal,
+  requestRetentionCleanupInternal,
+  evaluateRetentionEligibilityInternal,
+  cleanupOrphanDelegationInternal,
+  reconcileCleanupStartupInternal,
+  gcCleanupTombstonesInternal,
+  computeActorScopeTag,
+  cleanupActorSecretPath,
+  retentionTombstonePath,
+} from "./cleanup.ts";
 export {
   buildSideEffectFenceExtensions,
   startSideEffectFenceServer,
@@ -72,6 +87,7 @@ export {
   canonicalArgsDigest,
 } from "./action-ledger.ts";
 export type { CancelActor, CancelReceipt, CancelScope, ConfigRevisionActor, DelegationFoundationDependencies, DelegationExecutionDependencies, DelegationExecutionResult, ChildInspection, OrphanReconciliationResult, OwnerIdentity, OwnerIdentityObservation, OwnerLiveness, DeliveryAbandonReceipt, DeliveryHostAdapter, HostPersistedBranchEntry } from "./delegation.ts";
+export type { DeleteActor, DeleteReceipt, DeleteTrigger, RetentionEligibility } from "./delegation-types.ts";
 export type { StatusQueryResult } from "./delivery.ts";
 export type { OwnerClaim, OwnerIdentityProbeSafetyAdapter } from "./execution-supervisor.ts";
 export type { ActionIdentity, ActionIntentRequest, ActionPolicyClassification, ActionProjection, ActionReplayPolicy, ActionRetryPolicy, ActionResultRequest, ActionStatus, UncertaintyDisposition, ChildControlAdapter, ChildControlObservation } from "./delegation-types.ts";

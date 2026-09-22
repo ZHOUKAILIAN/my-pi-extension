@@ -71,7 +71,7 @@ export async function ensureInterruptedDeliveryPendingLocked(rootDir: string, vi
   const payload = safePayload(view.call);
   const d = { ...payload };
   await writePrivate(privatePayload(dirs(rootDir), payloadRef(payload.deliveryId).slice(8)), d);
-  await appendWal(rootDir, view.call.dispatchCallId, "delivery_pending", { deliveryId: payload.deliveryId, customType: payload.customType, payloadRef: payloadRef(payload.deliveryId), proofRef: payload.proofRef, outcome: payload.outcome, originalToolCallStatus: payload.originalToolCallStatus, deliverySemantics: payload.deliverySemantics }, undefined, deps);
+  await appendWal(rootDir, view.call.dispatchCallId, "delivery_pending", { deliveryId: payload.deliveryId, customType: payload.customType, payloadRef: payloadRef(payload.deliveryId), proofRef: payload.proofRef, outcome: payload.outcome, originalToolCallStatus: payload.originalToolCallStatus, deliverySemantics: payload.deliverySemantics, activityAt: now(deps) }, undefined, deps);
   return (await loadView(rootDir, view.call.dispatchCallId));
 }
 
@@ -129,6 +129,25 @@ async function scanForStatus(adapter: DeliveryHostAdapter | undefined, lineage: 
   return scanEntries(adapter, lineage);
 }
 
+export async function querySubagentStatusLockedInternal(rootDir: string, dispatchCallId: string, lineage: ActiveLineage, entries: readonly HostPersistedBranchEntry[] | undefined, deps: DelegationFoundationDependencies = {}): Promise<StatusQueryResult> {
+  let view = await loadViewReadOnly(rootDir, dispatchCallId);
+  if (view.integrity) return statusProjection(view);
+  if (!view.call || !validLineageForCall(view.call, lineage)) return { state: "rejected", dispatchCallId };
+  let scanned: readonly HostPersistedBranchEntry[] | undefined;
+  try { scanned = await scanForStatus(deps.deliveryHostAdapter, lineage, entries); } catch { return { state: "paused_integrity", dispatchCallId, integrityReason: "active branch scan cannot be proven" }; }
+  const current = await inspectNormalObservation(rootDir, view, lineage, scanned);
+  if (current.kind === "integrity") return { state: "paused_integrity", dispatchCallId, integrityReason: current.reason };
+  if (current.kind === "none") return statusProjection(view);
+  try {
+    await appendWalStrictNoRepair(rootDir, dispatchCallId, "normal_tool_result_observed", { toolCallIdHash: view.call.toolCallIdHash, hostEntryRef: current.entry.entryRef, proofRef: proofRef(dispatchCallId), observedAt: now(deps), activeLineageId: view.call.activeLineageId, activeBranchAnchor: view.call.activeBranchAnchor }, undefined, deps);
+  } catch (error) {
+    return { state: "paused_integrity" as const, dispatchCallId, integrityReason: error instanceof Error ? error.message : "normal observation WAL integrity cannot be proven" };
+  }
+  // Do not materialize from a status/query path. The WAL fact itself is the
+  // only permitted write; a later maintenance/read path may project it.
+  return statusProjection(await loadViewReadOnly(rootDir, dispatchCallId));
+}
+
 export async function querySubagentStatusInternal(rootDir: string, dispatchCallId: string, lineage: ActiveLineage, entries?: readonly HostPersistedBranchEntry[], deps: DelegationFoundationDependencies = {}): Promise<StatusQueryResult> {
   // First perform a genuinely read-only pass.  Only a strict, already-host-
   // persisted normal result is allowed to enter the call lock and append its
@@ -141,24 +160,7 @@ export async function querySubagentStatusInternal(rootDir: string, dispatchCallI
   const initial = await inspectNormalObservation(rootDir, view, lineage, scanned);
   if (initial.kind === "integrity") return { state: "paused_integrity", dispatchCallId, integrityReason: initial.reason };
   if (initial.kind === "none") return statusProjection(view);
-
-  const result = await withCallLock(rootDir, dispatchCallId, async () => {
-    view = await loadViewReadOnly(rootDir, dispatchCallId);
-    if (view.integrity) return statusProjection(view);
-    if (!view.call || !validLineageForCall(view.call, lineage)) return { state: "rejected" as const, dispatchCallId };
-    try { scanned = await scanForStatus(deps.deliveryHostAdapter, lineage, entries); } catch { return { state: "paused_integrity" as const, dispatchCallId, integrityReason: "active branch scan cannot be proven" }; }
-    const current = await inspectNormalObservation(rootDir, view, lineage, scanned);
-    if (current.kind === "integrity") return { state: "paused_integrity" as const, dispatchCallId, integrityReason: current.reason };
-    if (current.kind === "none") return statusProjection(view);
-    try {
-      await appendWalStrictNoRepair(rootDir, dispatchCallId, "normal_tool_result_observed", { toolCallIdHash: view.call.toolCallIdHash, hostEntryRef: current.entry.entryRef, proofRef: proofRef(dispatchCallId), observedAt: now(deps), activeLineageId: view.call.activeLineageId, activeBranchAnchor: view.call.activeBranchAnchor }, undefined, deps);
-    } catch (error) {
-      return { state: "paused_integrity" as const, dispatchCallId, integrityReason: error instanceof Error ? error.message : "normal observation WAL integrity cannot be proven" };
-    }
-    // Do not materialize from a status/query path. The WAL fact itself is the
-    // only permitted write; a later maintenance/read path may project it.
-    return statusProjection(await loadViewReadOnly(rootDir, dispatchCallId));
-  });
+  const result = await withCallLock(rootDir, dispatchCallId, () => querySubagentStatusLockedInternal(rootDir, dispatchCallId, lineage, entries, deps));
   return result ?? { state: "busy", dispatchCallId };
 }
 
@@ -167,7 +169,7 @@ async function claimDeliveryOwnerLocked(rootDir: string, view: InternalView, dep
   if (outbox.ownerRef === ref && outbox.ownerGeneration !== undefined && outbox.fencingGeneration !== undefined) return view;
   const ownerGeneration = (outbox.ownerGeneration ?? 0) + 1;
   const fencingGeneration = (outbox.fencingGeneration ?? -1) + 1;
-  await appendWal(rootDir, call.dispatchCallId, "delivery_owner_claimed", { deliveryId: outbox.deliveryId, ownerRef: ref, ownerGeneration, fencingGeneration, ...(outbox.ownerGeneration === undefined ? {} : { previousOwnerGeneration: outbox.ownerGeneration }) }, undefined, deps);
+  await appendWal(rootDir, call.dispatchCallId, "delivery_owner_claimed", { deliveryId: outbox.deliveryId, ownerRef: ref, ownerGeneration, fencingGeneration, activityAt: now(deps), ...(outbox.ownerGeneration === undefined ? {} : { previousOwnerGeneration: outbox.ownerGeneration }) }, undefined, deps);
   return loadView(rootDir, call.dispatchCallId);
 }
 async function receiptScan(adapter: DeliveryHostAdapter | undefined, lineage: ActiveLineage, call: DispatchCallView, outbox: CustomOutboxView, entries?: readonly HostPersistedBranchEntry[]) {
@@ -191,7 +193,7 @@ async function executeDeliveryLocked(rootDir: string, dispatchCallId: string, de
   scan = await receiptScan(adapter, lineage, view.call!, outbox, entries);
   if (scan.integrity) { await appendWal(rootDir, dispatchCallId, "delivery_integrity_paused", { deliveryId: outbox.deliveryId, reason: "multiple or mismatched custom receipts" }, undefined, deps); return { state: "paused_integrity", deliveryId: outbox.deliveryId, sendCount: 0 }; }
   if (scan.matches.length === 1) {
-    await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: outbox.deliveryId, ownerRef: outbox.ownerRef, ownerGeneration: outbox.ownerGeneration, fencingGeneration: outbox.fencingGeneration }, undefined, deps);
+    await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: outbox.deliveryId, ownerRef: outbox.ownerRef, ownerGeneration: outbox.ownerGeneration, fencingGeneration: outbox.fencingGeneration, activityAt: now(deps) }, undefined, deps);
     await materialize(rootDir, await loadView(rootDir, dispatchCallId));
     return { state: "receipted", deliveryId: outbox.deliveryId, sendCount: 0 };
   }
@@ -216,9 +218,27 @@ async function executeDeliveryLocked(rootDir: string, dispatchCallId: string, de
   const post = await receiptScan(adapter, lineage, after.call!, afterOutbox);
   if (post.integrity) { await appendWal(rootDir, dispatchCallId, "delivery_integrity_paused", { deliveryId: deliveryIdValue, reason: "multiple or mismatched custom receipts" }, undefined, deps); return { state: "paused_integrity", deliveryId: deliveryIdValue, sendCount: 1 }; }
   if (post.matches.length !== 1) { await appendWal(rootDir, dispatchCallId, "delivery_uncertain", { deliveryId: deliveryIdValue, ownerRef: afterOutbox.ownerRef, ownerGeneration: afterOutbox.ownerGeneration, fencingGeneration: afterOutbox.fencingGeneration }, undefined, deps); return { state: "uncertain", deliveryId: deliveryIdValue, sendCount: 1 }; }
-  await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: deliveryIdValue, ownerRef: afterOutbox.ownerRef, ownerGeneration: afterOutbox.ownerGeneration, fencingGeneration: afterOutbox.fencingGeneration }, undefined, deps);
+  await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: deliveryIdValue, ownerRef: afterOutbox.ownerRef, ownerGeneration: afterOutbox.ownerGeneration, fencingGeneration: afterOutbox.fencingGeneration, activityAt: now(deps) }, undefined, deps);
   await materialize(rootDir, await loadView(rootDir, dispatchCallId));
   return { state: "receipted", deliveryId: deliveryIdValue, sendCount: 1 };
+}
+
+export async function observeCustomReceiptLockedInternal(rootDir: string, dispatchCallId: string, lineage: ActiveLineage, adapter: DeliveryHostAdapter | undefined, deps: DelegationFoundationDependencies = {}) {
+  if (!adapter) return { state: "none" as const, dispatchCallId };
+  let view = await loadViewReadOnly(rootDir, dispatchCallId); const outbox = outboxFrom(view);
+  if (view.integrity || !view.call || !outbox || !validLineageForCall(view.call, lineage)) return { state: "paused_integrity" as const, dispatchCallId };
+  if (["receipted", "abandoned", "uncertain"].includes(outbox.status)) return { state: outbox.status as "receipted" | "abandoned" | "uncertain", dispatchCallId };
+  const scanned = await receiptScan(adapter, lineage, view.call, outbox);
+  if (scanned.integrity) return { state: "paused_integrity" as const, dispatchCallId };
+  if (scanned.matches.length !== 1) return { state: "none" as const, dispatchCallId };
+  view = await claimDeliveryOwnerLocked(rootDir, view, deps); const owned = outboxFrom(view)!;
+  await appendWalStrictNoRepair(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: owned.deliveryId, ownerRef: owned.ownerRef, ownerGeneration: owned.ownerGeneration, fencingGeneration: owned.fencingGeneration, activityAt: now(deps) }, undefined, deps);
+  return { state: "receipted" as const, dispatchCallId };
+}
+
+export async function observeCustomReceiptInternal(rootDir: string, dispatchCallId: string, lineage: ActiveLineage, adapter: DeliveryHostAdapter | undefined, deps: DelegationFoundationDependencies = {}) {
+  const result = await withCallLock(rootDir, dispatchCallId, () => observeCustomReceiptLockedInternal(rootDir, dispatchCallId, lineage, adapter, deps));
+  return result ?? { state: "busy" as const, dispatchCallId };
 }
 
 export async function executeDeliveryInternal(rootDir: string, dispatchCallId: string, deliveryIdValue: string, lineage: ActiveLineage, adapter: DeliveryHostAdapter | undefined, deps: DelegationFoundationDependencies = {}) {
@@ -233,7 +253,7 @@ export async function reconcileDeliveryStartupInternal(rootDir: string, dispatch
     if (outbox.status === "sending") {
       const scan = await receiptScan(adapter, lineage, view.call!, outbox);
       if (scan.integrity) { await appendWal(rootDir, dispatchCallId, "delivery_integrity_paused", { deliveryId: outbox.deliveryId, reason: "multiple or mismatched custom receipts" }, undefined, deps); return { state: "paused_integrity", dispatchCallId, sendCount: 0 }; }
-      if (scan.matches.length === 1) { await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: outbox.deliveryId, ownerRef: outbox.ownerRef, ownerGeneration: outbox.ownerGeneration, fencingGeneration: outbox.fencingGeneration }, undefined, deps); return { state: "receipted", dispatchCallId, sendCount: 0 }; }
+      if (scan.matches.length === 1) { await appendWal(rootDir, dispatchCallId, "delivery_receipted", { deliveryId: outbox.deliveryId, ownerRef: outbox.ownerRef, ownerGeneration: outbox.ownerGeneration, fencingGeneration: outbox.fencingGeneration, activityAt: now(deps) }, undefined, deps); return { state: "receipted", dispatchCallId, sendCount: 0 }; }
       await appendWal(rootDir, dispatchCallId, "delivery_uncertain", { deliveryId: outbox.deliveryId, ownerRef: outbox.ownerRef, ownerGeneration: outbox.ownerGeneration, fencingGeneration: outbox.fencingGeneration }, undefined, deps); return { state: "uncertain", dispatchCallId, sendCount: 0 };
     }
     if (outbox.status === "pending") return executeDeliveryLocked(rootDir, dispatchCallId, outbox.deliveryId, lineage, adapter, undefined, deps);

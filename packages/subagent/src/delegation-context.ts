@@ -2,7 +2,7 @@
 import * as fs from "node:fs/promises";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getAgentDiscoverySnapshot, validAgentDiscoverySnapshot, type AgentDiscoverySnapshot, type AgentScope } from "./agents.ts";
 import { lineageMatches, type ActiveLineage } from "./lineage.ts";
 import { withIdentityLock } from "./session-lock.ts";
@@ -19,14 +19,39 @@ export class WalAppendGuardRejected extends Error {
 export function hash(value: string | Buffer): string { return createHash("sha256").update(value).digest("hex"); }
 export function hashPath(value: string): string { return hash(path.resolve(value)).slice(0, 32); }
 export function toolCallHash(value: string): string { return hash(value); }
-export function dirs(rootDir: string) { const root = path.join(rootDir, V2_ROOT); return { root, wal: path.join(root, "wal"), calls: path.join(root, "calls"), delegations: path.join(root, "delegations"), private: path.join(root, "private"), proofs: path.join(root, "proofs") }; }
+export function dirs(rootDir: string) { const root = path.join(rootDir, V2_ROOT); return { root, wal: path.join(root, "wal"), calls: path.join(root, "calls"), delegations: path.join(root, "delegations"), private: path.join(root, "private"), proofs: path.join(root, "proofs"), cleanupJournal: path.join(root, "cleanup-journal"), tombstones: path.join(root, "tombstones"), actorSecret: path.join(root, "actor-scope.secret") }; }
 export function callWal(d: ReturnType<typeof dirs>, callId: string): string { return path.join(d.wal, `${callId}.jsonl`); }
 export function callProjection(d: ReturnType<typeof dirs>, callId: string): string { return path.join(d.calls, `${callId}.json`); }
 export function delegationProjection(d: ReturnType<typeof dirs>, id: string): string { return path.join(d.delegations, `${id}.json`); }
 export function privatePayload(d: ReturnType<typeof dirs>, id: string): string { return path.join(d.private, `${id}.json`); }
 export function proofPath(d: ReturnType<typeof dirs>, id: string): string { return path.join(d.proofs, `${id}.json`); }
 export async function ensureDirectory(directory: string): Promise<void> { await ensureOwnerDirectory(directory); }
-export async function ensureStore(rootDir: string) { const d = dirs(rootDir); for (const directory of [d.root, d.wal, d.calls, d.delegations, d.private, d.proofs]) await ensureDirectory(directory); return d; }
+export async function ensureStore(rootDir: string) { const d = dirs(rootDir); for (const directory of [d.root, d.wal, d.calls, d.delegations, d.private, d.proofs, d.cleanupJournal, d.tombstones]) await ensureDirectory(directory); return d; }
+
+/** The delete actor key is owner-only state. It is provisioned with the v2 store,
+ * but an absent/tampered key is never recreated by a delete or replay path. */
+export async function ensureActorScopeSecret(rootDir: string): Promise<Buffer> {
+  const d = await ensureStore(rootDir);
+  const existing = readActorScopeSecret(rootDir);
+  if (existing) return existing;
+  try { nodeFs.lstatSync(d.actorSecret); throw new Error("actor scope secret exists but is not verifiable"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const secret = randomBytes(32);
+  await atomicOwnerJson(d.actorSecret, { version: 1, secret: secret.toString("hex") });
+  const verified = readActorScopeSecret(rootDir);
+  if (!verified) throw new Error("actor scope secret durability cannot be proven");
+  return verified;
+}
+export function actorScopeSecretPath(rootDir: string): string { return dirs(rootDir).actorSecret; }
+export function readActorScopeSecret(rootDir: string): Buffer | undefined {
+  const file = dirs(rootDir).actorSecret;
+  try {
+    const stat = nodeFs.lstatSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || !ownerFileSync(file) || stat.nlink !== 1 || (stat.mode & 0o777) !== OWNER_ONLY_FILE) return undefined;
+    const parsed = JSON.parse(nodeFs.readFileSync(file, "utf8")) as any;
+    if (!parsed || parsed.version !== 1 || typeof parsed.secret !== "string" || !/^[0-9a-f]{64}$/.test(parsed.secret)) return undefined;
+    return Buffer.from(parsed.secret, "hex");
+  } catch { return undefined; }
+}
 export async function openSecureFile(file: string, flags: number, mode = OWNER_ONLY_FILE): Promise<fs.FileHandle> { return openOwnerFile(file, flags, mode); }
 export async function atomicJson(file: string, value: unknown): Promise<void> { return atomicOwnerJson(file, value); }
 export async function writePrivate(file: string, value: unknown): Promise<void> { await atomicJson(file, value); }
@@ -103,10 +128,16 @@ export async function materialize(rootDir: string, view: InternalView): Promise<
   const d = dirs(rootDir);
   if (view.integrity) { await ensureDirectory(d.root); for (const directory of [d.calls, d.delegations, d.private, d.proofs]) await ensureDirectory(directory); await fs.unlink(proofPath(d, view.integrity.callId)).catch(() => undefined); await atomicJson(callProjection(d, view.integrity.callId), { version: 1, dispatchCallId: view.integrity.callId, state: "paused_integrity", reason: view.integrity.reason }); return; }
   await ensureStore(rootDir); if (!view.call) return;
+  if (view.call.cleanupComplete) {
+    await fs.unlink(callProjection(d, view.call.dispatchCallId)).catch(() => undefined);
+    for (const delegation of view.delegations.values()) await fs.unlink(delegationProjection(d, delegation.delegationId)).catch(() => undefined);
+    if (view.call.proofDeleted) await fs.unlink(proofPath(d, view.call.dispatchCallId)).catch(() => undefined);
+    return;
+  }
   if (view.call.state === "repair_required") { await fs.unlink(callProjection(d, view.call.dispatchCallId)).catch(() => undefined); await fs.unlink(proofPath(d, view.call.dispatchCallId)).catch(() => undefined); for (const delegation of view.delegations.values()) await fs.unlink(delegationProjection(d, delegation.delegationId)).catch(() => undefined); return; }
   await atomicJson(callProjection(d, view.call.dispatchCallId), view.call);
-  for (const delegation of view.delegations.values()) { const { requiredIdentity: _identity, provenanceRef: _provenance, ...publicDelegation } = delegation; await atomicJson(delegationProjection(d, delegation.delegationId), publicDelegation); }
-  if (view.call.state === "final" && view.call.finalOutcome) { const proof = { version: 1 as const, dispatchCallId: view.call.dispatchCallId, mode: view.call.mode, slots: view.call.slots.slice().sort((a, b) => a.order - b.order).map(({ index, order, state, delegationId, terminalOutcome, resultRef, cancelSettlement }) => ({ index, order, state, ...(delegationId ? { delegationId } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(resultRef !== undefined ? { resultRef } : {}), ...(cancelSettlement ? { cancelSettlement } : {}) })), outcome: view.call.finalOutcome, createdAt: String(view.events.find((event) => event.type === "call_admitted")?.data.createdAt ?? new Date().toISOString()), finalizedAt: String(view.events.find((event) => event.type === "call_finalized")?.data.finalizedAt ?? new Date().toISOString()) }; await atomicJson(proofPath(d, view.call.dispatchCallId), proof); }
+  for (const delegation of view.delegations.values()) { if (delegation.deleteCompleted || delegation.orphanCleanupComplete) { await fs.unlink(delegationProjection(d, delegation.delegationId)).catch(() => undefined); continue; } const { requiredIdentity: _identity, provenanceRef: _provenance, ...publicDelegation } = delegation; await atomicJson(delegationProjection(d, delegation.delegationId), publicDelegation); }
+  if (view.call.state === "final" && view.call.finalOutcome && !view.call.proofDeleted) { const proof = { version: 1 as const, dispatchCallId: view.call.dispatchCallId, mode: view.call.mode, slots: view.call.slots.slice().sort((a, b) => a.order - b.order).map(({ index, order, state, delegationId, terminalOutcome, resultRef, cancelSettlement }) => ({ index, order, state, ...(delegationId ? { delegationId } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(resultRef !== undefined ? { resultRef } : {}), ...(cancelSettlement ? { cancelSettlement } : {}) })), outcome: view.call.finalOutcome, createdAt: String(view.events.find((event) => event.type === "call_admitted")?.data.createdAt ?? new Date().toISOString()), finalizedAt: String(view.events.find((event) => event.type === "call_finalized")?.data.finalizedAt ?? new Date().toISOString()) }; await atomicJson(proofPath(d, view.call.dispatchCallId), proof); }
 }
 export async function withCallLock<T>(rootDir: string, callId: string, fn: () => Promise<T>): Promise<T | undefined> { const d = dirs(rootDir); await ensureDirectory(d.root); for (let attempt = 0; attempt < 100; attempt += 1) { const result = await withIdentityLock({ rootDir: d.root, key: `call-${callId}` }, fn); if (result !== undefined) return result; await new Promise((resolve) => setTimeout(resolve, 5)); } return undefined; }
 export async function withOrphanCoordination<T>(rootDir: string, fn: () => Promise<T>): Promise<T | undefined> { const d = await ensureStore(rootDir); return withIdentityLock({ rootDir: d.root, key: "private-orphan-reconcile" }, fn); }

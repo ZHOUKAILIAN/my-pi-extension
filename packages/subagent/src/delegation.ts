@@ -3,6 +3,7 @@ import type { AgentConfig } from "./agents.ts";
 import type { AttemptResult } from "./runner.ts";
 import type { ActiveLineage } from "./lineage.ts";
 import { reconcilePrivateOrphans } from "./delegation-orphans.ts";
+import { reconcileCleanupStartupInternal } from "./cleanup.ts";
 import * as control from "./delegation-control.ts";
 import * as supervisor from "./execution-supervisor.ts";
 import type {
@@ -83,10 +84,14 @@ export async function reconcileRunningChildInternal(rootDir: string, dispatchCal
   return supervisor.reconcileRunningChildInternal(rootDir, dispatchCallId, delegationId, inspect, ownerDeps(deps));
 }
 export async function normalizeStartupInternal(rootDir: string, current: ActiveLineage, deps: DelegationFoundationDependencies = {}): Promise<StartupNormalizationResult> {
-  return supervisor.normalizeStartupInternal(rootDir, current, executionDeps(deps as DelegationExecutionDependencies));
+  const base = await supervisor.normalizeStartupInternal(rootDir, current, executionDeps(deps as DelegationExecutionDependencies));
+  await reconcileCleanupStartupInternal(rootDir, { ...deps, lineage: current });
+  return { ...base, spawnCount: 0, sendCount: 0 };
 }
 export async function normalizeExecutionStartupInternal(rootDir: string, current: ActiveLineage, inspect: (child: ChildInspection) => Promise<"live" | "dead" | "unknown">, deps: DelegationExecutionDependencies = {}): Promise<StartupNormalizationResult> {
-  return supervisor.normalizeExecutionStartupInternal(rootDir, current, inspect, executionDeps(deps));
+  const base = await supervisor.normalizeExecutionStartupInternal(rootDir, current, inspect, executionDeps(deps));
+  await reconcileCleanupStartupInternal(rootDir, { ...deps, lineage: current });
+  return { ...base, spawnCount: 0, sendCount: 0 };
 }
 
 export const readDispatchCallInternal = control.readDispatchCallInternal;

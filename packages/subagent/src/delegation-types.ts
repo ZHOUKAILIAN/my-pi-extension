@@ -5,6 +5,11 @@ import type { AttemptResult } from "./runner.ts";
 import type { runPiAttempt } from "./runner.ts";
 import type { SideEffectFenceBinding, SideEffectFenceConfig, SideEffectFenceReattachProof } from "./side-effect-fence.ts";
 
+export type DeleteTrigger = "explicit_delete" | "retention";
+export interface DeleteActor { parentSessionId: string; activeLineageId: string; activeBranchAnchor: string; }
+export interface DeleteReceipt { target: string; objectKind: "delegation" | "call"; actorScopeTag: string; status: "requested" | "completed" | "rejected" | "paused_integrity"; walWrites: number; deleteCount: number; reason?: string; }
+export interface RetentionEligibility { target: string; objectKind: "call" | "delegation"; eligible: boolean; lastDurableActivity?: string; reason?: string; }
+
 export type DispatchMode = "single" | "parallel" | "chain";
 export type OriginalToolCallStatus = "running" | "interrupted";
 export type NormalToolResultStatus = "unobserved" | "observed";
@@ -124,6 +129,10 @@ export interface DelegationFoundationDependencies {
   watchdogTerminate?: (request: { delegationId: string; actionId?: string; reason: string; ownerGeneration: number; fencingGeneration: number }) => Promise<void> | void;
   /** Gated v2-only Pi side-effect fence. Public v1 callers never provide this. */
   sideEffectFence?: SideEffectFenceConfig;
+  /** Test/internal injection for the owner-only delete actor secret. */
+  cleanupSecret?: Uint8Array | string;
+  /** Test seam invoked after the read-only cleanup preflight and before Call lock acquisition. */
+  cleanupBarrier?: (point: string) => void | Promise<void>;
   /** Reattach must prove it can rebuild the same fenced channel before execution. */
   reattachFenceProof?: (options: { delegationId: string; spawnId: string; ownerGeneration: number; fencingGeneration: number }) => Promise<SideEffectFenceReattachProof | undefined>;
 }
@@ -179,6 +188,7 @@ export interface DispatchCallView {
   projectTrustDigest?: string; slots: DispatchSlotView[]; chainCursor: number; privatePayloadRef: string;
   originalToolCallStatus: OriginalToolCallStatus; normalToolResultStatus: NormalToolResultStatus; customOutbox?: CustomOutboxView;
   state: CallState; cancelRequestedSeq?: number; cancelActorRef?: string; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
+  cleanupRequested?: boolean; cleanupTrigger?: DeleteTrigger; cleanupReferenceOrderDigest?: string; cleanupCursor?: number; cleanupComplete?: boolean; proofDeleted?: boolean;
 }
 export interface DelegationView {
   version: 1; delegationId: string; dispatchCallId: string; slotIndex: number; parentSessionId: string;
@@ -195,6 +205,11 @@ export interface InternalDelegation extends DelegationView {
   spawnId?: string; spawnStarted?: boolean; childSessionId?: string; childSessionPathHash?: string; childPid?: number; childIdentity?: ChildIdentity;
   runKind?: "initial" | "recovery"; recoveryCyclesUsed: number; logicalSpawnCount: number; continuationEpoch: number; fencingGeneration: number; ownerGeneration: number; owner?: OwnerIdentity;
   cleanupPending?: boolean; cleanupSessionRef?: string;
+  deletePlanned?: boolean;
+  deleteRequested?: boolean;
+  deleteCompleted?: boolean;
+  orphanCleanupRequested?: boolean;
+  orphanCleanupComplete?: boolean;
 }
 export interface RevisionIntent { revisionId: string; revisionEpoch: number; oldDigest: string; newDigest: string; actor: ConfigRevisionActor; }
 export interface RevisionObservation { revisionId: string; revisionEpoch: number; oldDigest: string; newDigest: string; }

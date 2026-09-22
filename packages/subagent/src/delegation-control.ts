@@ -7,7 +7,7 @@ import { lineageMatches, type ActiveLineage } from "./lineage.ts";
 import { resolveAgentWithAudit, type CanonicalProvenance } from "./resolver.ts";
 import { claimExecutionOwnerUnlocked, currentOwnerIdentity, makeOwnerSupervisorContext, sameOwner, validOwnerIdentity, validateCurrentExecutionContext, type OwnerClaim } from "./execution-supervisor.ts";
 import type { CancelActor, CancelReceipt, CancelScope, DelegationFoundationDependencies, DispatchCallAdmissionRequest, DispatchCallView, DispatchItemInput, InternalDelegation, InternalView, ProjectTrustBinding, RevisionIntent, RevisionObservation, StartupNormalizationResult, ConfigRevisionActor, OwnerIdentity, DispatchMode, WalEvent, ChildInspection } from "./delegation-types.ts";
-import { appendWal, callPayload, configureRevisionPrivateValidator, dirs, ensureStore, hash, hashPath, isHex, loadView, materialize, privatePayload, readCurrentDelegationPayload, readDelegationPayload, readPrivate, readStableOwnerFileSync, validProjectTrust, writePrivate, withCallLock, withOrphanCoordination, pausedResult, exactObject, validResultRef, toolCallHash } from "./delegation-context.ts";
+import { appendWal, callPayload, configureRevisionPrivateValidator, dirs, ensureStore, hash, hashPath, isHex, loadView, materialize, privatePayload, readCurrentDelegationPayload, readDelegationPayload, readPrivate, readStableOwnerFileSync, validProjectTrust, writePrivate, withCallLock, ensureActorScopeSecret, withOrphanCoordination, pausedResult, exactObject, validResultRef, toolCallHash } from "./delegation-context.ts";
 import { reconcilePrivateOrphansUnlocked } from "./delegation-orphans.ts";
 import { deriveCallOutcome, deriveViewOutcome, durableChildState, isCallTerminal, isCallWideCancellation } from "./wal-replay.ts";
 import { ensureInterruptedDeliveryPendingLocked, querySubagentStatusInternal, requestDeliveryAbandonInternal, executeDeliveryInternal, reconcileDeliveryStartupInternal } from "./delivery.ts";
@@ -106,6 +106,9 @@ export async function admitDispatchCallInternal(request: DispatchCallAdmissionRe
   const items = validateRequest(request); if (!items) return { state: "invalid" as const, error: "invalid or mutually exclusive dispatch shape" };
   if (!lineageMatches({ parentSessionId: request.parentSessionId, activeLineageId: request.lineage.activeLineageId, activeBranchAnchor: request.lineage.activeBranchAnchor }, request.lineage)) return { state: "invalid" as const, error: "active lineage cannot be proven" };
   const trustContext = await validateProjectTrust(request); if ((request.agentScope ?? "user") !== "user" && !trustContext) return { state: "invalid" as const, error: "parent project trust binding cannot be proven" }; const trust = trustContext?.binding;
+  // Provision the owner-only delete key only for a valid admission. Delete and
+  // replay paths never call this helper, so a removed/tampered key fails closed.
+  await ensureActorScopeSecret(rootDir);
   const callId = callIdFor(request);
   const result = await withOrphanCoordination(rootDir, async () => { await reconcilePrivateOrphansUnlocked(rootDir); return withCallLock(rootDir, callId, async () => {
     const d = await ensureStore(rootDir); let existing = await loadView(rootDir, callId);
@@ -454,7 +457,7 @@ export async function readDelegationInternal(rootDir: string, dispatchCallId: st
     if (view.integrity) return undefined;
     await materialize(rootDir, view);
     const delegation = view.delegations.get(delegationId);
-    if (!delegation) return undefined;
+    if (!delegation || delegation.deleteCompleted || delegation.orphanCleanupComplete) return undefined;
     const { requiredIdentity: _identity, provenanceRef: _provenance, spawnId: _spawnId, spawnStarted: _spawnStarted, childSessionId: _childSessionId, childSessionPathHash: _childSessionPathHash, childPid: _childPid, childIdentity: _childIdentity, owner: _owner, runKind: _runKind, recoveryCyclesUsed: _recoveryCyclesUsed, logicalSpawnCount: _logicalSpawnCount, continuationEpoch: _continuationEpoch, fencingGeneration: _fencingGeneration, ...publicDelegation } = delegation;
     return publicDelegation;
   })) ?? undefined;
