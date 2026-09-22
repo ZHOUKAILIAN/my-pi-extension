@@ -7,7 +7,9 @@ import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "./agents.ts";
 import { createChildEnvironment } from "./fast-inheritance.ts";
 import { markRetryClassification, retryClassificationOf } from "./retry-classification.ts";
-
+import { readStableOwnerFileSync } from "./secure-fs.ts";
+import { SIDE_EFFECT_FENCE_TIMEOUT_MS, sideEffectFenceClientProofValid, sideEffectFenceEnvironment, type SideEffectFenceClientConfig } from "./side-effect-fence.ts";
+// Runner is shared by v1 and gated v2; keep its retry bound policy-neutral.
 export const MAX_RETRIES_PER_MODEL = 2;
 export const DEFAULT_RETRY_DELAY_MS = 50;
 
@@ -81,8 +83,10 @@ export interface RunAttemptOptions {
   firstLogicalChildSpawn: boolean;
   parentFastRequested: boolean;
   onUpdate?: (result: AttemptResult) => void;
-  onChildProcess?: (child: { pid: number; identity: string; sessionPath?: string }) => void | Promise<void>;
+  onChildProcess?: (child: { pid: number; identity: string; sessionPath?: string }) => void | boolean | Promise<void | boolean>;
   spawn?: typeof nodeSpawn;
+  /** Internal v2-only CLI fence; absent means the v1 argv path is untouched. */
+  sideEffectFence?: SideEffectFenceClientConfig;
 }
 
 interface JsonProcess {
@@ -93,6 +97,7 @@ interface JsonProcess {
   on(event: "error", listener: (error: Error) => void): JsonProcess;
   kill(signal?: NodeJS.Signals): boolean;
   killed?: boolean;
+  stdin?: NodeJS.WritableStream;
 }
 
 function emptyUsage(): UsageStats {
@@ -169,23 +174,310 @@ export async function findSessionFile(sessionDir: string, sessionId: string): Pr
   return undefined;
 }
 
+function exactKeys(record: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowed = new Set([...required, ...optional]);
+  return required.every((key) => Object.prototype.hasOwnProperty.call(record, key)) && Object.keys(record).every((key) => allowed.has(key));
+}
+
+function validString(value: unknown): value is string { return typeof value === "string" && value.length > 0; }
+function validSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/.test(value);
+}
+function validTimestamp(value: unknown): boolean {
+  // Pi writes Date#toISOString() for session and entry timestamps. Date.parse()
+  // alone also accepts non-wire strings such as "1", so keep the boundary to
+  // the actual JSONL timestamp representation.
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && Number.isFinite(Date.parse(value));
+}
+
+function validNumber(value: unknown): value is number { return typeof value === "number" && Number.isFinite(value); }
+function validNonNegativeInteger(value: unknown): value is number { return Number.isSafeInteger(value) && (value as number) >= 0; }
+function validThinkingLevel(value: unknown): boolean { return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value as string); }
+function validRetryMessage(value: unknown): boolean { return typeof value === "string" && value.length > 0; }
+
+function validJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (validNumber(value)) return true;
+  if (Array.isArray(value)) return value.every(validJsonValue);
+  return isRecord(value) && Object.values(value).every(validJsonValue);
+}
+
+function validContentPart(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  if (value.type === "text") return exactKeys(value, ["type", "text"], ["textSignature"]) && typeof value.text === "string" && (value.textSignature === undefined || typeof value.textSignature === "string");
+  if (value.type === "thinking") return exactKeys(value, ["type", "thinking"], ["thinkingSignature", "redacted"]) && typeof value.thinking === "string" && (value.thinkingSignature === undefined || typeof value.thinkingSignature === "string") && (value.redacted === undefined || typeof value.redacted === "boolean");
+  if (value.type === "toolCall") return exactKeys(value, ["type", "id", "name", "arguments"], ["thoughtSignature", "namespace"]) && validString(value.id) && validString(value.name) && isRecord(value.arguments) && validJsonValue(value.arguments) && (value.thoughtSignature === undefined || typeof value.thoughtSignature === "string") && (value.namespace === undefined || typeof value.namespace === "string");
+  if (value.type === "image") return exactKeys(value, ["type", "data", "mimeType"]) && typeof value.data === "string" && typeof value.mimeType === "string";
+  return false;
+}
+
+function validUserContent(value: unknown): boolean {
+  return typeof value === "string" || (Array.isArray(value) && value.every((part) => isRecord(part) && (part.type === "text" || part.type === "image") && validContentPart(part)));
+}
+
+function validUsage(value: unknown): boolean {
+  if (!isRecord(value) || !exactKeys(value, ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"], ["cacheWrite1h", "reasoning"])) return false;
+  if (!["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cacheWrite1h", "reasoning"].every((key) => value[key] === undefined || validNumber(value[key]))) return false;
+  return isRecord(value.cost) && exactKeys(value.cost, ["input", "output", "cacheRead", "cacheWrite", "total"]) && ["input", "output", "cacheRead", "cacheWrite", "total"].every((key) => validNumber(value.cost[key]));
+}
+
+function validDeferred(value: unknown): boolean {
+  return isRecord(value) && exactKeys(value, ["provider", "modelId", "api", "id"], ["expiresAt", "pollAfterMs", "data"]) && validString(value.provider) && validString(value.modelId) && validString(value.api) && validString(value.id) && (value.expiresAt === undefined || validNumber(value.expiresAt)) && (value.pollAfterMs === undefined || validNumber(value.pollAfterMs)) && (value.data === undefined || validJsonValue(value.data));
+}
+
+function validDiagnostic(value: unknown): boolean {
+  if (!isRecord(value) || !exactKeys(value, ["type", "timestamp"], ["error", "details"]) || !validString(value.type) || !validNumber(value.timestamp)) return false;
+  if (value.error !== undefined) {
+    if (!isRecord(value.error) || !exactKeys(value.error, ["message"], ["name", "stack", "code"]) || typeof value.error.message !== "string") return false;
+    if (value.error.name !== undefined && typeof value.error.name !== "string") return false;
+    if (value.error.stack !== undefined && typeof value.error.stack !== "string") return false;
+    if (value.error.code !== undefined && typeof value.error.code !== "string" && !validNumber(value.error.code)) return false;
+  }
+  return value.details === undefined || isRecord(value.details);
+}
+
+function validAssistantMessage(value: Record<string, unknown>): boolean {
+  return exactKeys(value, ["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp"], ["responseModel", "responseId", "diagnostics", "deferred", "errorMessage", "rawStopReason", "endTurn"]) && value.role === "assistant" && Array.isArray(value.content) && value.content.every(validContentPart) && validString(value.api) && validString(value.provider) && validString(value.model) && validUsage(value.usage) && ["pending", "stop", "length", "toolUse", "error", "aborted", "deferred"].includes(value.stopReason as string) && validNumber(value.timestamp) && (value.responseModel === undefined || typeof value.responseModel === "string") && (value.responseId === undefined || typeof value.responseId === "string") && (value.diagnostics === undefined || (Array.isArray(value.diagnostics) && value.diagnostics.every(validDiagnostic))) && (value.deferred === undefined || validDeferred(value.deferred)) && (value.errorMessage === undefined || typeof value.errorMessage === "string") && (value.rawStopReason === undefined || typeof value.rawStopReason === "string") && (value.endTurn === undefined || typeof value.endTurn === "boolean");
+}
+
+function validUserMessage(value: Record<string, unknown>): boolean {
+  return exactKeys(value, ["role", "content", "timestamp"]) && value.role === "user" && validUserContent(value.content) && validNumber(value.timestamp);
+}
+
+function validToolResultMessage(value: Record<string, unknown>): boolean {
+  return exactKeys(value, ["role", "toolCallId", "toolName", "content", "isError", "timestamp"], ["details", "usage", "addedToolNames"]) && value.role === "toolResult" && validString(value.toolCallId) && validString(value.toolName) && Array.isArray(value.content) && value.content.every((part) => isRecord(part) && (part.type === "text" || part.type === "image") && validContentPart(part)) && typeof value.isError === "boolean" && validNumber(value.timestamp) && (value.details === undefined || validJsonValue(value.details)) && (value.usage === undefined || validUsage(value.usage)) && (value.addedToolNames === undefined || (Array.isArray(value.addedToolNames) && value.addedToolNames.every(validString)));
+}
+
+/** Pi AgentMessage schema shared by JSON mode and session records. */
+function validAgentMessage(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  if (value.role === "assistant") return validAssistantMessage(value);
+  if (value.role === "user") return validUserMessage(value);
+  if (value.role === "toolResult") return validToolResultMessage(value);
+  if (value.role === "custom") return exactKeys(value, ["role", "customType", "content", "display", "timestamp"], ["details"]) && validString(value.customType) && validUserContent(value.content) && typeof value.display === "boolean" && validNumber(value.timestamp) && (value.details === undefined || validJsonValue(value.details));
+  if (value.role === "branchSummary") return exactKeys(value, ["role", "summary", "fromId", "timestamp"]) && typeof value.summary === "string" && validString(value.fromId) && validNumber(value.timestamp);
+  if (value.role === "compactionSummary") return exactKeys(value, ["role", "summary", "tokensBefore", "timestamp"]) && typeof value.summary === "string" && validNumber(value.tokensBefore) && validNumber(value.timestamp);
+  if (value.role === "bashExecution") return exactKeys(value, ["role", "command", "output", "cancelled", "truncated", "timestamp"], ["exitCode", "fullOutputPath", "excludeFromContext"]) && typeof value.command === "string" && typeof value.output === "string" && typeof value.cancelled === "boolean" && typeof value.truncated === "boolean" && validNumber(value.timestamp) && (value.exitCode === undefined || validNumber(value.exitCode)) && (value.fullOutputPath === undefined || typeof value.fullOutputPath === "string") && (value.excludeFromContext === undefined || typeof value.excludeFromContext === "boolean");
+  return false;
+}
+
+function validAssistantMessageEvent(value: unknown): boolean {
+  if (!isRecord(value) || typeof value.type !== "string") return false;
+  switch (value.type) {
+    case "start": return exactKeys(value, ["type"]);
+    case "text_start": case "thinking_start": case "toolcall_start": return exactKeys(value, ["type", "contentIndex"], value.type === "toolcall_start" ? ["id", "toolName"] : []) && Number.isInteger(value.contentIndex) && (value.type !== "toolcall_start" || (validString(value.id) && validString(value.toolName)));
+    case "text_delta": case "thinking_delta": case "toolcall_delta": return exactKeys(value, ["type", "contentIndex", "delta"]) && Number.isInteger(value.contentIndex) && typeof value.delta === "string";
+    case "text_end": case "thinking_end": return exactKeys(value, ["type", "contentIndex", "content"]) && Number.isInteger(value.contentIndex) && typeof value.content === "string";
+    case "toolcall_end": return exactKeys(value, ["type", "contentIndex", "toolCall"]) && Number.isInteger(value.contentIndex) && validContentPart(value.toolCall);
+    case "done": return exactKeys(value, ["type", "reason", "message"]) && ["stop", "length", "toolUse", "deferred"].includes(value.reason as string) && isRecord(value.message) && validAssistantMessage(value.message);
+    case "error": return exactKeys(value, ["type", "reason", "error"]) && ["aborted", "error"].includes(value.reason as string) && isRecord(value.error) && validAssistantMessage(value.error);
+    default: return false;
+  }
+}
+
+const JSON_EVENT_TYPES = new Set([
+  "agent_start", "agent_end", "agent_settled",
+  "turn_start", "turn_end",
+  "message_start", "message_update", "message_end",
+  "tool_execution_start", "tool_execution_update", "tool_execution_end",
+  "queue_update", "compaction_start", "compaction_end", "entry_appended",
+  "session_info_changed", "thinking_level_changed", "bash_execution_update",
+  "auto_retry_start", "auto_retry_end",
+  "summarization_retry_scheduled", "summarization_retry_attempt_start", "summarization_retry_finished",
+]);
+
+function validCompactionResult(value: unknown): boolean {
+  return isRecord(value) && exactKeys(value, ["summary", "firstKeptEntryId", "tokensBefore"], ["estimatedTokensAfter", "usage", "details"]) && typeof value.summary === "string" && validString(value.firstKeptEntryId) && validNumber(value.tokensBefore) && (value.estimatedTokensAfter === undefined || validNumber(value.estimatedTokensAfter)) && (value.usage === undefined || validUsage(value.usage)) && (value.details === undefined || validJsonValue(value.details));
+}
+
+function validRetryStartEvent(event: Record<string, unknown>): boolean {
+  return exactKeys(event, ["type", "attempt", "maxAttempts", "delayMs", "errorMessage"]) && validNonNegativeInteger(event.attempt) && validNonNegativeInteger(event.maxAttempts) && validNonNegativeInteger(event.delayMs) && validRetryMessage(event.errorMessage);
+}
+
+/** Strict Pi 0.84.4 JSON event validator. Unknown event types and fields fail closed. */
+function validJsonEvent(event: Record<string, unknown>): boolean {
+  if (typeof event.type !== "string" || !JSON_EVENT_TYPES.has(event.type)) return false;
+  switch (event.type) {
+    case "agent_start": case "agent_settled": return exactKeys(event, ["type"]);
+    case "agent_end": return exactKeys(event, ["type", "messages", "willRetry"]) && Array.isArray(event.messages) && event.messages.every(validAgentMessage) && typeof event.willRetry === "boolean";
+    // Pi's JSON stdout maps AgentEvent directly; turn_start has no metadata.
+    case "turn_start": return exactKeys(event, ["type"]);
+    case "turn_end": return exactKeys(event, ["type", "message", "toolResults"]) && validAgentMessage(event.message) && Array.isArray(event.toolResults) && event.toolResults.every((message) => isRecord(message) && validToolResultMessage(message));
+    case "message_start": case "message_end": return exactKeys(event, ["type", "message"]) && validAgentMessage(event.message);
+    case "message_update": return exactKeys(event, ["type", "usage", "assistantMessageEvent"]) && validUsage(event.usage) && validAssistantMessageEvent(event.assistantMessageEvent);
+    case "tool_execution_start": return exactKeys(event, ["type", "toolCallId", "toolName", "args"]) && validString(event.toolCallId) && validString(event.toolName) && validJsonValue(event.args);
+    case "tool_execution_update": return exactKeys(event, ["type", "toolCallId", "toolName", "args", "partialResult"]) && validString(event.toolCallId) && validString(event.toolName) && validJsonValue(event.args) && validJsonValue(event.partialResult);
+    case "tool_execution_end": return exactKeys(event, ["type", "toolCallId", "toolName", "result", "isError"]) && validString(event.toolCallId) && validString(event.toolName) && validJsonValue(event.result) && typeof event.isError === "boolean";
+    case "queue_update": return exactKeys(event, ["type", "steering", "followUp"]) && Array.isArray(event.steering) && event.steering.every((value) => typeof value === "string") && Array.isArray(event.followUp) && event.followUp.every((value) => typeof value === "string");
+    case "compaction_start": return exactKeys(event, ["type", "reason"]) && ["manual", "threshold", "overflow"].includes(event.reason as string);
+    // result is omitted by JSON.stringify when its typed value is undefined.
+    // The current Pi 0.84.4 event type is `CompactionResult | undefined`; a
+    // JSON null is not the wire representation and is rejected here.
+    case "compaction_end": return exactKeys(event, ["type", "reason", "aborted", "willRetry"], ["result", "errorMessage"]) && ["manual", "threshold", "overflow"].includes(event.reason as string) && (event.result === undefined || validCompactionResult(event.result)) && typeof event.aborted === "boolean" && typeof event.willRetry === "boolean" && (event.errorMessage === undefined || validRetryMessage(event.errorMessage));
+    case "entry_appended": return exactKeys(event, ["type", "entry"]) && isRecord(event.entry) && validWireSessionEntry(event.entry);
+    case "session_info_changed": return exactKeys(event, ["type"], ["name"]) && (event.name === undefined || typeof event.name === "string");
+    case "thinking_level_changed": return exactKeys(event, ["type", "level"]) && validThinkingLevel(event.level);
+    case "bash_execution_update": return exactKeys(event, ["type", "delta"], ["id"]) && (event.id === undefined || typeof event.id === "string") && typeof event.delta === "string";
+    case "auto_retry_start": case "summarization_retry_scheduled": return validRetryStartEvent(event);
+    case "auto_retry_end": return exactKeys(event, ["type", "success", "attempt"], ["finalError"]) && typeof event.success === "boolean" && validNonNegativeInteger(event.attempt) && (event.finalError === undefined || typeof event.finalError === "string");
+    case "summarization_retry_attempt_start":
+      return (exactKeys(event, ["type", "source"]) && event.source === "branchSummary") || (exactKeys(event, ["type", "source", "reason"]) && event.source === "compaction" && ["manual", "threshold", "overflow"].includes(event.reason as string));
+    case "summarization_retry_finished": return exactKeys(event, ["type"]);
+    default: return false;
+  }
+}
+
+type DiskSessionVersion = 1 | 2 | 3;
+
+function persistedStopReason(value: unknown): boolean {
+  // `pending` is a streaming-only StopReason. Pi never writes it to a
+  // SessionEntry, although it is valid in the stdout message_start protocol.
+  return ["stop", "length", "toolUse", "error", "aborted", "deferred"].includes(value as string);
+}
+
+function validHookMessage(value: unknown): boolean {
+  return isRecord(value) && exactKeys(value, ["role", "customType", "content", "display", "timestamp"], ["details"]) &&
+    value.role === "hookMessage" && validString(value.customType) && validUserContent(value.content) &&
+    typeof value.display === "boolean" && validNumber(value.timestamp) &&
+    (value.details === undefined || validJsonValue(value.details));
+}
+
+function validPersistedBashMessage(value: unknown, version: DiskSessionVersion): boolean {
+  if (!isRecord(value) || !exactKeys(value, ["role", "command", "output", "cancelled", "truncated", "timestamp"], ["exitCode", "fullOutputPath", "excludeFromContext"]) ||
+      value.role !== "bashExecution" || typeof value.command !== "string" || typeof value.output !== "string" ||
+      typeof value.cancelled !== "boolean" || typeof value.truncated !== "boolean" || !validNumber(value.timestamp) ||
+      (value.fullOutputPath !== undefined && typeof value.fullOutputPath !== "string") ||
+      (value.excludeFromContext !== undefined && typeof value.excludeFromContext !== "boolean")) return false;
+  return value.exitCode === undefined || validNumber(value.exitCode) || (version === 1 && value.exitCode === null);
+}
+
+function validPersistedAgentMessage(value: unknown, version: DiskSessionVersion): boolean {
+  if (!isRecord(value)) return false;
+  if (value.role === "hookMessage") return version < 3 && validHookMessage(value);
+  if (value.role === "custom") return version === 3 && validAgentMessage(value);
+  if (value.role === "bashExecution") return validPersistedBashMessage(value, version);
+  if (value.role !== "user" && value.role !== "assistant" && value.role !== "toolResult") return false;
+  if (!validAgentMessage(value)) return false;
+  if (value.role === "assistant" && !persistedStopReason(value.stopReason)) return false;
+  // responseModel/diagnostics/deferred and added tool-result metadata were
+  // introduced after the v2 on-disk format. Keep the historical branches
+  // explicit rather than accepting the current v3 object for every version.
+  if (version < 3) {
+    const legacyAssistantKeys = new Set(["role", "content", "api", "provider", "model", "usage", "stopReason", "timestamp", "errorMessage"]);
+    const legacyToolKeys = new Set(["role", "toolCallId", "toolName", "content", "details", "isError", "timestamp"]);
+    const keys = value.role === "assistant" ? legacyAssistantKeys : value.role === "toolResult" ? legacyToolKeys : new Set(["role", "content", "timestamp"]);
+    if (Object.keys(value).some((key) => !keys.has(key))) return false;
+  }
+  return true;
+}
+
+function validV1Entry(entry: Record<string, unknown>): boolean {
+  if (!validTimestamp(entry.timestamp) || typeof entry.type !== "string") return false;
+  // v1 was linear. It deliberately has no id/parentId, and compaction used an
+  // array index until the v1 -> v2 migration.
+  switch (entry.type) {
+    case "message": return exactKeys(entry, ["type", "timestamp", "message"]) && validPersistedAgentMessage(entry.message, 1);
+    case "thinking_level_change": return exactKeys(entry, ["type", "timestamp", "thinkingLevel"]) && validString(entry.thinkingLevel);
+    case "model_change": return exactKeys(entry, ["type", "timestamp", "provider", "modelId"]) && validString(entry.provider) && validString(entry.modelId);
+    case "compaction": return exactKeys(entry, ["type", "timestamp", "summary", "firstKeptEntryIndex", "tokensBefore"]) && typeof entry.summary === "string" && validNonNegativeInteger(entry.firstKeptEntryIndex) && validNumber(entry.tokensBefore);
+    default: return false;
+  }
+}
+
+function validTreeEntry(entry: Record<string, unknown>, version: 2 | 3): boolean {
+  if (!validString(entry.id) || (typeof entry.parentId !== "string" && entry.parentId !== null) || !validTimestamp(entry.timestamp) || typeof entry.type !== "string") return false;
+  switch (entry.type) {
+    case "message": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "message"]) && validPersistedAgentMessage(entry.message, version);
+    case "thinking_level_change": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "thinkingLevel"]) && validString(entry.thinkingLevel);
+    case "model_change": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "provider", "modelId"]) && validString(entry.provider) && validString(entry.modelId);
+    case "compaction": {
+      const optional = version === 3 ? ["details", "usage", "fromHook"] : ["details", "fromHook"];
+      return exactKeys(entry, ["type", "id", "parentId", "timestamp", "summary", "firstKeptEntryId", "tokensBefore"], optional) &&
+        typeof entry.summary === "string" && validString(entry.firstKeptEntryId) && validNumber(entry.tokensBefore) &&
+        (entry.details === undefined || validJsonValue(entry.details)) &&
+        (entry.fromHook === undefined || typeof entry.fromHook === "boolean") &&
+        (version === 3 ? entry.usage === undefined || validUsage(entry.usage) : entry.usage === undefined);
+    }
+    case "branch_summary": {
+      const optional = version === 3 ? ["details", "usage", "fromHook"] : ["details", "fromHook"];
+      return exactKeys(entry, ["type", "id", "parentId", "timestamp", "fromId", "summary"], optional) && validString(entry.fromId) && typeof entry.summary === "string" &&
+        (entry.details === undefined || validJsonValue(entry.details)) && (entry.fromHook === undefined || typeof entry.fromHook === "boolean") &&
+        (version === 3 ? entry.usage === undefined || validUsage(entry.usage) : entry.usage === undefined);
+    }
+    case "custom": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "customType"], ["data"]) && validString(entry.customType) && (entry.data === undefined || validJsonValue(entry.data));
+    case "custom_message": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "customType", "content", "display"], ["details"]) && validString(entry.customType) && validUserContent(entry.content) && typeof entry.display === "boolean" && (entry.details === undefined || validJsonValue(entry.details));
+    case "label": return exactKeys(entry, ["type", "id", "parentId", "timestamp", "targetId"], ["label"]) && validString(entry.targetId) && (entry.label === undefined || typeof entry.label === "string");
+    case "session_info": return version === 3 && exactKeys(entry, ["type", "id", "parentId", "timestamp"], ["name"]) && (entry.name === undefined || typeof entry.name === "string");
+    default: return false;
+  }
+}
+
+/** Strictly validate a Pi session-record JSONL entry for its header version. */
+function validSessionEntry(entry: Record<string, unknown>, version: DiskSessionVersion): boolean {
+  return version === 1 ? validV1Entry(entry) : validTreeEntry(entry, version);
+}
+
+/** The stdout `entry_appended` event is always the current v3 entry shape. */
+function validWireSessionEntry(entry: Record<string, unknown>): boolean {
+  return validTreeEntry(entry, 3);
+}
+
+function validSessionHeader(header: Record<string, unknown>, sessionId: string, cwd: string, version: DiskSessionVersion, wire = false): boolean {
+  const hasVersion = Object.prototype.hasOwnProperty.call(header, "version");
+  if (wire && (!hasVersion || header.version !== 3)) return false;
+  if (!wire && hasVersion && (!validNonNegativeInteger(header.version) || header.version !== version)) return false;
+  const required = ["type", "id", "timestamp", "cwd", ...(wire || version > 1 || hasVersion ? ["version"] : [])];
+  const optional = version === 1 ? ["version", "parentSession", "branchedFrom", "provider", "modelId", "thinkingLevel"] : version === 2 ? ["parentSession", "branchedFrom"] : ["parentSession"];
+  if (!exactKeys(header, required, optional) || header.type !== "session" || !validSessionId(header.id) || header.id !== sessionId || !validTimestamp(header.timestamp) || typeof header.cwd !== "string" || !path.isAbsolute(header.cwd) || path.resolve(header.cwd) !== path.resolve(cwd)) return false;
+  for (const key of ["parentSession", "branchedFrom", "provider", "modelId", "thinkingLevel"]) {
+    if (header[key] !== undefined && !validString(header[key])) return false;
+  }
+  // The old v1 header carried a complete model snapshot. If any part is
+  // present, require the whole snapshot; otherwise a random extra field could
+  // masquerade as a historical header.
+  const legacyModelFields = [header.provider, header.modelId, header.thinkingLevel].some((value) => value !== undefined);
+  if (version === 1 && legacyModelFields && ![header.provider, header.modelId, header.thinkingLevel].every(validString)) return false;
+  if (header.parentSession !== undefined && header.branchedFrom !== undefined) return false;
+  return true;
+}
+
+/** Current Pi 0.84.4 JSON stdout wire header. Never accept a legacy version. */
+function validWireSessionHeader(header: Record<string, unknown>, sessionId: string, cwd: string): boolean {
+  return validSessionHeader(header, sessionId, cwd, 3, true);
+}
+
+/** Persisted session header compatibility, deliberately not usable for stdout. */
+function validOnDiskSessionHeader(header: Record<string, unknown>, sessionId: string, cwd: string): DiskSessionVersion | undefined {
+  const version = !Object.prototype.hasOwnProperty.call(header, "version") ? 1 : header.version;
+  if (version !== 1 && version !== 2 && version !== 3) return undefined;
+  return validSessionHeader(header, sessionId, cwd, version) ? version : undefined;
+}
+
 export async function validateSessionFile(file: string, sessionId: string, cwd: string): Promise<boolean> {
   try {
-    const lines = (await fs.promises.readFile(file, "utf8")).split(/\r?\n/);
-    let header: Record<string, unknown> | undefined;
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const record: unknown = JSON.parse(line);
-      if (!isRecord(record)) return false;
-      if (!header) {
-        header = record;
-        if (header.type !== "session" || header.id !== sessionId || typeof header.cwd !== "string" || path.resolve(header.cwd) !== path.resolve(cwd)) return false;
-      }
-    }
-    return header !== undefined;
+    // A session path is a capability. Prove ownership, regular-file identity,
+    // link count, non-writable mode, and stable contents before parsing it.
+    if (!path.isAbsolute(file) || path.resolve(file) !== file) return false;
+    const stable = readStableOwnerFileSync(file);
+    // macOS may expose /tmp through /private/tmp, so compare the resolved
+    // parent while still rejecting a final-component symlink.
+    const expectedRealpath = path.join(fs.realpathSync(path.dirname(file)), path.basename(file));
+    if (!stable || stable.realpath !== expectedRealpath) return false;
+    const lines = stable.content.split(/\r?\n/);
+    if (lines.at(-1) === "") lines.pop();
+    if (lines.length === 0 || lines.some((line) => !line.trim())) return false;
+    const records = lines.map((line) => JSON.parse(line) as unknown);
+    if (!isRecord(records[0])) return false;
+    const version = validOnDiskSessionHeader(records[0], sessionId, cwd);
+    if (version === undefined) return false;
+    if (records.length === 1) return true;
+    const rest = records.slice(1);
+    // Resumable on-disk sessions contain only SessionEntry records. The JSON
+    // event protocol is validated separately by the stdout runner below.
+    return rest.every((record) => isRecord(record) && validSessionEntry(record, version));
   } catch {
-    // Any truncated or otherwise invalid JSONL record makes the session
-    // untrusted. Callers must quarantine it rather than resume or spawn.
+    // Any truncated, blank, mixed, or otherwise invalid JSONL record makes the
+    // session untrusted. Callers must quarantine it rather than resume.
     return false;
   }
 }
@@ -429,11 +721,24 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     sessionId: options.childSessionId,
     cwdScope: safeScope(options.cwd),
   };
+  const failClosed = (reason: string): AttemptResult => { result.phase = "finished"; result.failureKind = "unknown_transport"; result.errorMessage = reason; return sanitizeAttemptResult(result, options.model, [options.task, options.agent.systemPrompt]); };
+  if (options.sideEffectFence && !sideEffectFenceClientProofValid(options.sideEffectFence)) return failClosed("side-effect fence deployment proof is unavailable");
+  if (options.sideEffectFence && typeof options.onChildProcess !== "function") return failClosed("side-effect fence child callback is unavailable");
   const args = ["--mode", "json", "-p"];
   if (options.sessionFile) args.push("--session", path.resolve(options.sessionFile));
   else args.push("--session-dir", options.sessionDir, "--session-id", options.childSessionId);
   if (options.model) args.push("--model", options.model);
-  if (options.agent.tools?.length) args.push("--tools", options.agent.tools.join(","));
+  if (options.agent.tools?.length && !options.sideEffectFence) args.push("--tools", options.agent.tools.join(","));
+  if (options.sideEffectFence) {
+    args.push("--no-tools");
+    // Pi's CLI contract is explicit: --no-tools disables every active tool;
+    // repeated -e flags are loaded in argument order. The fence is appended
+    // last and the task is sent over stdin so private prompt text is absent
+    // from argv. The v1 path above remains byte-for-byte unchanged.
+    args.push("--no-extensions");
+    for (const extension of options.sideEffectFence.extensions) args.push("-e", extension);
+    args.push("-e", options.sideEffectFence.interceptor);
+  }
   let promptFile: { dir: string; file: string } | undefined;
   let stdout = "";
   let rawStderr = "";
@@ -452,12 +757,13 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     try { event = JSON.parse(line); } catch { malformed = true; return; }
     if (!isRecord(event)) { malformed = true; return; }
     if (!sawHeader) {
-      if (event.type !== "session" || typeof event.id !== "string" || typeof event.cwd !== "string") { malformed = true; return; }
+      if (!validWireSessionHeader(event, options.childSessionId, options.cwd)) { malformed = true; return; }
       sawHeader = true;
       headerId = event.id;
       headerCwd = event.cwd;
       return;
     }
+    if (!validJsonEvent(event)) { malformed = true; return; }
     if (event.type === "message_start" && event.message?.role === "assistant") {
       terminal = undefined;
     }
@@ -501,7 +807,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
     }
     promptFile = await writeSystemPrompt(options.agent);
     if (promptFile) args.push("--append-system-prompt", promptFile.file);
-    args.push(options.task);
+    if (!options.sideEffectFence) args.push(options.task);
     const invocation = getPiInvocation(args);
     const spawnProcess = options.spawn ?? nodeSpawn;
     let proc: JsonProcess;
@@ -509,8 +815,8 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       proc = spawnProcess(invocation.command, invocation.args, {
         cwd: options.cwd,
         shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? createChildEnvironment({
+        stdio: options.sideEffectFence ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
+        env: options.sideEffectFence ? { ...(options.env ?? createChildEnvironment({ agent: options.agent, firstLogicalChildSpawn: options.firstLogicalChildSpawn, parentSessionRequestedFast: options.parentFastRequested })), ...sideEffectFenceEnvironment(options.sideEffectFence) } : options.env ?? createChildEnvironment({
           agent: options.agent,
           firstLogicalChildSpawn: options.firstLogicalChildSpawn,
           parentSessionRequestedFast: options.parentFastRequested,
@@ -522,18 +828,70 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       result.errorMessage = "child process could not be started";
       return sanitizeAttemptResult(result, options.model, blockedTexts);
     }
+    let fencedLifecycleFailed = false;
+    const fenceTimeoutMs = options.sideEffectFence?.timeoutMs ?? SIDE_EFFECT_FENCE_TIMEOUT_MS;
     await new Promise<void>((resolve) => {
       let buffer = "";
-      let childRegistration = Promise.resolve();
-      if (typeof proc.pid === "number" && proc.pid > 0) {
-        childRegistration = Promise.resolve(options.onChildProcess?.({
-          pid: proc.pid,
-          identity: options.childSessionId,
-          ...(options.sessionFile ? { sessionPath: path.resolve(options.sessionFile) } : {}),
-        })).catch(() => {
+      let processClosed = false;
+      let registrationFailed = false;
+      let settled = false;
+      let forceSettleTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (code: number | null = null) => {
+        if (settled) return;
+        settled = true;
+        if (forceSettleTimer) clearTimeout(forceSettleTimer);
+        result.exitCode = code;
+        if (buffer.trim()) processLine(buffer);
+        resolve();
+      };
+      const finishAfterGracefulTeardown = async (code: number | null) => {
+        if (!options.sideEffectFence || !options.sideEffectFence.awaitGraceful) { finish(code); return; }
+        const graceful = await options.sideEffectFence.awaitGraceful(fenceTimeoutMs);
+        if (!graceful) {
+          fencedLifecycleFailed = true;
           malformed = true;
-          try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
-        });
+          result.errorMessage = "child graceful shutdown cannot be proven";
+        }
+        finish(code);
+      };
+      const terminate = (reason: string, cancelled = false) => {
+        if (cancelled) wasAborted = true;
+        if (options.sideEffectFence) fencedLifecycleFailed = true;
+        registrationFailed = true;
+        malformed = true;
+        result.errorMessage = reason;
+        try { (proc.stdin as any)?.destroy?.(); } catch { /* already closed */ }
+        try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
+        forceSettleTimer = setTimeout(() => {
+          try { if (!proc.killed) proc.kill("SIGKILL"); } catch { /* process already gone */ }
+          finish(null);
+        }, 5_000);
+        forceSettleTimer.unref();
+      };
+      const lifecycle = async (): Promise<void> => {
+        if (typeof proc.pid !== "number" || proc.pid <= 0) {
+          if (options.sideEffectFence) throw new Error("child pid cannot be proven");
+          return;
+        }
+        const child = { pid: proc.pid, identity: options.childSessionId, ...(options.sessionFile ? { sessionPath: path.resolve(options.sessionFile) } : {}) };
+        const callbackResult = await options.onChildProcess?.(child);
+        if (callbackResult === false) throw new Error("child callback rejected binding");
+        if (options.sideEffectFence) {
+          const client = options.sideEffectFence;
+          const bindResult = await client.bindChild!(child.pid, child.identity);
+          if (bindResult === false) throw new Error("side-effect fence child binding rejected");
+          if (!await client.awaitHandshake!(fenceTimeoutMs)) throw new Error("side-effect fence handshake cannot be proven");
+        }
+      };
+      const lifecycleTimeout = options.sideEffectFence ? new Promise<never>((_, reject) => {
+        const timer = setTimeout(() => reject(new Error("child lifecycle binding timeout")), fenceTimeoutMs);
+        timer.unref();
+      }) : undefined;
+      let childRegistration = (options.sideEffectFence ? Promise.race([lifecycle(), lifecycleTimeout!]) : lifecycle()).catch((error: unknown) => {
+        terminate(error instanceof Error ? error.message : "child lifecycle binding failed");
+      });
+      if (options.sideEffectFence?.failure) {
+        void options.sideEffectFence.failure.then((reason) => terminate(typeof reason === "string" ? reason : "side-effect fence watchdog failed"), () => terminate("side-effect fence watchdog failed"));
       }
       proc.stdout.on("data", (data: Buffer | string) => {
         stdout += data.toString();
@@ -543,24 +901,32 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
         for (const line of lines) processLine(line);
       });
       proc.stderr.on("data", (data: Buffer | string) => { rawStderr += data.toString(); });
-      proc.on("error", () => { malformed = true; childRegistration.then(resolve); });
+      proc.on("error", () => { processClosed = true; malformed = true; finish(null); });
       proc.on("close", (code) => {
-        childRegistration.then(() => {
-          result.exitCode = code;
-          if (buffer.trim()) processLine(buffer);
-          resolve();
-        });
+        processClosed = true;
+        childRegistration.then(() => { void finishAfterGracefulTeardown(code); });
       });
-      const abort = () => {
-        wasAborted = true;
-        try { proc.kill("SIGTERM"); } catch { /* process already gone */ }
-        setTimeout(() => { if (!proc.killed) try { proc.kill("SIGKILL"); } catch { /* ignore */ } }, 5000).unref();
-      };
+      // A fenced child receives no task bytes until the durable child binding,
+      // the client-owned channel bind, and the client-owned hello/ACK have all
+      // completed. The runner owns this sequence; the callback only persists
+      // the generic child binding and cannot satisfy the fence by itself.
+      childRegistration.then(() => {
+        if (registrationFailed || processClosed || proc.killed || !proc.stdin || fencedLifecycleFailed) return;
+        if (options.sideEffectFence) {
+          try { proc.stdin.write(options.task); proc.stdin.end(); } catch { terminate("fenced task delivery failed"); }
+        } else {
+          proc.stdin?.end();
+        }
+      });
+      const abort = () => terminate("cancelled", true);
       if (options.signal) {
         if (options.signal.aborted) abort();
         else options.signal.addEventListener("abort", abort, { once: true });
       }
     });
+    if (fencedLifecycleFailed) {
+      try { await options.sideEffectFence?.close?.("runner_fenced_lifecycle_failure"); } catch { /* cleanup remains fail closed */ }
+    }
 
     const validHeader = sawHeader && headerId === options.childSessionId && path.resolve(headerCwd!) === path.resolve(options.cwd);
     const finalErrorMessage = terminal?.stopReason === "error" && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;

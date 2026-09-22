@@ -1,0 +1,4 @@
+{"type":"session","id":"fixture-v1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/pi-session-fixture","provider":"openai","modelId":"gpt-test","thinkingLevel":"off","branchedFrom":"parent-fixture"}
+{"type":"model_change","timestamp":"2026-01-01T00:00:01.000Z","provider":"openai","modelId":"gpt-test"}
+{"type":"message","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"user","content":"continue","timestamp":1767225602000}}
+{"type":"compaction","timestamp":"2026-01-01T00:00:03.000Z","summary":"older summary","firstKeptEntryIndex":2,"tokensBefore":12}

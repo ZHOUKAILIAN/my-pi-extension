@@ -10,6 +10,8 @@
 | 固定 revision | 无；当时没有固定 commit |
 | 状态 | 可追溯记录；不是完整原始工具逐字转录 |
 
+> **历史覆盖边界（2026-09-14）**：本文件只覆盖其表中所列旧基线 / 历史 WIP；不覆盖 base HEAD `e1439e4e198fe5a62c988177774c72c93b4ad4e9`、五文档 diff `6b2f6b54d1e8c45ea82e9355aa9e2782ed4677185879c2db586bc5c0fc9cb734` 固定的新方案。新版结论以 [2026-09-14 Adoption Decision](2026-09-14-subagent-dispatcher-Adoption-Decision.md) 为准。
+
 ## 结论先行
 
 本 Artifact 记录产品语义、隐私边界、可观测性和验收条件的评审事实。它支持“允许继续实现”的 Adoption Decision，不支持把当前实现称为已验证或把所有 Finding 称为已关闭。

@@ -32,7 +32,10 @@ async function options(root: string, lines: any[], code = 0, stderr = ""): Promi
   };
 }
 function header(cwd = "/tmp/project") { return { type: "session", version: 3, id: "child-1", cwd, timestamp: new Date().toISOString() }; }
-function terminal(stopReason = "stop", extra: Record<string, unknown> = {}) { return { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "done" }], stopReason, ...extra } }; }
+function usage() { return { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }; }
+function assistantMessage(stopReason = "stop", extra: Record<string, unknown> = {}) { return { role: "assistant", content: [{ type: "text", text: "done" }], api: "openai-completions", provider: "openai", model: "m", usage: usage(), stopReason, timestamp: Date.now(), ...extra }; }
+function terminal(stopReason = "stop", extra: Record<string, unknown> = {}) { return { type: "message_end", message: assistantMessage(stopReason, extra) }; }
+function toolResultMessage(extra: Record<string, unknown> = {}) { return { role: "toolResult", toolCallId: "1", toolName: "read", content: [{ type: "text", text: "provider result" }], isError: false, timestamp: Date.now(), ...extra }; }
 
 test("attempt projection excludes task, cwd, stderr and preserves only a safe cwd scope", () => {
   const projected = sanitizeAttemptResult({
@@ -67,7 +70,71 @@ test("session validation parses every JSONL record and rejects a truncated secon
   await fs.writeFile(file, `${JSON.stringify(header())}\n{"type":"message_end","message":`);
   assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false);
   await fs.writeFile(file, `${JSON.stringify(header())}\n${JSON.stringify({ type: "message_end", message: {} })}\n`);
-  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false);
+  await fs.writeFile(file, `${JSON.stringify(header())}\n${JSON.stringify(terminal())}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false, "stdout message_end is not an on-disk SessionEntry");
+  const validEntry = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "resumable", timestamp: Date.now() } };
+  await fs.writeFile(file, `${JSON.stringify(header())}\n${JSON.stringify(validEntry)}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true, "real SessionEntry remains resumable");
+  const v1Header = { type: "session", id: "child-1", cwd: "/tmp/project", timestamp: new Date().toISOString() };
+  await fs.writeFile(file, `${JSON.stringify(v1Header)}\n${JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message: { role: "user", content: "historical", timestamp: Date.now() } })}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true, "historical on-disk version 1");
+  const v2Entry = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "historical", timestamp: Date.now() } };
+  await fs.writeFile(file, `${JSON.stringify({ ...header(), version: 2 })}\n${JSON.stringify(v2Entry)}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true, "historical on-disk version 2");
+  const legacyV1Header = { ...v1Header, provider: "openai", modelId: "m", thinkingLevel: "off", branchedFrom: "parent" };
+  await fs.writeFile(file, `${JSON.stringify(legacyV1Header)}\n${JSON.stringify({ type: "message", timestamp: new Date().toISOString(), message: { role: "user", content: "legacy", timestamp: Date.now() } })}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true, "historical v1 header without version and with legacy fields");
+  await fs.writeFile(file, `${JSON.stringify(header())}\n${JSON.stringify({ type: "tool_execution_end", toolCallId: "1", toolName: "read", isError: false })}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false);
+  await fs.writeFile(file, `${JSON.stringify(header())}\n${JSON.stringify({ type: "tool_execution_end", toolCallId: "1", toolName: "read", result: {}, isError: false, status: 503 })}\n`);
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false);
+  const blank = path.join(root, "blank.jsonl");
+  await fs.writeFile(blank, `${JSON.stringify(header())}\n\n`);
+  assert.equal(await validateSessionFile(blank, "child-1", "/tmp/project"), false);
+  const link = path.join(root, "link.jsonl");
+  await fs.symlink(file, link);
+  assert.equal(await validateSessionFile(link, "child-1", "/tmp/project"), false);
+  assert.equal(await validateSessionFile(path.relative(process.cwd(), file), "child-1", "/tmp/project"), false);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("session records accept Pi messages and reject schema-valid JSON with missing or mistyped required fields", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const entry = (message: unknown, id = "entry-1") => ({ type: "message", id, parentId: null, timestamp: new Date().toISOString(), message });
+  const user = { role: "user", content: "work", timestamp: Date.now() };
+  const tool = toolResultMessage();
+  const validFile = path.join(root, "valid-session.jsonl");
+  await fs.writeFile(validFile, [header(), entry(user, "user-1"), entry(assistantMessage(), "assistant-1"), entry(tool, "tool-1")].map((record) => JSON.stringify(record)).join("\n") + "\n");
+  assert.equal(await validateSessionFile(validFile, "child-1", "/tmp/project"), true);
+
+  const invalidMessages = [
+    { ...assistantMessage(), usage: undefined },
+    { ...assistantMessage(), usage: { ...usage(), output: "2" } },
+    { role: "user", content: "work" },
+    { ...toolResultMessage(), isError: "false" },
+    { ...toolResultMessage(), toolCallId: 1 },
+  ];
+  for (const [index, message] of invalidMessages.entries()) {
+    const file = path.join(root, `invalid-${index}.jsonl`);
+    await fs.writeFile(file, [header(), entry(message, `invalid-${index}`)].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false, `invalid message ${index} accepted`);
+  }
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("real Pi v1, v2, and v3 session fixtures validate only under their own schema", async () => {
+  const fixtureRoot = path.join(process.cwd(), "packages/subagent/test/fixtures");
+  assert.equal(await validateSessionFile(path.join(fixtureRoot, "session-v1.jsonl"), "fixture-v1", "/tmp/pi-session-fixture"), true);
+  assert.equal(await validateSessionFile(path.join(fixtureRoot, "session-v2.jsonl"), "fixture-v2", "/tmp/pi-session-fixture"), true);
+  assert.equal(await validateSessionFile(path.join(fixtureRoot, "session-v3.jsonl"), "fixture-v3", "/tmp/pi-session-fixture"), true);
+
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const file = path.join(root, "mixed.jsonl");
+  const v1Header = { type: "session", id: "child-1", cwd: "/tmp/project", timestamp: new Date().toISOString() };
+  const v1WithTreeFields = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "not v1", timestamp: Date.now() } };
+  await fs.writeFile(file, [v1Header, v1WithTreeFields].map(JSON.stringify).join("\n") + "\n");
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -89,6 +156,89 @@ test("JSON mode accepts message_end and tool_execution_end protocol, not obsolet
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("JSON mode retains Pi turn and update event protocol while validating complete messages", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "agent_start" },
+    { type: "turn_start" },
+    { type: "message_start", message: { ...assistantMessage("pending"), content: [] } },
+    { type: "message_update", usage: usage(), assistantMessageEvent: { type: "text_start", contentIndex: 0 } },
+    terminal(),
+    { type: "turn_end", message: assistantMessage(), toolResults: [] },
+    { type: "agent_end", messages: [assistantMessage()], willRetry: false },
+    { type: "agent_settled" },
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("JSON mode accepts the complete Pi 0.84.4 session event wire set", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const entry = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "queued", timestamp: Date.now() } };
+  const compactionResult = {
+    summary: "compacted", firstKeptEntryId: "entry-1", tokensBefore: 100, estimatedTokensAfter: 20,
+    usage: usage(), details: {},
+  };
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "agent_start" }, { type: "turn_start" },
+    { type: "queue_update", steering: ["steer"], followUp: ["follow up"] },
+    { type: "compaction_start", reason: "threshold" },
+    { type: "entry_appended", entry },
+    { type: "session_info_changed", name: "child" },
+    { type: "thinking_level_changed", level: "high" },
+    { type: "bash_execution_update", id: "bash-1", delta: "output" },
+    { type: "auto_retry_start", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "terminated" },
+    { type: "auto_retry_end", success: true, attempt: 2 },
+    { type: "summarization_retry_scheduled", attempt: 1, maxAttempts: 3, delayMs: 2000, errorMessage: "terminated" },
+    { type: "summarization_retry_attempt_start", source: "branchSummary" },
+    { type: "summarization_retry_attempt_start", source: "compaction", reason: "threshold" },
+    { type: "summarization_retry_finished" },
+    { type: "compaction_end", reason: "threshold", result: compactionResult, aborted: false, willRetry: false },
+    { type: "compaction_end", reason: "overflow", aborted: true, willRetry: false },
+    { type: "session_info_changed" },
+    terminal(), { type: "turn_end", message: assistantMessage(), toolResults: [] },
+    { type: "agent_end", messages: [assistantMessage()], willRetry: false }, { type: "agent_settled" },
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("JSON event validation fails closed for unknown, mixed, and malformed Pi records", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const validEntry = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "work", timestamp: Date.now() } };
+  const malformedEvents = [
+    { type: "extension_error", extensionPath: "/tmp/ext", event: "tool_call", error: "failed" },
+    { type: "queue_update", steering: [], followUp: [], extra: true },
+    { type: "thinking_level_changed", level: "invalid" },
+    { type: "auto_retry_start", attempt: "1", maxAttempts: 3, delayMs: 10, errorMessage: "retry" },
+    { type: "summarization_retry_attempt_start", source: "branchSummary", reason: "threshold" },
+    { type: "compaction_end", reason: "threshold", result: null, aborted: true, willRetry: false },
+    { type: "compaction_end", reason: "threshold", result: { summary: "missing fields" }, aborted: false, willRetry: false },
+    { type: "entry_appended", entry: { ...validEntry, message: { role: "assistant", content: [], timestamp: Date.now() } } },
+  ];
+  for (const event of malformedEvents) {
+    const attempt = await runPiAttempt(await options(root, [header(), event, terminal()]));
+    assert.equal(attempt.failureKind, "unknown_transport", JSON.stringify(event));
+  }
+  const mixed = await runPiAttempt(await options(root, [header(), { type: "agent_start" }, validEntry, terminal()]));
+  assert.equal(mixed.failureKind, "unknown_transport");
+  const badHeaders = [
+    { ...header(), version: undefined },
+    { ...header(), version: 1 },
+    { ...header(), version: 2 },
+    { ...header(), timestamp: "1" },
+    { ...header(), cwd: "tmp/project" },
+    { ...header(), unknown: true },
+  ];
+  for (const badHeader of badHeaders) {
+    const attempt = await runPiAttempt(await options(root, [badHeader, terminal()]));
+    assert.equal(attempt.failureKind, "unknown_transport", JSON.stringify(badHeader));
+  }
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("resumes with an absolute session path and never sends a missing session id", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   let invocation: string[] = [];
@@ -105,8 +255,8 @@ test("resumes with an absolute session path and never sends a missing session id
 
 test("signal, empty output, missing header, and missing terminal all fail closed", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
-  const cases = [[], [null], [header(), null], [terminal()], [header()], [header(), { type: "message_end", message: { role: "assistant", content: [] } }],
-    [header(), { type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", name: "read", arguments: {} }], stopReason: "toolUse" } }]];
+  const cases = [[], [null], [header(), null], [terminal()], [header()], [header(), { type: "message_end", message: { ...assistantMessage(), usage: {} } }],
+    [header(), { type: "message_end", message: { ...assistantMessage("toolUse"), content: [{ type: "toolCall", name: "read", arguments: {} }] } }]];
   for (const lines of cases) {
     const attempt = await runPiAttempt(await options(root, lines));
     assert.equal(attempt.failureKind, "unknown_transport");
@@ -156,7 +306,7 @@ test("a later tool event invalidates an earlier stop candidate", async () => {
 test("an assistant message start after stop requires a new terminal", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   const attempt = await runPiAttempt(await options(root, [
-    header(), terminal("stop"), { type: "message_start", message: { role: "assistant", content: [] } },
+    header(), terminal("stop"), { type: "message_start", message: { ...assistantMessage(), content: [] } },
   ]));
   assert.equal(attempt.failureKind, "unknown_transport");
   await fs.rm(root, { recursive: true, force: true });
@@ -182,8 +332,8 @@ test("a tool 503 cannot override a final non-transient provider error", async ()
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   const attempt = await runPiAttempt(await options(root, [
     header(),
-    { type: "tool_execution_end", toolCallId: "1", toolName: "request", result: {}, isError: true, status: 503 },
-    terminal("error", { status: 401, errorMessage: "authentication failed" }),
+    { type: "tool_execution_end", toolCallId: "1", toolName: "request", result: {}, isError: true },
+    terminal("error", { errorMessage: "authentication failed" }),
   ], 1, "HTTP 503 from an old tool result"));
   assert.equal(attempt.failureKind, "non_transient_provider");
   assert.equal(attempt.errorMessage, "provider request failed");
@@ -196,7 +346,7 @@ test("a provider error followed by a new stop returns the new assistant report",
   const attempt = await runPiAttempt(await options(root, [
     header(),
     terminal("error", { errorMessage: "fetch failed" }),
-    { type: "message_start", message: { role: "assistant", content: [] } },
+    { type: "message_start", message: { ...assistantMessage(), content: [] } },
     terminal("stop", { content: [{ type: "text", text: "Recovered report" }] }),
   ]));
   assert.equal(attempt.failureKind, "success");
@@ -261,9 +411,8 @@ test("provider messages are allowlisted and deeply redact nested diagnostics", a
   const secret = "super-secret-token-123";
   const message = terminal("stop", {
     model: "provider/actual-model",
-    headers: { Authorization: `Bearer ${secret}`, "x-api-key": secret },
-    rawBody: { nested: { token: secret, value: "safe" } },
-    cause: { details: { response: { body: `token=${secret}` } } },
+    responseId: secret,
+    diagnostics: [{ type: "provider", timestamp: Date.now(), details: { headers: { Authorization: `Bearer ${secret}` }, rawBody: { nested: secret } } }],
     content: [
       { type: "text", text: `completed; Authorization: Bearer ${secret}` },
       { type: "toolCall", id: "call-1", name: "request", arguments: { headers: { authorization: secret }, nested: { rawBody: secret, token: secret } } },
@@ -274,7 +423,7 @@ test("provider messages are allowlisted and deeply redact nested diagnostics", a
     result: { output: `Cookie: session=${secret}`, headers: { "Set-Cookie": secret }, rawBody: { nested: secret }, nested: { value: "safe", cause: { token: secret } } },
   }, {
     type: "message_end",
-    message: { role: "toolResult", content: [{ type: "text", text: "provider result" }], details: { headers: { Authorization: secret }, token: secret, rawBody: { secret } } },
+    message: toolResultMessage({ details: { headers: { Authorization: secret }, token: secret, rawBody: { secret } } }),
   }, message]));
   const serialized = JSON.stringify(attempt);
   assert.equal(attempt.failureKind, "success");
@@ -326,7 +475,7 @@ test("review probes redact Cookie= and arbitrary X-/Header assignments while kee
 
 test("missing requested or terminal model is recorded as unknown", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
-  const attempt = await runPiAttempt({ ...(await options(root, [header(), terminal()])), model: undefined });
+  const attempt = await runPiAttempt({ ...(await options(root, [header(), terminal("stop", { model: undefined })])), model: undefined });
   assert.equal(attempt.requestedModel, "unknown");
   assert.equal(attempt.actualModel, "unknown");
   await fs.rm(root, { recursive: true, force: true });
@@ -340,8 +489,8 @@ test("task echoes, raw bodies, headers, and nested diagnostics never cross the r
   const attempt = await runPiAttempt({ ...(await options(root, [header(), {
     type: "tool_execution_end", toolCallId: "call-1", toolName: "request", isError: true,
     result: { task, prompt: task, headers: { Cookie: secret }, rawBody: { nested: { diagnostic: secret } }, unknown: { value: secret } },
-  }, { type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: secret }] } }, terminal("stop", {
-    content: [{ type: "text", text: `assistant echoed: ${task}` }, { type: "toolCall", name: "request", arguments: { task, prompt: task, headers: { Cookie: secret } } }],
+  }, { type: "message_end", message: toolResultMessage({ content: [{ type: "text", text: secret }] }) }, terminal("stop", {
+    content: [{ type: "text", text: `assistant echoed: ${task}` }, { type: "toolCall", id: "call-1", name: "request", arguments: { task, prompt: task, headers: { Cookie: secret } } }],
   })])), task, onUpdate: (value: unknown) => updates.push(value) });
   const serialized = JSON.stringify(attempt);
   assert.equal(JSON.stringify(updates).includes(task), false);

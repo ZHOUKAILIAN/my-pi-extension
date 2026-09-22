@@ -22,9 +22,18 @@ async function writeSession(options: { sessionDir: string; id: string; cwd: stri
   await fs.writeFile(file, `${JSON.stringify({ type: "session", version: 3, id: options.id, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`);
   return file;
 }
+async function writeFixtureSession(options: { sessionDir: string; childSessionId: string; cwd: string }, version: 1 | 2 | 3): Promise<string> {
+  await fs.mkdir(options.sessionDir, { recursive: true });
+  const file = path.join(options.sessionDir, `fixture-v${version}.jsonl`);
+  const fixture = await fs.readFile(path.join(process.cwd(), `packages/subagent/test/fixtures/session-v${version}.jsonl`), "utf8");
+  await fs.writeFile(file, fixture.replaceAll(`fixture-v${version}`, options.childSessionId).replaceAll("/tmp/pi-session-fixture", options.cwd));
+  return file;
+}
 function result(options: { cwd: string; id: string; kind: AttemptResult["failureKind"]; model?: string; actualModel?: string; attempt: number; source: AttemptResult["source"] }): AttemptResult {
   return { agent: "implementer", agentSource: "user", exitCode: options.kind === "success" ? 0 : 1, messages: [], toolResults: [], usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, sessionId: options.id, requestedModel: options.model ?? "unknown", actualModel: options.actualModel ?? "unknown", attempt: options.attempt, source: options.source, failureKind: options.kind, errorMessage: options.kind === "transient_provider" ? "provider request failed" : undefined, cwdScope: "cwd:0000000000000000" };
 }
+function piUsage() { return { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }; }
+function piAssistant(stopReason = "stop") { return { role: "assistant", content: [{ type: "text", text: "failed" }], api: "openai-completions", provider: "openai", model: "model-a", usage: piUsage(), stopReason, timestamp: Date.now() }; }
 
 function fakeProcess(lines: unknown[], stderr: string): any {
   const process = new EventEmitter() as any;
@@ -40,6 +49,68 @@ async function dispatchWithMock(rootDir: string, behavior: (options: Parameters<
     rootDir, sleep: async () => {}, runAttempt: async (options) => behavior(options, ++count),
   });
 }
+
+test("Pi v1, v2, and v3 fixture sessions are resumable", async () => {
+  for (const version of [1, 2, 3] as const) {
+    const root = await tempRoot();
+    const handle = `fixture-resume-v${version}`;
+    let calls = 0;
+    const first = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "work", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async (options) => {
+        calls += 1;
+        await writeFixtureSession(options, version);
+        return result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source });
+      },
+    });
+    assert.equal(first.status, "completed", `v${version} initial dispatch`);
+    const resumed = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "continue", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async (options) => {
+        assert.ok(options.sessionFile, `v${version} must pass a validated session path`);
+        calls += 1;
+        return result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source });
+      },
+    });
+    assert.equal(resumed.status, "completed", `v${version} resume`);
+    assert.equal(calls, 2, `v${version} resumed exactly once`);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test("version-near session records are quarantined and never resumed", async () => {
+  for (const version of [1, 2, 3] as const) {
+    const root = await tempRoot();
+    const handle = `near-schema-v${version}`;
+    const first = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "work", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async (options) => {
+        await fs.mkdir(options.sessionDir, { recursive: true });
+        const header = { type: "session", ...(version === 1 ? {} : { version }), id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() };
+        const invalidEntry = version === 1
+          ? { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "tree fields are not v1", timestamp: Date.now() } }
+          : version === 2
+            ? { type: "session_info", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), name: "v3-only" }
+            : { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "hookMessage", customType: "wrong-version", content: "hook", display: false, timestamp: Date.now() } };
+        await fs.writeFile(path.join(options.sessionDir, "invalid.jsonl"), [header, invalidEntry].map(JSON.stringify).join("\n") + "\n");
+        return result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source });
+      },
+    });
+    assert.equal(first.status, "recoverable_failed", `v${version} invalid session`);
+    assert.equal(first.failureKind, "unknown_transport", `v${version} invalid session kind`);
+    const identity = makeSessionIdentity({ parentSessionId: "parent-1", cwd: "/tmp/project", agentName: "implementer", handle });
+    const registryFile = path.join(root, "registry", `${identity.key}.json`);
+    assert.equal(JSON.parse(await fs.readFile(registryFile, "utf8")).status, "quarantined", `v${version} quarantine`);
+    let spawned = false;
+    const resumed = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "must not resume", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async () => { spawned = true; throw new Error("must not spawn"); },
+    });
+    assert.equal(resumed.status, "invalid", `v${version} quarantine is terminal`);
+    assert.equal(spawned, false, `v${version} is never resumed`);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
 
 test("model retry budget is exactly initial+2 per model, then ordered fallback", async () => {
   const root = await tempRoot();
@@ -67,8 +138,8 @@ test("stderr alone does not receive a retry budget", async () => {
     const response = await dispatchWithMock(root, async (options) => {
       calls.push({ model: options.model, source: options.source });
       await writeSession({ sessionDir: options.sessionDir, id: options.childSessionId, cwd: options.cwd });
-      const header = { type: "session", version: 3, id: options.childSessionId, cwd: options.cwd };
-      const terminal = { type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "failed" }], stopReason: "error" } };
+      const header = { type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() };
+      const terminal = { type: "message_end", message: piAssistant("error") };
       return runPiAttempt({ ...options, spawn: () => fakeProcess([header, terminal], stderr) });
     });
     assert.equal(response.status, "recoverable_failed", stderr);
@@ -99,7 +170,7 @@ test("normal child return with a tool error remains completed and retains diagno
     await writeSession({ sessionDir: options.sessionDir, id: options.childSessionId, cwd: options.cwd });
     return {
       ...result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source }),
-      messages: [{ role: "assistant", content: [{ type: "text", text: "report says the test failed" }], stopReason: "stop" } as any],
+      messages: [piAssistant()] as any,
       diagnostics: { toolErrorCount: 1, providerErrorCount: 0 },
       phase: "finished",
     };
@@ -441,7 +512,7 @@ test("a valid header with a truncated second JSONL row is quarantined before res
   const root = await tempRoot();
   const first = await dispatchWithMock(root, async (options) => {
     await fs.mkdir(options.sessionDir, { recursive: true });
-    await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd })}\n{"type":"message_end","message":`);
+    await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n{"type":"message_end","message":`);
     return result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source });
   }, { session: "truncated-second-row" });
   assert.equal(first.status, "recoverable_failed");
@@ -458,6 +529,41 @@ test("a valid header with a truncated second JSONL row is quarantined before res
   assert.equal(resumed.status, "invalid");
   assert.equal(spawned, false);
   await fs.rm(root, { recursive: true, force: true });
+});
+
+test("syntax-valid session records with missing or mistyped Pi fields are quarantined before resume", async () => {
+  const invalidMessages = [
+    { ...piAssistant(), usage: undefined },
+    { ...piAssistant(), timestamp: "not-a-number" },
+  ];
+  for (const [index, message] of invalidMessages.entries()) {
+    const root = await tempRoot();
+    const handle = `schema-invalid-${index}`;
+    const first = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "work", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async (options) => {
+        await fs.mkdir(options.sessionDir, { recursive: true });
+        await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), [
+          { type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() },
+          { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message },
+        ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+        return result({ cwd: options.cwd, id: options.childSessionId, kind: "success", model: options.model, attempt: options.attempt, source: options.source });
+      },
+    });
+    assert.equal(first.status, "recoverable_failed");
+    assert.equal(first.failureKind, "unknown_transport");
+    const identity = makeSessionIdentity({ parentSessionId: "parent-1", cwd: "/tmp/project", agentName: "implementer", handle });
+    const registryFile = path.join(root, "registry", `${identity.key}.json`);
+    assert.equal(JSON.parse(await fs.readFile(registryFile, "utf8")).status, "quarantined");
+    let spawned = false;
+    const resumed = await dispatchAgent({ parentSessionId: "parent-1", cwd: "/tmp/project", task: "must not resume", agent: agent(), session: handle }, {
+      rootDir: root,
+      runAttempt: async () => { spawned = true; throw new Error("must not spawn"); },
+    });
+    assert.equal(resumed.status, "invalid");
+    assert.equal(spawned, false);
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a resumed child that becomes truncated is quarantined before returning", async () => {

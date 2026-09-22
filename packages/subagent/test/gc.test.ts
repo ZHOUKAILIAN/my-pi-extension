@@ -78,7 +78,7 @@ test("GC and an active resume share the identity lock and do not race", async ()
       entered();
       await finish;
       await fs.mkdir(options.sessionDir, { recursive: true });
-      await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", id: options.childSessionId, cwd: options.cwd })}\n`);
+      await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`);
       return { agent: agent.name, agentSource: "user", task: options.task, cwd: options.cwd, exitCode: 0, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, sessionId: options.childSessionId, model: options.model, source: options.source, attempt: options.attempt, failureKind: "success" };
     },
   });
@@ -98,7 +98,7 @@ test("GC cannot delete an existing persistent session while resume holds its ide
     now: () => new Date("2020-01-01T00:00:00.000Z"),
     runAttempt: async (options): Promise<AttemptResult> => {
       await fs.mkdir(options.sessionDir, { recursive: true });
-      await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", id: options.childSessionId, cwd: options.cwd })}\n`);
+      await fs.writeFile(path.join(options.sessionDir, "child.jsonl"), `${JSON.stringify({ type: "session", version: 3, id: options.childSessionId, cwd: options.cwd, timestamp: new Date().toISOString() })}\n`);
       return { agent: agent.name, agentSource: "user", task: options.task, cwd: options.cwd, exitCode: 0, messages: [], stderr: "", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 }, sessionId: options.childSessionId, model: options.model, source: options.source, attempt: options.attempt, failureKind: "success" };
     },
   });
