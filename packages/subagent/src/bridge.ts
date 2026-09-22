@@ -12,6 +12,10 @@ const MARKER_DIRECTORY = "preservation-pins";
 const QUARANTINE_SUFFIX = /^\.json\.quarantine-[A-Za-z0-9-]+$/;
 const O_NOFOLLOW = nodeFs.constants.O_NOFOLLOW;
 const O_DIRECTORY = nodeFs.constants.O_DIRECTORY;
+const BRIDGE_PRODUCTION_PROOF_BRAND = Symbol("bridge-v1-production-proof");
+const BRIDGE_TEST_PROOF_BRAND = Symbol("bridge-v1-test-proof");
+const productionProofs = new WeakSet<object>();
+const testProofs = new WeakSet<object>();
 
 type BridgeStoreErrorKind = "invalid" | "unavailable";
 class BridgeStoreError extends Error {
@@ -28,6 +32,68 @@ export interface BridgeCapability {
   verified: boolean;
   verificationEvidence: "not-run";
   adoptionAllowed: false;
+}
+
+/** Opaque output of a real installed bridge binary verification. There is no
+ * public constructor: the current slice intentionally cannot produce one. */
+export interface BridgeProductionProof {
+  readonly [BRIDGE_PRODUCTION_PROOF_BRAND]: true;
+  readonly capability: "bridge-v1";
+  readonly bridgeVersion: string;
+  readonly bridgeDigest: string;
+  readonly markerVersion: 1;
+  readonly gcPinSemantics: "verified";
+  readonly rollbackSemantics: "verified";
+  readonly verifiedAt: string;
+  readonly expiresAt: string;
+}
+
+export interface BridgeTestProof {
+  readonly [BRIDGE_TEST_PROOF_BRAND]: true;
+  readonly testOnly: true;
+  readonly capability: "bridge-v1";
+  readonly bridgeVersion: "test-fixture";
+  readonly bridgeDigest: string;
+  readonly markerVersion: 1;
+  readonly gcPinSemantics: "verified";
+  readonly rollbackSemantics: "verified";
+  readonly verifiedAt: string;
+  readonly expiresAt: string;
+}
+
+/** Internal test seam only. This proof is deliberately rejected by the
+ * production adoption predicate and cannot be used to sign deployment proof. */
+function strictProofShape(value: object, production: boolean): boolean {
+  if (!Object.isFrozen(value) || Object.getPrototypeOf(value) !== Object.prototype || Object.keys(value).length !== (production ? 8 : 9)) return false;
+  const candidate = value as Record<PropertyKey, unknown>;
+  const brand = production ? BRIDGE_PRODUCTION_PROOF_BRAND : BRIDGE_TEST_PROOF_BRAND;
+  if (candidate[brand] !== true) return false;
+  if (!production && candidate.testOnly !== true) return false;
+  return candidate.capability === "bridge-v1" &&
+    candidate.bridgeVersion === (production ? candidate.bridgeVersion : "test-fixture") &&
+    typeof candidate.bridgeVersion === "string" && candidate.bridgeVersion.length > 0 &&
+    typeof candidate.bridgeDigest === "string" && /^[a-f0-9]{64}$/.test(candidate.bridgeDigest) &&
+    candidate.markerVersion === 1 && candidate.gcPinSemantics === "verified" &&
+    candidate.rollbackSemantics === "verified" && typeof candidate.verifiedAt === "string" &&
+    typeof candidate.expiresAt === "string" && Number.isFinite(Date.parse(candidate.verifiedAt)) &&
+    Number.isFinite(Date.parse(candidate.expiresAt)) && Date.parse(candidate.expiresAt) > Date.parse(candidate.verifiedAt);
+}
+
+export function createBridgeTestProofInternal(now = new Date()): BridgeTestProof {
+  const expiresAt = new Date(now.getTime() + 60_000).toISOString();
+  const proof = Object.freeze({ [BRIDGE_TEST_PROOF_BRAND]: true as const, testOnly: true as const, capability: "bridge-v1" as const, bridgeVersion: "test-fixture" as const, bridgeDigest: "0".repeat(64), markerVersion: 1 as const, gcPinSemantics: "verified" as const, rollbackSemantics: "verified" as const, verifiedAt: now.toISOString(), expiresAt });
+  testProofs.add(proof);
+  return proof;
+}
+
+export function isBridgeTestProof(value: unknown): value is BridgeTestProof {
+  return typeof value === "object" && value !== null && testProofs.has(value) && strictProofShape(value, false);
+}
+
+export function isBridgeProductionProof(value: unknown): value is BridgeProductionProof {
+  // The identity check is deliberately first. Unregistered objects, including
+  // Proxy objects with symbol/getter traps, never reach the structural check.
+  return typeof value === "object" && value !== null && productionProofs.has(value) && strictProofShape(value, true);
 }
 
 /** Installed bridge contract only; deployment verification is intentionally not claimed here. */
@@ -55,7 +121,7 @@ export function isBridgeV1Capability(value: unknown): value is BridgeCapability 
 
 /** This slice never supplies the deployment evidence required for adoption. */
 export function canAdoptExistingV1(value: unknown): boolean {
-  return isBridgeV1Capability(value) && value.verified && value.adoptionAllowed;
+  return isBridgeProductionProof(value);
 }
 
 export interface PreservationPin {
@@ -479,6 +545,40 @@ export async function inspectPreservationPinInternal(options: PreservationPinRea
   }
   const locked = await withIdentityLock({ rootDir: resolved.rootDir, key: resolved.sourceHash }, async () => readMarkerAtLock(resolved));
   return locked ?? { state: "busy" };
+}
+
+/** Lock-scoped mutations used by adoption/rollback. The caller owns the
+ * source identity lock; these functions deliberately do not reacquire it. */
+export async function createPreservationPinAtLockInternal(options: PreservationPinCreateOptions, dependencies?: BridgeDependencies): Promise<PreservationPinMutation> {
+  const resolved = resolvedOptions(options, dependencies); if (!resolved) return { status: "rejected" };
+  const requested = desiredPin(resolved); if (!requested) return { status: "rejected" };
+  try { await secureMarkerDirectory(resolved.rootDir, true); } catch { return { status: "rejected" }; }
+  const current = await readMarkerAtLock(resolved);
+  if (current.state === "valid") return current.pin?.pinUntil === requested.pinUntil ? { status: "already_exists", pin: current.pin } : { status: "conflict", pin: current.pin };
+  if (current.state === "invalid" || current.state === "unavailable") return { status: "rejected" };
+  const context = await openMarkerDirectory(resolved.rootDir, true); if (!context) return { status: "rejected" };
+  try { await atomicWriteMarker(context, resolved.sourceHash, requested, resolved.now, false, resolved.dependencies); return { status: "created", pin: requested }; }
+  catch { return { status: "rejected" }; } finally { await context.handle.close().catch(() => undefined); }
+}
+
+export async function refreshPreservationPinAtLockInternal(options: PreservationPinRefreshOptions, dependencies?: BridgeDependencies): Promise<PreservationPinMutation> {
+  const resolved = resolvedOptions(options, dependencies); if (!resolved || !(options.pinUntil instanceof Date) || !Number.isFinite(options.pinUntil.getTime())) return { status: "rejected" };
+  resolved.pinUntil = new Date(options.pinUntil.getTime()); const current = await readMarkerAtLock(resolved);
+  if (current.state === "expired") return { status: "expired", pin: current.pin };
+  if (current.state !== "valid" || !current.pin) return { status: "rejected" };
+  if (resolved.pinUntil.getTime() < Date.parse(current.pin.pinUntil)) return { status: "conflict", pin: current.pin };
+  if (resolved.pinUntil.getTime() === Date.parse(current.pin.pinUntil)) return { status: "already_exists", pin: current.pin };
+  const base = { version: MARKER_VERSION as 1, sourceHash: resolved.sourceHash, pinUntil: resolved.pinUntil.toISOString(), createdAt: current.pin.createdAt, lastRefreshedAt: resolved.now.toISOString() };
+  const next = { ...base, integrity: integrityFor(base) }; const context = await openMarkerDirectory(resolved.rootDir, false); if (!context) return { status: "rejected" };
+  try { await atomicWriteMarker(context, resolved.sourceHash, next, resolved.now, true, resolved.dependencies); return { status: "refreshed", pin: next }; }
+  catch { return { status: "rejected" }; } finally { await context.handle.close().catch(() => undefined); }
+}
+
+export async function releasePreservationPinAtLockInternal(options: PreservationPinReleaseOptions, dependencies?: BridgeDependencies): Promise<PreservationPinMutation> {
+  const resolved = resolvedOptions(options, dependencies); if (!resolved) return { status: "rejected" };
+  const current = await readMarkerAtLock(resolved); if (current.state === "absent") return { status: "absent" };
+  if ((current.state !== "valid" && current.state !== "expired") || !current.pin) return { status: "rejected" };
+  return await removeMarkerAtLock(resolved, true) ? { status: "released", pin: current.pin } : { status: "rejected" };
 }
 
 export async function createPreservationPinInternal(options: PreservationPinCreateOptions, dependencies?: BridgeDependencies): Promise<PreservationPinMutation> {

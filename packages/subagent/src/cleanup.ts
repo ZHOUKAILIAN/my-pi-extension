@@ -11,6 +11,7 @@ import {
 import { aggregateSlotDigest, cleanupReferenceOrderDigest, isCallTerminal } from "./wal-replay.ts";
 import { hasUnresolvedActionForCall, hasUnresolvedActionForDelegation } from "./action-predicate.ts";
 import { observeCustomReceiptLockedInternal, querySubagentStatusLockedInternal } from "./delivery.ts";
+import { hasLiveAdoptionReferenceSync } from "./adoption.ts";
 import { lineageMatches, type ActiveLineage } from "./lineage.ts";
 import { ownerFileSync, ownerDirectorySync, syncDirectory, atomicOwnerJson } from "./secure-fs.ts";
 import type {
@@ -212,8 +213,9 @@ function activeClaimOrChild(delegation: InternalDelegation): boolean {
   const activeState = ["reserved", "admitted", "resolving", "resolution_ready", "bound", "initial_ready", "initial_running", "recovery_ready", "cycle_ready", "recovery_running", "reattach_only", "cancel_requested", "paused_configuration", "paused_integrity", "paused_uncertainty"].includes(delegation.state);
   return (activeState && !!delegation.owner) || !!delegation.childSessionId || !!delegation.childSessionPathHash || delegation.childPid !== undefined;
 }
-function blocker(view: InternalView, delegation?: InternalDelegation): string | undefined {
+function blocker(rootDir: string, view: InternalView, delegation?: InternalDelegation): string | undefined {
   if (!view.call || view.call.state !== "final" || !isCallTerminal(view)) return "call is not terminal";
+  if (hasLiveAdoptionReferenceSync(rootDir, view.call.dispatchCallId) || (delegation && hasLiveAdoptionReferenceSync(rootDir, delegation.delegationId))) return "live v1 adoption or rollback reference";
   if (!expectedDeliveryComplete(view)) return "final delivery is not complete";
   if (view.call.customOutbox && BLOCKED_CUSTOM.has(view.call.customOutbox.status)) return "custom delivery is pending or uncertain";
   if (hasUnresolvedActionForCall(view)) return "an action is unresolved or uncertain";
@@ -293,6 +295,7 @@ function countEvents(before: InternalView, after: InternalView): number { return
 
 async function deleteDelegationLocked(rootDir: string, callId: string, delegationId: string, actorScopeTag: string, deps: DelegationFoundationDependencies, ownedByCallCleanup = false): Promise<DeleteReceipt> {
   let view = await strictLoad(rootDir, callId); const delegation = view.delegations.get(delegationId);
+  if (hasLiveAdoptionReferenceSync(rootDir, callId) || hasLiveAdoptionReferenceSync(rootDir, delegationId)) return { target: delegationId, objectKind: "delegation", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: "live v1 adoption or rollback reference" };
   if (view.integrity || !view.call || !delegation) return { target: delegationId, objectKind: "delegation", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: view.integrity?.reason ?? "delegation not found" };
   const saved = persistedTag(view, "delegation", delegationId); if (saved && !constantTimeEquals(saved, actorScopeTag)) return { target: delegationId, objectKind: "delegation", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: "durable actor scope tag mismatch" };
   if (delegation.deleteCompleted || delegation.orphanCleanupComplete) {
@@ -310,7 +313,7 @@ async function deleteDelegationLocked(rootDir: string, callId: string, delegatio
     if (current.call?.cleanupRequested && !ownedByCallCleanup) return { target: delegationId, objectKind: "delegation", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: "Call cleanup owns this delegation" };
     const alreadyPlanned = current.delegations.get(delegationId)?.deletePlanned === true;
     if (!alreadyPlanned) {
-      const blocked = ownedByCallCleanup && current.call?.cleanupRequested ? undefined : blocker(current, delegation);
+      const blocked = ownedByCallCleanup && current.call?.cleanupRequested ? undefined : blocker(rootDir, current, delegation);
       if (blocked) return { target: delegationId, objectKind: "delegation", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: blocked };
       const plan = { delegationId, slotIndex: delegation.slotIndex, proofRef: `proof:${callId}`, referenceOrderDigest: cleanupReferenceOrderDigest(current.call!), ...tombstoneValue("delegation", delegationId, actorScopeTag, nowIso(deps)) };
       await strictAppend(rootDir, callId, "delegation_delete_planned", plan, delegationId, deps); writes += 1;
@@ -358,14 +361,14 @@ async function finishDelegationCleanupLocked(rootDir: string, callId: string, de
 
 function orderedSlots(call: DispatchCallView) { return call.slots.filter((slot) => slot.required).slice().sort((a, b) => a.order - b.order); }
 async function callCleanupLocked(rootDir: string, callId: string, actorScopeTag: string, trigger: DeleteTrigger, deps: DelegationFoundationDependencies): Promise<DeleteReceipt> {
-  let view = await strictLoad(rootDir, callId); if (view.integrity || !view.call) return { target: callId, objectKind: "call", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: view.integrity?.reason ?? "call not found" };
+  let view = await strictLoad(rootDir, callId); if (hasLiveAdoptionReferenceSync(rootDir, callId)) return { target: callId, objectKind: "call", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: "live v1 adoption or rollback reference" }; if (view.integrity || !view.call) return { target: callId, objectKind: "call", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: view.integrity?.reason ?? "call not found" };
   const saved = persistedTag(view, "call", callId); if (saved && !constantTimeEquals(saved, actorScopeTag)) return { target: callId, objectKind: "call", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: "durable actor scope tag mismatch" };
   if (view.call.cleanupComplete) {
     const event = view.events.find((item) => item.type === "call_tombstone_written"); const ok = event && await readTombstone(rootDir, "call", callId, actorScopeTag, event.data).catch(() => false);
     return ok ? { target: callId, objectKind: "call", actorScopeTag, status: "completed", walWrites: 0, deleteCount: 0 } : { target: callId, objectKind: "call", actorScopeTag, status: "paused_integrity", walWrites: 0, deleteCount: 0, reason: "Call tombstone cannot be proven" };
   }
   if (!view.call.cleanupRequested) {
-    const reason = blocker(view); if (reason || !requiredTerminal(view)) return { target: callId, objectKind: "call", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: reason ?? "required slots are not terminal" };
+    const reason = blocker(rootDir, view); if (reason || !requiredTerminal(view)) return { target: callId, objectKind: "call", actorScopeTag, status: "rejected", walWrites: 0, deleteCount: 0, reason: reason ?? "required slots are not terminal" };
     // This is deliberately before call_cleanup_requested. A torn/corrupt WAL
     // or an invalid proof therefore cannot freeze a cleanup request.
     view = await ensureProof(rootDir, view, deps);
@@ -478,7 +481,7 @@ async function evaluateRetentionEligibilityLocked(rootDir: string, target: strin
     const proofMtime = await ownerFileMtime([proofPath(dirs(rootDir), resolved.callId)]); if (proofMtime === -1) return { target: resolved.callId, objectKind: "call", eligible: false, reason: "proof activity identity cannot be proven" }; if (proofMtime !== undefined) dates.push(proofMtime);
   }
   const lastTime = dates.length ? Math.max(...dates) : NaN; const last = Number.isFinite(lastTime) ? new Date(lastTime).toISOString() : undefined; const age = lastTime;
-  const blocked = blocker(view); const eligible = Number.isFinite(age) && now(deps).getTime() - age >= RETENTION_MS && !blocked && requiredTerminal(view);
+  const blocked = blocker(rootDir, view); const eligible = Number.isFinite(age) && now(deps).getTime() - age >= RETENTION_MS && !blocked && requiredTerminal(view);
   return { target: resolved.callId, objectKind: "call", eligible, ...(last ? { lastDurableActivity: last } : {}), ...(eligible ? {} : { reason: Number.isFinite(age) && now(deps).getTime() - age < RETENTION_MS ? "retention window has not elapsed" : blocked ?? "required slots are not terminal" }) };
 }
 export async function evaluateRetentionEligibilityInternal(rootDir: string, target: string, deps: DelegationFoundationDependencies = {}): Promise<RetentionEligibility> {
@@ -521,6 +524,7 @@ export async function cleanupOrphanDelegationInternal(rootDir: string, delegatio
   let result: DeleteReceipt | { status: "paused_integrity"; reason: string } | undefined;
   try { result = await withCallLock(rootDir, resolved.callId, async () => {
     let current = await strictLoad(rootDir, resolved.callId); const item = current.delegations.get(delegationId);
+    if (hasLiveAdoptionReferenceSync(rootDir, resolved.callId) || hasLiveAdoptionReferenceSync(rootDir, delegationId)) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: "", status: "rejected" as const, walWrites: 0, deleteCount: 0, reason: "live v1 adoption or rollback reference" };
     const auth = await authenticateLocked(rootDir, current, "delegation", delegationId, actor, deps);
     if ("reason" in auth) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: "", status: "rejected" as const, walWrites: 0, deleteCount: 0, reason: auth.reason };
     if (!item || current.integrity) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: auth.tag, status: "paused_integrity" as const, walWrites: 0, deleteCount: 0, reason: current.integrity?.reason ?? "orphan WAL cannot be proven" };
@@ -530,7 +534,7 @@ export async function cleanupOrphanDelegationInternal(rootDir: string, delegatio
     let writes = 0;
     if (!item.orphanCleanupRequested) {
       if (current.call?.cleanupRequested) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: auth.tag, status: "rejected" as const, walWrites: 0, deleteCount: 0, reason: "Call cleanup owns this delegation" };
-      const reason = blocker(current, item); if (reason) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: auth.tag, status: "rejected" as const, walWrites: 0, deleteCount: 0, reason };
+      const reason = blocker(rootDir, current, item); if (reason) return { target: delegationId, objectKind: "delegation" as const, actorScopeTag: auth.tag, status: "rejected" as const, walWrites: 0, deleteCount: 0, reason };
       const plan = tombstoneValue("delegation", delegationId, auth.tag, nowIso(deps));
       await strictAppend(rootDir, resolved.callId, "delegation_cleanup_requested", plan, delegationId, deps); writes += 1;
     }

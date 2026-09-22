@@ -187,7 +187,7 @@ export interface DispatchCallView {
   persistence: "restart-durable" | "in_process_only"; toolCallIdHash: string; requestDigest: string; mode: DispatchMode; agentScope: AgentScope;
   projectTrustDigest?: string; slots: DispatchSlotView[]; chainCursor: number; privatePayloadRef: string;
   originalToolCallStatus: OriginalToolCallStatus; normalToolResultStatus: NormalToolResultStatus; customOutbox?: CustomOutboxView;
-  state: CallState; cancelRequestedSeq?: number; cancelActorRef?: string; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
+  state: CallState; adoptionRollbackFrozen?: boolean; adoptionRollbackQuarantinePlanned?: boolean; cancelRequestedSeq?: number; cancelActorRef?: string; integrityReason?: string; finalOutcome?: "success" | "failure" | "cancelled"; finalizedAt?: string;
   cleanupRequested?: boolean; cleanupTrigger?: DeleteTrigger; cleanupReferenceOrderDigest?: string; cleanupCursor?: number; cleanupComplete?: boolean; proofDeleted?: boolean;
 }
 export interface DelegationView {

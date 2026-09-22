@@ -53,6 +53,17 @@ export {
   retentionTombstonePath,
 } from "./cleanup.ts";
 export {
+  adoptExistingV1Internal,
+  adoptV1SessionInternal,
+  rollbackAdoptedV1Internal,
+  rollbackV1AdoptionInternal,
+  hasLiveAdoptionReferenceSync,
+  isAdoptionRecord,
+} from "./adoption.ts";
+export type { AdoptionActor, AdoptionDependencies, AdoptionRecord, AdoptionResult, AdoptionStatus, RollbackResult, RollbackStatus, V1AdoptionRequest, V1SourceLiveness, V2RollbackLiveness } from "./adoption.ts";
+export { aggregateCapabilityGateInternal, capabilityGateAllowsPublicV2Internal, CAPABILITY_GATE_NAMES } from "./capability-gate.ts";
+export type { CapabilityGate, CapabilityGateInput, CapabilityGateName } from "./capability-gate.ts";
+export {
   buildSideEffectFenceExtensions,
   startSideEffectFenceServer,
   cleanupSideEffectFenceOrphans,

@@ -6,6 +6,10 @@ export {
   refreshPreservationPinInternal as refreshPreservationPin,
   releasePreservationPinInternal as releasePreservationPin,
   inspectPreservationPinAtLockInternal as inspectPreservationPinAtLock,
+  createPreservationPinAtLockInternal as createPreservationPinAtLock,
+  refreshPreservationPinAtLockInternal as refreshPreservationPinAtLock,
+  releasePreservationPinAtLockInternal as releasePreservationPinAtLock,
   removePreservationPinAtLockInternal as removePreservationPinAtLock,
 } from "./bridge.ts";
-export type { BridgeDependencies } from "./bridge.ts";
+export { createBridgeTestProofInternal, isBridgeTestProof, isBridgeProductionProof } from "./bridge.ts";
+export type { BridgeDependencies, BridgeTestProof } from "./bridge.ts";
