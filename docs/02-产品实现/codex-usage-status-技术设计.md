@@ -2,220 +2,207 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `IMPLEMENTING`（合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E） |
+| 状态 | `IMPLEMENTING`（`fast-gpt-v1` 已采纳并完成源码/测试实现；真实 provider/live E2E pending） |
 | 层级 | 第二层（L2） |
 | L1 owner | [Codex Usage Status + Fast Extension 产品规范](../01-产品定义/扩展/codex-usage-status-扩展.md) |
 | 目标 package | `packages/codex-usage-status` / `@pi/codex-usage-status` |
-| 当前实现 | `packages/codex-usage-status` 已实现额度独立行、Fast 请求/计费接线、parent-Fast interop 与 Fast+Codex 合并行；合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E；focused tests 覆盖 eligibility、命令、bootstrap/env、事件发布、状态切换、payload hook、ticket/cost correction、唯一 widget owner、Fast 左侧状态、清理与零副作用刷新；本轮 `npm test`、`npm run typecheck`、`git diff --check` 和全仓 Markdown 相对链接检查通过，local dispatcher live E2E 未执行 |
+| 当前实现事实 | package 已实现 `fast-gpt-v1`：所有合法小写 `gpt-*` eligibility、请求改写、旧五型号 known pricing correction、unknown FIFO ticket/费用原样保留、unknown 通知 caveat、parent-Fast interop、额度读取与 Fast+Codex 合并行；真实 provider/live E2E pending。 |
+| 本轮边界 | 源码与测试按已采纳 `fast-gpt-v1` 最小实现；不修改 package/config 或外部 dispatcher，不执行 live 收费 provider 调用，不提交 commit/push。 |
 
 ## 1. 结论先行
 
-扩展只在 TUI 的当前模型为 `openai-codex`、`ctx.modelRegistry.isUsingOAuth(ctx.model)` 为真、且模型保有原生 `openai-codex-responses` API 与 `https://chatgpt.com/backend-api` base URL 时，以 `ctx.ui.setWidget('codex-usage-status', factory, { placement: 'belowEditor' })` 投影到输入框下方、原有 footer 上方的独立行。当前由同一 widget 以 `<Fast 状态> · <Codex 额度>` 固定顺序显示，Fast 在左，不写 `codex-fast` footer status。它把授权解析、额度读取和 UI 投影拆开：每次成功 scope 确认只授予 60 秒展示 lease，lease 到期先清除旧快照；usage HTTP 单独受 5 秒超时约束；所有异步结果都以 generation 和内存 scope fingerprint 验证后才能提交。widget 的 `render(width)` 每次按当前 theme 生成文本并通过 ANSI-safe `truncateToWidth` 返回单行；展示前清除两个旧 status，隐藏和 shutdown 同时清除 widget/status。
+`fast-gpt-v1` 只改变 Fast 的模型 eligibility 和 cost policy，不改变额度读取、widget owner、授权安全 gate、请求 payload gate、parent-Fast 协议、默认 Off、不自动重试/fallback、不持久化和既有边界。
 
-```mermaid
-sequenceDiagram
-    participant Pi
-    participant Extension
-    participant Usage as https://chatgpt.com/backend-api/wham/usage
-    participant UsageRow as Pi belowEditor widget
-
-    Pi->>Extension: session_start / input / model_select / agent_settled
-    Extension->>Extension: TUI/provider gate、scope generation、single-flight
-    Extension->>Usage: GET（bearer + account scope，manual redirect）
-    Usage-->>Extension: snake_case usage payload
-    Extension->>Extension: 当前 scope 再验证、白名单投影
-    Extension->>UsageRow: setWidget(factory, { placement: 'belowEditor' })
-```
-
-### 1.1 合并行 UI owner（已实现）
-
-| 项目 | 目标协议 |
-| --- | --- |
-| 唯一投影 owner | `UsageController` 唯一调用 `setWidget('codex-usage-status', ...)`，并负责清除 `codex-usage-status` / `codex-fast` 两个历史 status；`FastController` 不再直接写 UI |
-| Fast 输入 | `FastController` 仅暴露当前 Off/Active/Inactive 的纯展示状态与状态变更通知；同一 widget 的 `render(width)` 在当前 theme 下生成左侧 Fast 标签和右侧额度文本 |
-| 调度 | `index.ts` 先更新 Fast 状态、再让 Usage 投影；`/fast` 后由 Usage 以已有快照和新 Fast 纯状态重新调用同 key `setWidget` 替换 factory。该 presentation refresh 不调用 `handle()`，绝不调用 `getProviderAuth`、fetch、scope lease 或 timer；clear/shutdown 后不得保留 widget/TUI 引用 |
-| gate 与隐藏 | 仅 Usage 额度安全 gate 通过时存在合并行；gate 不通过、模型切离、非 TUI、shutdown 时清除 widget 与两个旧 status。Fast 逻辑、通知、payload hook、ticket 和 requested intent 仍照常运行 |
-| 时序 | 额度的 generation/scope/late-result 边界保持原样；Fast 状态变化不得使晚到额度结果复活 widget，额度晚到也不得复活旧 `codex-fast` footer |
-| 验证 | 覆盖 Off/Active/Inactive、命令刷新不触发 OAuth/fetch/timer、Fast 先后于额度投影、gate 隐藏、模型切换、shutdown、theme/窄宽 ANSI 和晚到结果 |
-
-## 2. Package 与公开边界
-
-| 位置 | 责任 |
-| --- | --- |
-| `packages/codex-usage-status/src/index.ts` | Pi extension factory、`/fast`、Fast→Usage 纯展示调度与生命周期接线。 |
-| `packages/codex-usage-status/src/fast.ts` | Fast intent/effective state、严格 eligibility、`service_tier` payload hook、bounded request ticket、assistant cost correction；仅提供纯状态投影/变更通知，不直接写 UI。 |
-| `packages/codex-usage-status/src/usage.ts` | 授权 scope 提取、请求、wire DTO 解析、快照状态、格式化与唯一合并 widget 投影；不改变 Fast 业务语义。 |
-| `packages/codex-usage-status/test/*.test.ts` | 额度解析、授权/异步状态、格式化、安全回归和 Fast 行为测试。 |
-| `packages/codex-usage-status/package.json` | Pi package manifest、运行依赖与入口；`pi-ai`、`pi-tui` 和 coding-agent peer 约束为 `>=0.84.4 <0.85.0`，直接使用的 `pi-ai`/`pi-tui` dev 版本为 `0.84.4`。 |
-
-该 package 是独立的 provider-status extension，不依赖 `workflow-runtime` 或 `workflow-contracts`，也不注册 Workflow Run、Artifact、Guard 或用户决策。
-
-## 3. Fast Runtime 合同
-
-### 3.1 Intent、eligibility 与 payload
-
-`FastController` 每次 factory 实例化时把 requested intent 初始化为 `false`，只保存在内存。`/fast` 通过 `ctx.hasUI` 保护 TUI/RPC 控制；JSON/print 只发出限制通知，不改变意图。UsageController 是唯一 owner 投影 Fast 与额度：FastController 通过纯 `FastDisplaySnapshot` 和状态变更通知提供 Fast 状态，不能重新引入 `codex-fast` footer status，也不得让 Fast 读取授权、触发 usage fetch 或接管 UsageController 的 scope/timer。
-
-eligibility 是纯当前模型判断：provider、API、base URL 和模型 id 必须逐项精确匹配 allowlist，且 `isUsingOAuth(model)` 返回真；OAuth 抛错视为不 eligible。它不调用 `getProviderAuth`、usage fetch 或 timer。requested On 在模型切换时保留，effective state 在 Active/Inactive 间变化并更新合并行/通知。
-
-Active 的 `before_provider_request` 仅接受 plain object 且 payload model 精确等于当前模型 id，返回 direct shallow copy `{ ...payload, service_tier: "priority" }`；其他情况返回 `undefined`。合并行左侧 Active（`⚡ Fast`）文本使用受限 truecolor soft-orange `#D98C3F`（RGB `(217, 140, 63)`，固定 ANSI 序列 `\u001b[38;2;217;140;63m⚡ Fast\u001b[0m`，文本后立即 reset），Inactive（`Fast inactive`）/Off（`Fast off`）使用 Pi theme `muted`。Active 通知固定为 `⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.`；TUI 以同一 orange ANSI 渲染并以 `info` 发送，RPC（`context.mode` 非 `tui`）发送不含 ANSI 的相同纯文本并以 `info` 发送；Inactive/Off 保持现有通知语义。Off/Active/Inactive 只描述本扩展，不代表 provider 实际采用了 priority。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook；支持的组合要求没有后续 `before_provider_request` handler 改变或移除本扩展输出的 `service_tier`。超出该组合时只保证本扩展自己的 hook 输出，不保证 provider 最终 tier 或 session 最终 cost。
-
-### 3.2 Cost ticket 与恢复边界
-
-每次实际改写创建最多 32 项 FIFO ticket，保存请求时复制的 model cost 和 session id/file。assistant `message_end` 按队列首项匹配 provider/API/model/session；不匹配或 malformed 时 fail open 并丢弃该 ticket。匹配后对 cloned usage 调用 public `@earendil-works/pi-ai` `calculateCost`，先分别乘 `gpt-5.5=2.5` 或其他 allowlist model `=2`，再按 Pi 0.84.4 原生顺序将四个 scaled component 相加为 `total`；只替换 `usage.cost` 且已正确计费时不返回 replacement。requested intent 在流式请求中途变化不影响 ticket。shutdown 仅清理 Fast FIFO；合并行及旧 status 的清理由 UsageController 统一执行。session replacement 由 Pi 重建 extension，intent 不持久化。valid 的 `error`/`aborted` assistant message 只要 accrued usage 完整合法也会修正；malformed usage fail open。
-
-Pi 会串行调用 `message_end` handlers。支持的组合要求：没有其他 handler（无论先于还是后于本扩展）改变模型/session 匹配输入、usage token 字段或 corrected `usage.cost`，以致影响本次 correction 或最终 persisted message。Pi 0.84.4 没有最终持久化 message 可观测 hook；超出该组合时只保证本扩展自己的 `message_end` hook 输出，不保证最终 session cost。
-
-该 ticket 只关联触发本扩展 hook 的逻辑 Agent 请求；已构建请求、internal retry、compaction/branch-summary 等没有该 hook 的请求不受影响。消息与 extension 顺序只能提供本 session 内 bounded correlation，后续 payload rewriter 和不可观测的 provider 请求复用仍不在当前保证内。
-
-### 3.3 Parent-Fast interop 当前机制
-
-`src/interop.ts` 定义版本化 channel `@pi/codex-usage-status:fast-requested/v1`、环境名 `PI_CODEX_FAST`、严格 plain-object parser 和安全发布 helper。`index.ts` 在 `session_start` 发布当前 requested，合法且状态改变的 `/fast on|off|toggle` 后发布刷新，`status`、非法参数和 `hasUI=false` 命令不发布，session id 读取失败时 fail closed；`session_shutdown` 发布 false。Fast 激活/模型重新变为 Active 的通知明确提示 selected user `implementer`/`code_reviewer` 的新 spawn 会继承 requested Fast，并保留紧凑 orange 通知。
-
-factory 启动立即消费 `PI_CODEX_FAST`：仅精确字符串 `"1"` 初始化 requested On，随后无论取值为何删除变量；该变量不会进入 child 的 shell、grandchild 或 reload。它是 advisory trusted-launcher input，不是认证、安全边界或持久化机制。其余 provider/API/base URL/OAuth/model eligibility 仍由 child 自己判断，因此 parent requested On 的 Inactive 不会阻止 eligible child Active；child reload/new/resume/fork 由新 factory 回到 Off。
-
-本 package 不拥有也不复制 subagent dispatcher 的 role/source/config policy。local dispatcher 监听上述 channel，以 exact session id 保存 requested intent，并在每个实际 spawn 前同步构造新 env：先删除 ambient `PI_CODEX_FAST`，再只为 resolved USER-source 且精确名为 `implementer`/`code_reviewer`、frontmatter `codexFast: inherit` 的 agent 设置 `"1"`。project source（含同名 override）和其他 user agent 均不继承。chain 和 queued parallel item 逐个实际 spawn 取快照；已 spawn child 不受 toggle 影响。该 local policy 不是 package-only VERIFIED 证据。
-
-producer `packages/codex-usage-status/src/interop.ts` 与 consumer `/Users/zhoukailian/.pi/agent/extensions/subagent/fast-inheritance.ts` 之间保留事件/env 合同的 duplication drift；两端没有伪称为 shared package import。local parity test 覆盖 consumer 的生产 helper，实际 child process/provider E2E 仍为 UNVERIFIED。
-
-## 4. 额度读取合同
-
-### 4.1 请求安全合同
-
-| 项目 | 规则 |
-| --- | --- |
-| 前置门禁 | `ctx.mode === "tui" && ctx.model?.provider === "openai-codex" && ctx.model.api === "openai-codex-responses" && ctx.model.baseUrl === "https://chatgpt.com/backend-api" && ctx.modelRegistry.isUsingOAuth(ctx.model)`；不满足时隐藏合并行，且不解析授权、不联网、不创建 timer。该完整性检查拒绝 endpoint/API 覆盖；名称等不改变这些运行时字段的元数据覆盖不可区分且可接受。 |
-| URL | 常量 `https://chatgpt.com/backend-api/wham/usage`；不得使用或拼接 provider `baseUrl`。 |
-| 方法 | `GET`，无请求体。仅 HTTP `200` 可解析；所有非 200 和 3xx 都失败。 |
-| 授权 | 通过 `ctx.modelRegistry.getProviderAuth("openai-codex")` 取得内存 bearer token；从其 JWT payload 的 `https://api.openai.com/auth` claim 提取账户作用域。解析失败即 `unavailable`。 |
-| 请求 headers | `Authorization: Bearer ...`、`ChatGPT-Account-ID: ...`；不发送 Reserve opt-in 或其他会改变账户状态的 header。 |
-| 重定向 | `redirect: "manual"`；不读取或请求 `Location`。 |
-| HTTP 超时 | `AbortSignal.timeout(5000)` 仅约束 usage `fetch`。 |
-| 授权解析 | `getProviderAuth` 本身不接受 AbortSignal，可能触发 Pi 最长约 15 秒的刷新/持久化；其结果只能通过 generation 判定是否仍可用，不能阻塞 UI 或输入处理。 |
-| body | `content-length` 超过 64 KiB 直接失败；否则流式读取解码后的 body，累计超过 64 KiB 立即 cancel reader/abort，再只接受 JSON plain object。 |
-| 调度 | `session_start`、`input`、`model_select`、`agent_settled` 只后台排队；每次成功 scope 确认设置 60 秒 lease，到期先清除 snapshot/递增 generation 再校验。usage 最小刷新间隔 60 秒、定期刷新 5 分钟；同一时刻最多一个授权解析和一个 usage 请求。 |
-
-实现不得读取认证文件、请求用户输入 token、复用代理 base URL 或向非固定 URL 发请求。若服务端要求当前扩展无法安全生成的条件路由 header，视为 `unavailable`。
-
-### 4.2 Wire DTO 与白名单投影
-
-直接 HTTP 响应按如下 snake_case 形态读取：
-
-```typescript
-interface UsageWireWindow {
-  used_percent?: unknown;
-  limit_window_seconds?: unknown;
-  reset_at?: unknown;
-}
-
-interface UsageWireLimit {
-  allowed?: unknown;
-  primary_window?: UsageWireWindow;
-  secondary_window?: UsageWireWindow;
-}
-
-interface UsageWireResponse {
-  account_id?: unknown;
-  rate_limit?: UsageWireLimit;
-  // additional_rate_limits is intentionally ignored and never parsed/projected.
-}
-```
-
-原始响应、账户 scope、token 和 headers 均不跨出请求状态机。UI 只接收：
-
-```typescript
-interface UsageWindow {
-  remainingPercent: number;
-  windowDurationMins?: number;
-  resetsAt?: number;
-}
-
-type Availability = "allowed" | "limited" | "unknown";
-
-interface UsageDisplaySnapshot {
-  availability: Availability;
-  windows: readonly UsageWindow[];
-  fetchedAt: number;
-}
-
-interface InternalScopedSnapshot {
-  display: UsageDisplaySnapshot;
-  scopeFingerprint: string; // 仅状态机内存比较，不进入 UI DTO、日志或持久化。
-}
-```
-
-解析规则：
-
-1. 只读取默认 `rate_limit`；忽略且不解析 `additional_rate_limits`，不读取 app-server camelCase 投影、credits、upsell 或未知字段。
-2. 默认 bucket 只依次读取 primary、secondary。`used_percent` 必须为有限数值 `0..100`；`remainingPercent = Math.round(100 - usedPercent)`。`limit_window_seconds` 只接受正整数并换算分钟；`reset_at` 只接受在 `2000-01-01..2100-01-01` 的正整数 Unix 秒级时间。
-3. 只有默认 `rate_limit.allowed` 决定全局 `availability`。`true` 是 `allowed`、`false` 是 `limited`，其他值是 `unknown`。
-4. 无任一合法默认窗口即解析失败。JWT 必须恰有三段、base64url payload 可解析为 plain object，且若 `exp` 存在必须是未过期的有限 Unix 秒；scope claim 不合法即失败。若响应有 `account_id`，它必须是非空字符串且与请求 scope 匹配；类型错误、空值或失配均丢弃整个响应。比较后立即丢弃账户标识。
-
-## 5. 授权、快照与 UI 状态机
-
-```mermaid
-stateDiagram-v2
-    [*] --> Hidden: 非 TUI 或额度安全 gate 不通过
-    [*] --> Refreshing: TUI + 完整额度安全 gate 通过
-    Refreshing --> Current: scope 当前 + allowed + 有效窗口
-    Refreshing --> Limited: scope 当前 + limited + 有效窗口
-    Refreshing --> Unknown: scope 当前 + unknown + 有效窗口
-    Refreshing --> Stale: 同 scope 失败且 age < 10m
-    Refreshing --> Unavailable: 无快照 / scope 变更 / age >= 10m
-    Current --> Unavailable: hard-expiry timer
-    Limited --> Unavailable: hard-expiry timer
-    Unknown --> Unavailable: hard-expiry timer
-    Stale --> Unavailable: hard-expiry timer
-    Current --> Hidden: 额度安全 gate 失效
-    Limited --> Hidden: 额度安全 gate 失效
-    Unknown --> Hidden: 额度安全 gate 失效
-    Stale --> Hidden: 额度安全 gate 失效
-    Unavailable --> Hidden: 额度安全 gate 失效
-```
-
-| 目标投影状态 | 合并行 | 规则 |
+| 维度 | 基准已实现事实（base `02c087ea`） | `fast-gpt-v1` 当前实现事实 |
 | --- | --- | --- |
-| `Hidden` | 清除 widget、`codex-usage-status` / `codex-fast` status | 额度安全 gate 不通过时无认证/网络/timer；Fast 内部逻辑照常独立。 |
-| `Current` | `<Fast> · Codex · 72% ███████░░░ · Sep 16 10:41` | Fast 左侧，C「胶囊额度」样式；只展示当前 scope 的默认 bucket 合法窗口。 |
-| `Limited` | `<Fast> · Codex limit reached` | 不显示会误导许可状态的进度条。 |
-| `Unknown` | `<Fast> · Codex status unknown · 72% ███████░░░` | 只展示默认窗口；不推断许可。 |
-| `Stale` | `<Fast> · Codex: stale <previous text>` | 仅 `now - fetchedAt < 10m` 且 scope fingerprint 相同。 |
-| `Unavailable` | `<Fast> · Codex: unavailable` | 不展示旧数值。 |
+| Eligibility | 精确 provider/API/base URL/OAuth + 旧五型号 allowlist | 精确 provider/API/base URL/OAuth + model id 精确小写 `gpt-` 前缀、非空且无空白 suffix，已实现 |
+| Priority payload | eligible 且 plain-object `payload.model` 精确匹配时浅复制并写 `service_tier: "priority"` | 保持不变，已覆盖所有 eligible GPT；`payload.model` gate 仍精确匹配当前模型 |
+| Cost | 旧五型号按现有 2x/2.5x correction | 旧五型号保持；unknown 型号不改 `usage.cost`，但每个被改写请求仍进入 FIFO ticket，已实现 |
+| UI/通知 | Fast+Codex 合并行、旧五型号现有文案、parent-Fast interop 已实现 | unknown 激活/status/切换提示 priority 仅为请求意图、费用未校正/不保证；unknown→unknown 也提示，已实现 |
+| Quota | 仅默认 bucket；`additional_rate_limits` 忽略 | 保持；Spark 不展示专属 bucket，不代表 Spark 可用性 |
+| 验证 | 既有 focused tests 与历史验证事实保留 | 已增加 eligibility、payload、交错 FIFO、unknown fee invariant、通知和旧边界测试；真实 smoke 未执行，保留 pending |
 
-每次成功 scope 确认授予 60 秒 scope lease，并安排 lease timer。lease timer 触发时先递增 generation、清除 snapshot 和 hard-expiry timer、显示 `unavailable`，再后台重校验；因此授权解析长期 pending 也不能使旧账户数据展示超过 lease。每次校验后都比较 fingerprint；缺失、变化或不匹配时同样清除。所有在途授权/HTTP 的晚到结果 generation 不一致时丢弃。成功 usage 快照另在 `fetchedAt + 10m` 安排 hard-expiry timer，触发时重新检查 age 与 scope 后清除旧比例；因此没有新请求结果也不会超过硬期限展示 stale。每次合并投影先清除旧 `setStatus('codex-usage-status', undefined)` 与 `setStatus('codex-fast', undefined)`，再设置同 key 的 `belowEditor` widget；隐藏、模型切换、非 TUI 与 shutdown 同时调用 `setWidget('codex-usage-status', undefined)` 和两个 status 清理。
+```mermaid
+flowchart LR
+    model[当前模型] --> gate[provider/API/baseUrl/OAuth + gpt-prefix eligibility]
+    gate -->|eligible| payload[plain payload + exact payload.model]
+    payload -->|rewrite| ticket[FIFO ticket: model/session + cost policy]
+    ticket --> message[对应 assistant message_end]
+    message --> known[旧五型号: correction]
+    message --> unknown[unknown gpt: consume ticket, keep usage.cost]
+```
 
-`formatProgressBar(remainingPercent)` 返回 10 个字符：`filled = clamp(Math.round(remainingPercent / 10), 0, 10)`，前 `filled` 个为 `█`，其余为 `░`。正常状态以受限 truecolor ANSI 输出：比例和填充块 `#74d9a5`（`38;2;116;217;165`），空块 faint `#59677c`（`38;2;89;103;124`），每个被着色片段后立即附 `reset`；不得接受服务端颜色/ANSI。`Codex`/重置时间仍通过 `ctx.ui.theme.fg("dim", …)`，`stale`/`status unknown` 用 `warning`、`limit reached` 用 `error`。额度 widget 的 `render(width)` 每次按当前 theme 生成完整文本，以 `truncateToWidth(text, width, '')` 返回严格一行；不缓存预着色结果，`invalidate()` 保持主题切换后的重新渲染契约。
+## 2. 当前已实现事实与 drift
 
-## 6. 失败、恢复与可运营性
+以下为基准 `02c087ea` 经本轮 `fast-gpt-v1` 实现后的运行事实：
 
-- 所有失败仅转换为 `Unavailable` 或同 scope 的 `Stale`，不向 Agent、provider 请求和 session 流程抛出。
-- `model_select` 切离额度安全 gate 时立即清除合并行与两个旧 status、失效在途请求；切回时后台触发 scope 校验和受限刷新。
-- `session_shutdown` 清除全部定时器、递增 generation、清除合并 widget 与两个旧 status；reload/new/resume 不复用旧 session 的内存快照。
-- 刷新触发在请求进行时合并为一个后续刷新意图；失败不立即重试。内存中可保留无敏感数据的 reason code（如 `unauthenticated`、`timeout`、`schema_invalid`、`scope_mismatch`）及最后尝试时间，供测试和未来安全诊断使用，但不写入 status、日志或 session。
-- HTTP 状态、错误文本、headers 和原始 body 不进入 status、日志、session 或测试快照。
-- 上游接口改变时解析失败是可预期状态；不引入网页抓取、浏览器自动化或 token 使用量估算。
+- `src/fast.ts` 的 `FAST_MODEL_IDS` 保留 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`，并经 `src/index.ts` 继续导出；它仅是 known pricing/cost correction 集合，不再是 eligibility allowlist。
+- `isFastEligible()` 对精确官方 Codex provider/API/base URL/OAuth gate 之外，接受所有精确小写 `gpt-` 前缀、非空且无空白 suffix 的型号，覆盖 Astra、mini、spark 与未来未知 GPT。
+- `FastController.rewriteProviderPayload()` 对所有 eligible、plain-object 且 `payload.model === context.model.id` 的 payload 返回浅复制，并创建最多 32 项 FIFO ticket；ticket 保存 request-time model/session 与 known/unknown cost policy。
+- `FastController.rewriteAssistantMessage()` 按 ticket 首项匹配 provider/API/model/session；旧五型号按既有规则修正 cost，unknown ticket 消费后保留原 `usage.cost`，不扫描跳过；mismatch、malformed usage、session 不一致和 shutdown 保持 fail open/清理边界。
+- unknown 激活、status、known↔unknown 及 unknown→unknown 模型切换均通知 priority 仅为请求意图、usage cost 未校正/不保证；known 文案保持既有表达。
+- `UsageController` 是唯一 merged widget owner，使用 `belowEditor` 的 `codex-usage-status`，并清除旧的 `codex-usage-status`/`codex-fast` status；Fast 不直接写 status。
+- `src/interop.ts` 已实现 `@pi/codex-usage-status:fast-requested/v1`、`PI_CODEX_FAST`、严格事件 payload 与一次性 bootstrap 消费；local dispatcher role/source/config policy 不是本 package 的 package-only 证据。
+- 额度仍只解析默认 `rate_limit` 的 primary/secondary window；`additional_rate_limits`（包括 Spark 专属 bucket）不解析、不展示。
 
-## 7. 验证计划
+## 3. Package、符号与影响面
 
-| Fast 验证 | 证据 |
+### 3.1 责任边界
+
+| 文件/范围 | 当前责任 | `fast-gpt-v1` 影响 |
+| --- | --- | --- |
+| `packages/codex-usage-status/src/index.ts` | extension factory、`/fast`、Pi lifecycle/provider/message hooks、Fast→Usage 调度；导出 package public symbols | 保持 hook 注册和生命周期顺序；补齐 unknown notification/model-switch 触发所需的调用参数或状态判断 |
+| `src/fast.ts` | Fast intent/effective state、eligibility、payload hook、bounded ticket、cost correction、Fast notification | 已改为全合法 `gpt-*` eligibility；ticket 保存 known/unknown cost policy；只对旧五型号 correction；unknown 通知判定已实现 |
+| `src/interop.ts` | parent requested event、bootstrap env、严格 parser | 不改协议；保持一次性、advisory、非持久化 |
+| `src/usage.ts` | auth scope、固定 usage URL、DTO 白名单、snapshot、唯一合并 widget、清理 | 不改额度语义；继续只展示默认 bucket，并消费 Fast display snapshot |
+| `test/fast-mode.test.ts` | Fast、ticket、通知、interop、factory/hook 回归 | 扩展模型/通知/FIFO/unknown cost 矩阵 |
+| `test/usage.test.ts` | quota DTO、刷新状态、widget 与副作用回归 | 保持现有测试，补充 Spark/default bucket 不可用性边界如需要 |
+| `package.json`、lock/config | package manifest 与 Pi 兼容约束 | 本轮不改 |
+
+### 3.2 导出符号与已发现调用方
+
+| 导出符号/契约 | 定义位置 | 当前调用方/影响点 |
+| --- | --- | --- |
+| `FastController`、`FastContextLike`、`FastState`、`FastDisplaySnapshot`、`FastDisplayTheme` | `src/fast.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建并调用；`test/fast-mode.test.ts` 直接实例化/断言；`src/usage.ts` 消费 `FastDisplaySnapshot`/`formatFastDisplay` |
+| `FAST_MODEL_IDS`、`isFastEligible`、`getFastState`、`formatFastDisplay`、`FAST_STATUS_CONSTANTS` | `src/fast.ts`，经 `src/index.ts` 导出 | `FAST_MODEL_IDS` 由 `test/fast-mode.test.ts` 作为 known pricing 兼容导出断言；`isFastEligible` 独立负责全合法 `gpt-*` eligibility；其余调用方保持不变 |
+| `FAST_REQUESTED_EVENT`、`parseFastRequestedEvent`、`publishFastRequested`、`consumeFastBootstrap`、`FAST_ENV_NAME` | `src/interop.ts`，部分经 `src/index.ts` 导出 | `src/index.ts` 生命周期接线；`test/fast-mode.test.ts` 直接验证；文档记录外部 local dispatcher consumer 合同，但该路径当前本机不存在，live consumer caller 状态为 `UNKNOWN/UNVERIFIED` |
+| `UsageController`、`fetchUsageSnapshot`、`parseUsagePayload`、`formatUsageSnapshot`、`formatProgressBar`、`USAGE_STATUS_CONSTANTS` | `src/usage.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建/调用 `UsageController`；`test/usage.test.ts` 直接调用；本轮不改变这些额度导出符号的语义 |
+| default export `codexUsageStatusExtension` | `src/index.ts` | Pi package manifest `package.json.pi.extensions` 加载；`test/fast-mode.test.ts` 用 mock ExtensionAPI 注册/触发 hooks |
+| hooks `before_provider_request` / `message_end` | `src/index.ts` 注册，分别调用 `rewriteProviderPayload` / `rewriteAssistantMessage` | Pi runtime hook；focused caller 是 `test/fast-mode.test.ts`；本轮必须保持 ticket 与 hook 顺序假设，并明确后续 handler/最终持久化不可观测边界 |
+| `codex-usage-status` widget、`codex-fast` legacy status | `src/usage.ts` 内部 key | `test/usage.test.ts`、合并行 UI；本轮不新增 Fast status，也不改唯一 owner |
+
+仓库内没有发现其他 package import `@pi/codex-usage-status` public exports；README、L1/L2/L3 文档是说明引用而非运行时调用方。L2 既有文档所指向的 `/Users/zhoukailian/.pi/agent/extensions/subagent/fast-inheritance.ts` 当前工作环境不存在，因此不能把该 external dispatcher 视为已验证调用方；协议 duplication drift 保留并标为待验证。
+
+## 4. `fast-gpt-v1` 已实现运行合同
+
+### 4.1 Eligibility（已实现）
+
+保持现有 exact gate：
+
+```text
+provider === "openai-codex"
+api === "openai-codex-responses"
+baseUrl === "https://chatgpt.com/backend-api"
+isUsingOAuth(model) === true
+model.id.startsWith("gpt-")
+model.id.slice("gpt-".length) 非空且不含空白字符
+```
+
+判定规则：
+
+| 输入 | 目标结果 |
 | --- | --- |
-| 命令与模式 | focused test 覆盖空参数、`on`、`off`、`toggle`、`status`、非法参数；JSON/print `hasUI=false` 不改变 intent，RPC `hasUI=true` 可改变。 |
-| gate 与状态 | focused test 覆盖精确 provider/API/base URL/OAuth/model-id gate、Off/Active/Inactive、模型切换保留 requested On、合并 widget 左侧投影及 Fast 命令纯展示刷新无授权读取、网络和 timer 副作用。 |
-| payload hook 与组合边界 | focused test 覆盖 plain-object/model match、浅复制和嵌套/原 payload 引用保持；L1/L2 明确 Pi 0.84.4 无最终 payload 或最终持久化 message 可观测 hook，支持组合要求没有后续 `before_provider_request` handler 改变/移除 tier；测试只证明本扩展 hook 输出，不假设可观测最终 provider tier。 |
-| ticket 生命周期 | focused test 覆盖请求时 model/session 快照、中途 Off、session mismatch、shutdown、32 项 FIFO bound；无本扩展 hook 的 message 不进入 correction，并记录其他 `message_end` handler 不得改变匹配输入或 token 字段的支持边界。 |
-| cost correction | focused test 覆盖非 `gpt-5.5` 2x、`gpt-5.5` 2.5x、long-context native tier、scaled component sum、浮点 native-priority idempotence；最终 session cost 仅在其他 `message_end` handler 不影响匹配输入、token 字段或 corrected `usage.cost` 的组合下受支持。 |
-| malformed 与 terminal usage | focused test 覆盖负数/非整数 token、缺失必需字段、reasoning/cacheWrite1h 的范围与交叉约束；合法 accrued usage 的 `error`/`aborted` message 仅按支持的 handler 组合修正，测试不假设可观测最终持久化 message。 |
-| usage independence/reset | focused test 覆盖两个 extension factory 实例的 Off reset、Usage 唯一 widget owner、Fast 不再写 status 与 Fast→Usage 纯展示刷新。真实 ExtensionRunner/Pi provider E2E 仍为 residual。 |
-| parent-Fast interop | Repo focused test `node --experimental-strip-types --test packages/codex-usage-status/test/fast-mode.test.ts` 覆盖 exact bootstrap env/delete、继承 JSON child 无 command 时的 eligible `before_provider_request` priority、ineligible child payload unchanged，以及第二次 factory 在 one-shot consume 后 Off。Local production helper test `/Users/zhoukailian/.pi/agent/extensions/subagent/test/fast-inheritance.test.ts` 以 `node --experimental-strip-types --test /Users/zhoukailian/.pi/agent/extensions/subagent/test/fast-inheritance.test.ts` 执行，覆盖 exact/malformed event 与 `codexFast`、session registry true/false/shutdown deletion、user/name/config policy、ambient env sanitization、chain/queued spawn snapshots 和既有 env 不受 toggle 影响。producer/consumer 合同 duplication drift 仍保留，local parity 不是 shared package import；actual child process/provider E2E UNVERIFIED。 |
+| `gpt-5.4`、旧五型号 | eligible |
+| `gpt-5.4-mini`、`gpt-5.4-spark`、`gpt-5.4-astra` | eligible |
+| 任意未来 `gpt-<非空、无空白 suffix>` | eligible，不需要更新 allowlist |
+| `gpt-` | ineligible，suffix 为空 |
+| `GPT-5.4`、`gpt -5.4`、suffix 含空白 | ineligible |
+| 非 `gpt-` 型号、第三方 provider、API/base URL 变体、OAuth false/throw | ineligible |
 
-| 验证 | 证据 |
+该函数必须仍是纯当前模型判断：不解析额度授权、不联网、不启动 timer。requested On 在模型切换时保留，effective state 仍为 Off/Active/Inactive。
+
+### 4.2 Payload hook 与 provider 证明边界（已实现）
+
+Active 时保持现有行为：仅 plain-object payload 且 `payload.model` 精确等于当前模型 id 时返回浅复制 `{ ...payload, service_tier: "priority" }`；无效 payload、model 不匹配、非 Active 返回 `undefined`。保留原 payload 与嵌套引用，不把 `service_tier` 写回原对象。
+
+该 hook 的返回值只证明本扩展产生了 priority 请求输出。Pi 0.84.4 没有最终 payload 或最终持久化 message 的可观测 hook；若后续 `before_provider_request` handler 改写/移除该 tier，或 provider 不接受该字段，本 package 不能证明 provider 最终采用 priority、实际加速或最终费用。Fast Active 和 Spark/default quota 展示均不得作此证明。
+
+### 4.3 FIFO ticket 与 cost policy（已实现）
+
+每个被本扩展成功改写的请求都入队一个 ticket，即使 model 是 unknown：
+
+```text
+PendingFastTicket = {
+  model: request-time cloned model,
+  sessionIdentity: request-time session id/file,
+  costPolicy: known multiplier | unknown-no-correction
+}
+```
+
+- 旧五型号是 known：`gpt-5.5` multiplier `2.5`，其余四个 multiplier `2`。沿用 public `calculateCost`、native model tier、四个 scaled component 相加为 `total` 和已正确计费幂等判断。
+- 其他符合 `gpt-` eligibility 的型号是 unknown：`costPolicy` 为 `unknown-no-correction`，不改变 `usage.cost`，包括合法或 malformed 的 `error`/`aborted` assistant message；它们仍代表一次已改写请求并占用 FIFO 位置。
+- `message_end` 必须按队列首项消费并先做既有 provider/API/model/session 匹配。匹配到 unknown ticket 时消费 ticket 后直接不返回 cost replacement；不能扫描队列寻找下一个 known ticket。
+- mismatch、session mismatch、shutdown 和 malformed usage 保持现有 fail-open 语义；任何被消费或丢弃的 ticket 都不能让后续 known 响应错位。最多 32 项和“溢出丢最老 ticket”边界保持不变。
+- requested intent 在流式请求中途变化不影响已入队 ticket；unknown 也不因后来切换到 known 而补做 correction。
+
+## 5. 通知、合并行与 quota 边界
+
+### 5.1 通知规则
+
+| 场景 | 目标行为 |
 | --- | --- |
-| 合并 widget UI | focused test 覆盖 `belowEditor` placement、固定 Fast 左/额度右、Off/Active/Inactive、至多一行、窄/宽度 resize、ANSI-safe 截断、当前 theme 与 `invalidate()`、两个旧 status/widget 清理、Fast 更新不触发额度副作用、晚到 promise 不复活及非 Codex 不留 Fast footer。 |
-| 单元测试 | 仅默认 bucket（额外 bucket 永不进入投影/UI）、主窗口、多窗口、10 单元进度条、非法/零窗口、剩余比例舍入、availability、非 200、3xx、超大/伪造 content-length、流式膨胀 body、畸形 DTO、JWT base64url/expiry、账户失配。 |
-| 时序测试 | 60 秒 scope lease（含认证永久 pending、换号/登出）、5 分钟 timer、60 秒 usage 限频、single-flight、pending refresh、hard expiry、模型切换/shutdown/reload 和晚到 promise 丢弃。 |
-| 安全回归 | 固定 URL、OAuth provider/API/baseUrl integrity gate 与 manual redirect；覆盖 `openai-codex.baseUrl` 或 API 的模型均不触发授权/网络。mock response 含账户或 token-like 字符串、headers 时，状态/UI DTO/持久化数据均不含它们。 |
-| 模式测试 | TUI 外不调用授权解析、网络或 timer。 |
-| TypeScript / 全仓 | 根 `package.json` 与 lockfile 的 Pi 开发依赖为 `0.84.4`；本 package 的 `pi-ai`/`pi-tui` dev 为精确 `0.84.4`、peer 限定在 `>=0.84.4 <0.85.0`；运行 `npm run typecheck`、`npm test`。 |
-| Pi TUI 手工验证 | 已登录 Codex 会话可显示额度；启动/输入不等待网络，模型切换立即隐藏，失败不阻塞对话。该项不是单元测试可替代的 E2E。 |
+| known Active 激活/status/切换 | 尽量保持现有 `FAST_ACTIVE_NOTIFICATION` 与现有 known 文案 |
+| unknown 型号 `/fast on`、toggle 激活或 status | 显示 Active/priority 请求意图，并明确 `usage cost` 未校正/不保证；不能只显示无条件的“Fast enabled” |
+| requested On 切换到 unknown 型号 | 即使 state 仍是 Active，也发送一次带上述 caveat 的通知 |
+| unknown→unknown 切换 | 不能仅比较 Active/Inactive 状态而静默；必须让用户看到适当的 priority/cost caveat |
+| unknown 切回 known | 恢复 known 文案与 known cost policy 说明，不遗留 unknown caveat |
+| Off/Inactive | 保留现有 Off/Inactive 语义；不因额度 limited/stale/unavailable 自动关闭 |
 
-独立额度行与 Fast 左侧的 UI owner/projection 协议已实现并由 focused tests 覆盖；待独立代码复审与真实 Pi TUI/provider E2E。
+通知至少要让用户理解三个事实：priority 是请求意图；provider 是否接受/加速未知；unknown 型号的 `usage.cost` 不会由本扩展校正。TUI 的 Active Fast label、RPC 纯文本、parent selected user child inheritance 提示继续遵循已有 ANSI/纯文本边界。
+
+### 5.2 Quota 与 widget 不变
+
+`UsageController` 继续是唯一 `codex-usage-status` widget owner：先清理两个 legacy status，再投影 `<Fast 状态> · <Codex 额度>`；`FastController` 只提供纯 display snapshot，不直接写 UI。TUI/provider quota gate、scope lease、generation、single-flight、5 秒 usage HTTP timeout、10 分钟 hard expiry、固定 URL/manual redirect、DTO 白名单和敏感信息边界保持原实现事实。
+
+usage DTO 只读取默认 `rate_limit` primary/secondary；`additional_rate_limits` 永不进入 projection。即使当前模型为 Spark，默认 bucket 也只表示默认额度状态，不表示 Spark 存在专属额度或 Spark 可用性。
+
+## 6. Parent-Fast interop 与运行部署边界
+
+本轮不改变下列已实现协议：
+
+- `src/interop.ts` 产生严格的 `@pi/codex-usage-status:fast-requested/v1` 事件，payload 为无额外字段 `{ version: 1, sessionId, requested }`。
+- `PI_CODEX_FAST=1` 只作为 child 一次性 advisory bootstrap，factory 启动即删除；缺失或非精确值 Off；reload/new/resume/fork 重新 Off。
+- launcher 在实际 spawn 时按 session id 快照 requested，并只对 resolved USER-source、exact `implementer`/`code_reviewer`、frontmatter `codexFast: inherit` 的 child 传递环境变量；project source、同名 project override 和其他 user agent 不继承。
+- role/source/config policy 与真实 child process/provider E2E 不属于 package-only VERIFIED 证据。当前外部 consumer 文件路径不存在，不能声称 local dispatcher live E2E 已通过。
+
+本阶段和后续实现完成后的最终本地启用也不在本轮执行：方案要求在评审 commit 后创建独立 detached deployment worktree（不用于继续开发），仅替换 `~/.pi/agent/settings.json` 中原 `codex-usage-status` package 路径，保留旧路径回滚；用户需 `/reload` 后 `/fast on`。真实 provider smoke 若未执行必须保留 `pending`。
+
+## 7. 验证与未验证边界
+
+### 7.1 Fast eligibility 与 payload
+
+| 覆盖项 | 本轮证据 |
+| --- | --- |
+| `gpt-5.4-astra` | `fast-mode.test.ts` eligibility/unknown notification + payload FIFO 通过 |
+| 任意未来合法 `gpt-*` | `gpt-future-2027` eligibility 测试通过，不依赖 allowlist |
+| `mini`、`spark`、`astra`、旧五型号 | eligibility 与 unknown/known cost FIFO 隔离测试通过；quota focused tests 保持默认 bucket |
+| `gpt-`、`GPT-*`、suffix 含空白、非 GPT | bad ID 测试通过 |
+| provider/API/base URL/OAuth 失配 | security gate 测试通过，OAuth false/throw 与 hook unchanged |
+| plain-object + exact `payload.model` | 浅复制、`service_tier=priority`、原对象/嵌套引用不变 |
+| 非 plain-object 或 model mismatch | payload hook unchanged/undefined |
+
+### 7.2 FIFO、cost 和边界
+
+- 已知→unknown→已知和 unknown→已知→unknown 交错请求/响应：每个 ticket 严格按 FIFO 消费，known 只修正自己的 `usage.cost`，unknown 保持原值，不能因跳过 unknown correction 让 known 错位。
+- unknown 型号的正常、`error`、`aborted` assistant message：`usage.cost` 不变；known 五型号维持既有 2x/2.5x、native long-context tier、component sum 和幂等行为。
+- 覆盖 malformed usage：负数/非整数 token、缺失字段、非法 reasoning/cacheWrite1h、交叉范围错误；unknown 不得因 malformed 路径产生 correction。
+- 保留并回归 32 项 FIFO 上限、request-time model/session snapshot、中途 Off、provider/API/model mismatch、session mismatch、shutdown 清空 ticket，以及无本扩展 hook 的 message 不进入 correction。
+
+### 7.3 通知与 UI/interop regression
+
+- `/fast` 空参数、`on`、`off`、`toggle`、`status`、非法参数、JSON/print/RPC 行为保持。
+- known 文案尽量不变；unknown 激活、status、known→unknown 和 unknown→unknown 都包含 priority 仅为请求意图、usage cost 未校正/不保证；unknown→known 不遗留 caveat；通知 focused test 通过。
+- Fast 仍只通过合并 widget 展示；无独立 `codex-fast` status；命令刷新不触发 OAuth/fetch/timer；模型切换、shutdown、late result 和第二 factory Off reset 保持。
+- parent event/env exact parser、one-shot delete、session isolation、selected child policy 和既有 parity 事实保持；外部 dispatcher live E2E 未执行则标 `pending`。
+
+### 7.4 全量验证入口与未验证项
+
+本轮已执行仓库门禁与 focused tests：
+
+```text
+npm test                         522 passed
+npm run typecheck                passed
+git diff --check                 passed
+fast-mode.test.ts                20 passed
+usage.test.ts                    21 passed
+Markdown 相对链接检查            passed
+```
+
+真实 Pi TUI/provider smoke、真实 child process/provider E2E、外部 dispatcher live E2E 不是本轮已执行证据，继续保留 `pending`；本轮禁止 live 收费 provider 调用。
+
+## 8. 方案采纳与代码评审状态
+
+- L1 与本 L2 的同一 `fast-gpt-v1` 版本已由 product_aligner 产品语义轴 PASS（0 findings）和 code_reviewer 实现/运营方案轴 PASS（0 findings）采纳；两个 review 均只读，采纳绑定基准 `02c087ea`、本任务及本 owner 文档。
+- 本任务已按采纳方案完成源码/测试最小实现并自检；代码实现仍遵循 implementer → 独立 code_reviewer 复审门禁。若发现 required finding，修复后必须再次独立复审。
+- 代码评审通过后才建立本轮本地 commit，不 push；最终 deployment 另用独立 detached worktree，不作为开发 worktree。
+- 真实 Pi TUI/provider smoke、真实 child process/provider E2E、外部 dispatcher live E2E 仍 pending；本轮禁止 live 收费 provider 调用。

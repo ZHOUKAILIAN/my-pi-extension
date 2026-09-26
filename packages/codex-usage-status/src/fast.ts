@@ -1,6 +1,9 @@
 import { calculateCost, type Model, type Usage } from '@earendil-works/pi-ai';
 import { FAST_ENV_NAME } from './interop.ts';
 
+// Compatibility export: these IDs are the known pricing models, not the
+// eligibility allowlist. Every valid lowercase `gpt-<non-whitespace suffix>`
+// is Fast-eligible; only these models receive known cost correction.
 export const FAST_MODEL_IDS = [
   'gpt-5.4',
   'gpt-5.5',
@@ -16,6 +19,7 @@ const FAST_ORANGE = '\u001b[38;2;217;140;63m';
 const ANSI_RESET = '\u001b[0m';
 const FAST_ACTIVE_LABEL = orange('⚡ Fast');
 const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.';
+const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast; priority is request intent only; usage cost is not corrected or guaranteed.';
 const MAX_PENDING_TICKETS = 32;
 const PRIORITY_SERVICE_TIER = 'priority';
 
@@ -49,12 +53,17 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function hasFastModelId(model: FastModel | undefined): boolean {
+function isKnownPricingModel(model: FastModel | undefined): boolean {
   return model !== undefined && FAST_MODEL_IDS.includes(model.id as (typeof FAST_MODEL_IDS)[number]);
 }
 
+function hasEligibleGptId(model: FastModel): boolean {
+  const suffix = model.id.startsWith('gpt-') ? model.id.slice('gpt-'.length) : '';
+  return suffix.length > 0 && !/\s/u.test(suffix);
+}
+
 export function isFastEligible(context: FastContextLike, model = context.model): boolean {
-  if (!model || model.provider !== FAST_PROVIDER || model.api !== FAST_API || model.baseUrl !== FAST_BASE_URL || !hasFastModelId(model)) {
+  if (!model || model.provider !== FAST_PROVIDER || model.api !== FAST_API || model.baseUrl !== FAST_BASE_URL || !hasEligibleGptId(model)) {
     return false;
   }
   try {
@@ -116,9 +125,21 @@ function cloneModel(model: FastModel): FastModel {
   } as FastModel;
 }
 
+type FastCostPolicy =
+  | { readonly kind: 'known'; readonly multiplier: 2 | 2.5 }
+  | { readonly kind: 'unknown' };
+
+function costPolicyForModel(model: FastModel | undefined): FastCostPolicy {
+  if (model !== undefined && isKnownPricingModel(model)) {
+    return { kind: 'known', multiplier: model.id === 'gpt-5.5' ? 2.5 : 2 };
+  }
+  return { kind: 'unknown' };
+}
+
 interface PendingFastTicket {
   readonly model: FastModel;
   readonly sessionIdentity: string | undefined;
+  readonly costPolicy: FastCostPolicy;
 }
 
 function isFiniteNumber(value: unknown): value is number {
@@ -152,18 +173,18 @@ function costsEqual(left: Usage['cost'], right: Usage['cost']): boolean {
     && left.total === right.total;
 }
 
-function priorityCost(model: FastModel, usage: Usage): Usage['cost'] | undefined {
+function priorityCost(model: FastModel, usage: Usage, policy: FastCostPolicy): Usage['cost'] | undefined {
+  if (policy.kind === 'unknown') return undefined;
   try {
     const clonedUsage: Usage = {
       ...usage,
       cost: { ...usage.cost },
     };
     const baseCost = calculateCost(model, clonedUsage);
-    const multiplier = model.id === 'gpt-5.5' ? 2.5 : 2;
-    const input = baseCost.input * multiplier;
-    const output = baseCost.output * multiplier;
-    const cacheRead = baseCost.cacheRead * multiplier;
-    const cacheWrite = baseCost.cacheWrite * multiplier;
+    const input = baseCost.input * policy.multiplier;
+    const output = baseCost.output * policy.multiplier;
+    const cacheRead = baseCost.cacheRead * policy.multiplier;
+    const cacheWrite = baseCost.cacheWrite * policy.multiplier;
     const cost = {
       ...baseCost,
       input,
@@ -221,11 +242,15 @@ export class FastController {
     previousStateOverride?: FastState,
   ): void {
     const previousState = previousStateOverride ?? (this.context ? this.state : undefined);
+    const previousModel = this.model;
     this.context = context;
     this.model = modelOverride ?? context.model;
     const state = this.state;
     this.emitDisplayStateChange(previousState);
-    if (announceTransition && this.requested && previousState !== undefined && previousState !== state) {
+    const policyNotification = state === 'active'
+      && (costPolicyForModel(previousModel ?? this.model).kind === 'unknown'
+        || costPolicyForModel(this.model).kind === 'unknown');
+    if (announceTransition && this.requested && previousState !== undefined && (previousState !== state || policyNotification)) {
       this.notifyState(state);
     }
   }
@@ -290,7 +315,12 @@ export class FastController {
     const model = context.model;
     if (!model || !isPlainObject(payload) || payload.model !== model.id) return undefined;
 
-    this.pendingTickets.push({ model: cloneModel(model), sessionIdentity: sessionIdentity(context) });
+    const requestModel = cloneModel(model);
+    this.pendingTickets.push({
+      model: requestModel,
+      sessionIdentity: sessionIdentity(context),
+      costPolicy: costPolicyForModel(requestModel),
+    });
     if (this.pendingTickets.length > MAX_PENDING_TICKETS) this.pendingTickets.shift();
     // Pi may compose later handlers; this is only this extension's payload output.
     return { ...payload, service_tier: PRIORITY_SERVICE_TIER };
@@ -303,7 +333,7 @@ export class FastController {
     if (message.provider !== ticket.model.provider || message.api !== ticket.model.api || message.model !== ticket.model.id || sessionIdentity(context) !== ticket.sessionIdentity) return undefined;
     if (!isUsage(message.usage)) return undefined;
 
-    const cost = priorityCost(ticket.model, message.usage);
+    const cost = priorityCost(ticket.model, message.usage, ticket.costPolicy);
     if (!cost || costsEqual(message.usage.cost, cost)) return undefined;
     // Other message_end handlers and final persistence are outside this hook's view.
     return {
@@ -321,7 +351,10 @@ export class FastController {
     const context = this.context;
     if (!context) return;
     if (state === 'active') {
-      context.ui.notify(context.mode === 'tui' ? orange(FAST_ACTIVE_NOTIFICATION) : FAST_ACTIVE_NOTIFICATION, 'info');
+      const notification = costPolicyForModel(this.model).kind === 'unknown'
+        ? FAST_UNKNOWN_ACTIVE_NOTIFICATION
+        : FAST_ACTIVE_NOTIFICATION;
+      context.ui.notify(context.mode === 'tui' ? orange(notification) : notification, 'info');
     } else if (state === 'inactive') {
       context.ui.notify('Fast is inactive: this model is not eligible for priority processing.', 'warning');
     } else {
