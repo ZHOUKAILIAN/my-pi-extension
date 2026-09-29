@@ -16,7 +16,7 @@
 - [Feature Extension 产品规范](扩展/feature-扩展.md)：`DECIDED`
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
 - [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`DECIDED`
-- [Codex Usage Status + Fast Extension](扩展/codex-usage-status-扩展.md)：`IMPLEMENTING`（合并行已实现，待独立代码复审与真实 Pi TUI/provider E2E）
+- [Codex Usage Status + Fast Extension](扩展/codex-usage-status-扩展.md)：`IMPLEMENTING`（`fast-gpt-v1` 已采纳并实现；真实 Pi TUI/provider E2E pending）
 - [Subagent Dispatcher Extension](扩展/subagent-扩展.md)：`DECIDED`（[2026-09-14 Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md) 已采纳 L1 产品契约与 L2 目标设计；S1–S43 连续，v2 待实现，未实现不得声称完成）
 
 ## L1 与 L2 的边界

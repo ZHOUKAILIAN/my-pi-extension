@@ -13,8 +13,10 @@ import extension, {
 
 const FAST_ACTIVE_TEXT = '⚡ Fast';
 const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.';
+const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast; priority is request intent only; usage cost is not corrected or guaranteed.';
 const ANSI_FAST_ACTIVE = `\u001b[38;2;217;140;63m${FAST_ACTIVE_TEXT}\u001b[0m`;
 const ANSI_FAST_ACTIVE_NOTIFICATION = `\u001b[38;2;217;140;63m${FAST_ACTIVE_NOTIFICATION}\u001b[0m`;
+const ANSI_FAST_UNKNOWN_ACTIVE_NOTIFICATION = `\u001b[38;2;217;140;63m${FAST_UNKNOWN_ACTIVE_NOTIFICATION}\u001b[0m`;
 
 function model(id = 'gpt-5.4', overrides: Record<string, unknown> = {}): any {
   return {
@@ -86,18 +88,22 @@ function assistant(modelValue: any, usageOverrides: Record<string, unknown> = {}
   };
 }
 
-test('eligibility is exact, allowlisted, and fail-closed when OAuth throws', () => {
+test('eligibility accepts all valid lowercase gpt IDs while FAST_MODEL_IDS remains known pricing only', () => {
   const ctx = context();
-  for (const id of FAST_MODEL_IDS) assert.equal(isFastEligible(ctx, model(id)), true);
-  for (const id of ['gpt-5.3-codex', 'gpt-5.4-mini', 'gpt-5.4-spark', 'GPT-5.4', 'gpt-5.40']) {
+  assert.deepEqual([...FAST_MODEL_IDS], ['gpt-5.4', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+  for (const id of [...FAST_MODEL_IDS, 'gpt-5.4-astra', 'gpt-5.4-mini', 'gpt-5.4-spark', 'gpt-future-2027']) {
+    assert.equal(isFastEligible(ctx, model(id)), true, id);
+  }
+  for (const id of ['gpt-', 'GPT-5.4', 'gpt -5.4', 'gpt-5.4 mini', 'gpt-5.4\tmini', 'codex-5.4']) {
     assert.equal(isFastEligible(ctx, model(id)), false, id);
   }
   for (const overrides of [
     { provider: 'openai' },
     { api: 'openai-responses' },
     { baseUrl: 'https://proxy.example/backend-api' },
-  ]) assert.equal(isFastEligible(ctx, model('gpt-5.4', overrides)), false);
+  ]) assert.equal(isFastEligible(ctx, model('gpt-future-2027', overrides)), false);
   assert.equal(isFastEligible({ ...ctx, model: undefined }, undefined), false);
+  assert.equal(isFastEligible({ ...ctx, modelRegistry: { isUsingOAuth: () => false } }), false);
   assert.equal(isFastEligible({ ...ctx, modelRegistry: { isUsingOAuth: () => { throw new Error('auth'); } } }), false);
 });
 
@@ -117,6 +123,32 @@ test('active payload replacement is direct, shallow, model-matched, and leaves i
   assert.equal(controller.rewriteProviderPayload(null, ctx), undefined);
   assert.equal(controller.rewriteProviderPayload({ model: 'gpt-5.4' }, context(model('gpt-5.5'))), undefined);
   assert.equal(FAST_STATUS_CONSTANTS.serviceTier, 'priority');
+  controller.shutdown();
+});
+
+test('unknown active/status/model switches explain priority intent and uncorrected cost', () => {
+  const controller = new FastController();
+  const unknown = context(model('gpt-5.4-astra'));
+  controller.setRequested(true, unknown);
+  assert.equal(unknown._notices.at(-1).message, ANSI_FAST_UNKNOWN_ACTIVE_NOTIFICATION);
+  assert.match(unknown._notices.at(-1).message, /selected user implementer\/code_reviewer agents inherit requested Fast/u);
+  assert.match(unknown._notices.at(-1).message, /priority is request intent only/u);
+  assert.match(unknown._notices.at(-1).message, /usage cost is not corrected or guaranteed/u);
+
+  const unknownRpc = context(model('gpt-5.4-astra'), { mode: 'rpc', hasUI: true });
+  controller.handle(unknownRpc, unknownRpc.model, true);
+  assert.equal(unknownRpc._notices.at(-1).message, FAST_UNKNOWN_ACTIVE_NOTIFICATION);
+  assert.equal(unknownRpc._notices.at(-1).message.includes('\u001b'), false);
+
+  controller.handleCommand('status', unknown);
+  assert.match(unknown._notices.at(-1).message, /priority is request intent only/u);
+  const unknownAgain = context(model('gpt-future-2027'));
+  controller.handle(unknownAgain, unknownAgain.model, true);
+  assert.match(unknownAgain._notices.at(-1).message, /usage cost is not corrected or guaranteed/u);
+
+  const known = context(model('gpt-5.4'));
+  controller.handle(known, known.model, true);
+  assert.equal(known._notices.at(-1).message, ANSI_FAST_ACTIVE_NOTIFICATION);
   controller.shutdown();
 });
 
@@ -158,7 +190,7 @@ test('requested On remains across model switches and uses soft-orange Active plu
   assert.equal(eligible._notices.at(-1).type, 'info');
   assert.equal(eligible._themeCalls.length, 0);
 
-  const ineligible = context(model('gpt-5.4-mini'));
+  const ineligible = context(model('gpt-'));
   controller.handle(ineligible, ineligible.model, true);
   assert.equal(controller.requestedOn, true);
   assert.equal(controller.state, 'inactive');
@@ -309,6 +341,65 @@ test('rejects malformed usage and corrects valid error or aborted usage', () => 
   controller.shutdown();
 });
 
+test('known and unknown tickets stay FIFO-isolated and unknown cost remains unchanged', () => {
+  const controller = new FastController();
+  const known = context(model('gpt-5.4'));
+  const unknown = context(model('gpt-5.4-spark'));
+  controller.setRequested(true, known);
+
+  controller.rewriteProviderPayload({ model: known.model.id }, known);
+  const unknownPayload = controller.rewriteProviderPayload({ model: unknown.model.id }, unknown) as Record<string, unknown>;
+  assert.equal(unknownPayload.service_tier, 'priority');
+  controller.rewriteProviderPayload({ model: known.model.id }, known);
+
+  const knownFirst = controller.rewriteAssistantMessage(assistant(known.model), known);
+  assert.ok(knownFirst);
+  assert.deepEqual(knownFirst.message.usage.cost, {
+    input: 2,
+    output: 8,
+    cacheRead: 3,
+    cacheWrite: 24,
+    total: 37,
+  });
+
+  const unknownMessage = assistant(unknown.model);
+  const unknownCost = { ...unknownMessage.usage.cost };
+  assert.equal(controller.rewriteAssistantMessage(unknownMessage, unknown), undefined);
+  assert.deepEqual(unknownMessage.usage.cost, unknownCost);
+
+  const knownSecond = controller.rewriteAssistantMessage(assistant(known.model), known);
+  assert.ok(knownSecond);
+  assert.deepEqual(knownSecond.message.usage.cost, {
+    input: 2,
+    output: 8,
+    cacheRead: 3,
+    cacheWrite: 24,
+    total: 37,
+  });
+
+  controller.rewriteProviderPayload({ model: unknown.model.id }, unknown);
+  controller.rewriteProviderPayload({ model: known.model.id }, known);
+  controller.rewriteProviderPayload({ model: unknown.model.id }, unknown);
+  const unknownFirstAgain = assistant(unknown.model);
+  assert.equal(controller.rewriteAssistantMessage(unknownFirstAgain, unknown), undefined);
+  assert.deepEqual(unknownFirstAgain.usage.cost, unknownCost);
+  assert.ok(controller.rewriteAssistantMessage(assistant(known.model), known));
+  const unknownLastAgain = assistant(unknown.model);
+  assert.equal(controller.rewriteAssistantMessage(unknownLastAgain, unknown), undefined);
+  assert.deepEqual(unknownLastAgain.usage.cost, unknownCost);
+
+  controller.rewriteProviderPayload({ model: unknown.model.id }, unknown);
+  for (const stopReason of ['error', 'aborted'] as const) {
+    const terminal = assistant(unknown.model);
+    terminal.stopReason = stopReason;
+    const before = { ...terminal.usage.cost };
+    assert.equal(controller.rewriteAssistantMessage(terminal, unknown), undefined);
+    assert.deepEqual(terminal.usage.cost, before);
+    if (stopReason === 'error') controller.rewriteProviderPayload({ model: unknown.model.id }, unknown);
+  }
+  controller.shutdown();
+});
+
 test('a new extension factory starts Fast Off even after another instance was turned On', async () => {
   const makeHarness = () => {
     const handlers = new Map<string, Function>();
@@ -430,10 +521,10 @@ test('inherited JSON child starts requested On without a command, and a second f
     assert.equal(inheritedResult?.service_tier, 'priority');
     assert.equal(inheritedPayload.service_tier, 'default');
 
-    const ineligibleContext = context(model('gpt-5.4-mini'), { mode: 'json', hasUI: false });
-    const ineligiblePayload = { model: 'gpt-5.4-mini', service_tier: 'default' };
+    const ineligibleContext = context(model('gpt-'), { mode: 'json', hasUI: false });
+    const ineligiblePayload = { model: 'gpt-', service_tier: 'default' };
     assert.equal(first.handlers.get('before_provider_request')?.({ payload: ineligiblePayload }, ineligibleContext), undefined);
-    assert.deepEqual(ineligiblePayload, { model: 'gpt-5.4-mini', service_tier: 'default' });
+    assert.deepEqual(ineligiblePayload, { model: 'gpt-', service_tier: 'default' });
 
     const second = makeHarness();
     const secondContext = context(model('gpt-5.4'), { mode: 'json', hasUI: false });
@@ -516,7 +607,7 @@ test('lifecycle projects the updated Fast state before hiding on a gate failure'
   await command?.('on', ctx);
   assert.match(rows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
 
-  await handlers.get('model_select')?.({ model: model('gpt-5.4-mini'), previousModel: ctx.model, source: 'set' }, ctx);
+  await handlers.get('model_select')?.({ model: model('gpt-'), previousModel: ctx.model, source: 'set' }, ctx);
   assert.match(rows.at(-1) ?? '', /Fast inactive/u);
   await handlers.get('model_select')?.({ model: model('other', { provider: 'other' }), previousModel: ctx.model, source: 'set' }, ctx);
   assert.equal(rows.at(-1), '<cleared>');
