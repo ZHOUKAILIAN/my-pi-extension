@@ -58,7 +58,7 @@ flowchart LR
    - Fast Active 不能证明 provider 接受了 `priority` 或实际加速。
 8. 对被本扩展改写的每个请求都保留一个 FIFO 关联 ticket，包括 unknown 型号。ticket 必须保存请求时的 model/session 快照和 cost policy；不得因为 unknown 不做 cost correction 而跳过 ticket，导致后续 known ticket 错位。仍保留最多 32 项、FIFO、mismatch/session/shutdown 等 fail-open 边界。
 9. 只有旧五型号按现有规则修正 `usage.cost`：`gpt-5.5` 为 `2.5x`，其余四个为 `2x`，并保留现有 native pricing tier、四个 component 相加和幂等语义。unknown 型号不改变 `usage.cost`，包括 `error`/`aborted` assistant message；unknown ticket 仍在对应 FIFO 消息位置被消费。
-10. 在上述支持的 handler 组合下，对 valid 的 known `error` 或 `aborted` assistant message，只要 usage 字段完整且合法，仍按已产生的 usage 修正 cost；unknown、malformed usage 和现有 mismatch 边界均不产生 cost correction。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook；超出该组合时，本扩展只保证自己的 hook 输出，不保证 provider 最终 tier 或 session 最终 cost。
+10. 对 valid 的 known `error` 或 `aborted` assistant message，只要 usage 字段完整且合法，仍按已产生的 usage 修正 cost；unknown、malformed usage 和现有 mismatch 边界均不产生 cost correction。支持该 cost 修正及最终持久化 cost 的 handler 组合，除没有后续 `before_provider_request` handler 改变或移除本扩展输出的 `service_tier` 外，还要求没有其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或本扩展已修正的 `usage.cost`，以免影响本次修正或最终持久化结果。若其他 `message_end` handler 改变上述任一输入或修正结果，本扩展只保证自己的 hook 输出，不保证最终持久化 session cost。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook；超出这些支持条件时，也不保证 provider 最终采用 priority、实际加速或最终 session cost。
 
 ### 2.2 费用与额度展示边界
 
@@ -130,8 +130,8 @@ Fast 的 factory 默认仍为 Off，但存在一个明确的一次性、受信�
 | F2 | Fast eligibility 与状态 | provider/API/base URL/OAuth 保持精确 gate；model id 仅需精确小写 `gpt-` 前缀、非空且无空白 suffix；覆盖 Astra、mini、spark、未来 GPT、`gpt-`、大小写、空白、非 GPT 和第三方；同一实例保留 requested On 并正确显示 Active/Inactive。 |
 | F3 | payload hook 与组合边界 | Active 仅为匹配的 plain-object payload 返回浅复制 `service_tier=priority`，保留原 payload/嵌套引用；支持组合要求没有后续 `before_provider_request` handler 改变或移除该 tier。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook，因此验收只证明本扩展 hook 输出，不证明 provider 最终 tier。 |
 | F4 | request-time ticket | 每个被改写请求（含 unknown）使用请求时 model/session 快照；中途 Off、session mismatch、shutdown 和超过 32 项 FIFO 上限均按现有规则 fail open；unknown ticket 不得被跳过。 |
-| F5 | Fast cost | 仅旧五型号修正 cost：`gpt-5.5` 为 2.5x、其他四个为 2x；unknown（包括 error/aborted）不改变 `usage.cost`；known/unknown 交错响应保持 FIFO；long-context native tier、四个 scaled component 相加及已正确计费幂等语义保留。 |
-| F6 | malformed/terminal usage | 负数、非整数、缺失必需字段、非法 reasoning/cacheWrite1h、`reasoning > output` 或 `cacheWrite1h > cacheWrite` 不修正；known 合法 accrued usage 的 `error`/`aborted` 仍修正，unknown 的 `error`/`aborted` cost 不变。 |
+| F5 | Fast cost | 仅旧五型号修正 cost：`gpt-5.5` 为 2.5x、其他四个为 2x；unknown（包括 error/aborted）不改变 `usage.cost`；known/unknown 交错响应保持 FIFO；long-context native tier、四个 scaled component 相加及已正确计费幂等语义保留。支持组合要求没有其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或已修正的 `usage.cost`，从而影响本次修正或最终持久化；超出时只保证本扩展自身 hook 输出，不保证最终持久化 session cost。 |
+| F6 | malformed/terminal usage | 负数、非整数、缺失必需字段、非法 reasoning/cacheWrite1h、`reasoning > output` 或 `cacheWrite1h > cacheWrite` 不修正；known 合法 accrued usage 的 `error`/`aborted` 仍修正，unknown 的 `error`/`aborted` cost 不变。若其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或已修正的 `usage.cost`，只保证本扩展 hook 输出，不保证最终持久化 session cost。 |
 | F7 | extension isolation/reset | Fast 不写独立 status key，只向合并行提供无副作用展示状态；新建第二个 extension factory 后 intent 从 Off 开始，Fast 命令/gate 触发的纯展示刷新不得调用授权、网络或额度 timer。 |
 | F8 | parent requested Off | 任意新 spawn 均不带 Fast；状态按 session id 隔离，false/`session_shutdown` 清除对应 parent intent。 |
 | F9 | selected child inheritance | parent requested On 仅使 resolved USER-source 且 exact name/config 命中的 `implementer`、`code_reviewer` child 获得一次性 `PI_CODEX_FAST=1`；其他 user、project 和同名 project override 不继承。 |

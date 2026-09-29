@@ -1,0 +1,4 @@
+{"type":"session","version":2,"id":"fixture-v2","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/pi-session-fixture","parentSession":"parent-fixture"}
+{"type":"message","id":"entry-user","parentId":null,"timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":"continue","timestamp":1767225601000}}
+{"type":"message","id":"entry-hook","parentId":"entry-user","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"hookMessage","customType":"fixture-hook","content":"hook context","display":false,"timestamp":1767225602000,"details":{"source":"fixture"}}}
+{"type":"compaction","id":"entry-compaction","parentId":"entry-hook","timestamp":"2026-01-01T00:00:03.000Z","summary":"tree summary","firstKeptEntryId":"entry-user","tokensBefore":12,"fromHook":true}

@@ -65,13 +65,13 @@ flowchart LR
 | --- | --- | --- |
 | `FastController`、`FastContextLike`、`FastState`、`FastDisplaySnapshot`、`FastDisplayTheme` | `src/fast.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建并调用；`test/fast-mode.test.ts` 直接实例化/断言；`src/usage.ts` 消费 `FastDisplaySnapshot`/`formatFastDisplay` |
 | `FAST_MODEL_IDS`、`isFastEligible`、`getFastState`、`formatFastDisplay`、`FAST_STATUS_CONSTANTS` | `src/fast.ts`，经 `src/index.ts` 导出 | `FAST_MODEL_IDS` 由 `test/fast-mode.test.ts` 作为 known pricing 兼容导出断言；`isFastEligible` 独立负责全合法 `gpt-*` eligibility；其余调用方保持不变 |
-| `FAST_REQUESTED_EVENT`、`parseFastRequestedEvent`、`publishFastRequested`、`consumeFastBootstrap`、`FAST_ENV_NAME` | `src/interop.ts`，部分经 `src/index.ts` 导出 | `src/index.ts` 生命周期接线；`test/fast-mode.test.ts` 直接验证；文档记录外部 local dispatcher consumer 合同，但该路径当前本机不存在，live consumer caller 状态为 `UNKNOWN/UNVERIFIED` |
+| `FAST_REQUESTED_EVENT`、`parseFastRequestedEvent`、`publishFastRequested`、`consumeFastBootstrap`、`FAST_ENV_NAME` | `src/interop.ts`，部分经 `src/index.ts` 导出 | 本 package 的 `src/index.ts` 发布事件并消费 bootstrap；仓库 consumer `packages/subagent/src/fast-inheritance.ts` 通过 public `@pi/codex-usage-status/interop` 动态 import parser，`packages/subagent/src/index.ts` 接入 consumer；`packages/subagent/test/fast-inheritance.test.ts` 自动化覆盖该仓库集成。真实 child process/provider/TUI 端到端仍未验证 |
 | `UsageController`、`fetchUsageSnapshot`、`parseUsagePayload`、`formatUsageSnapshot`、`formatProgressBar`、`USAGE_STATUS_CONSTANTS` | `src/usage.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建/调用 `UsageController`；`test/usage.test.ts` 直接调用；本轮不改变这些额度导出符号的语义 |
 | default export `codexUsageStatusExtension` | `src/index.ts` | Pi package manifest `package.json.pi.extensions` 加载；`test/fast-mode.test.ts` 用 mock ExtensionAPI 注册/触发 hooks |
 | hooks `before_provider_request` / `message_end` | `src/index.ts` 注册，分别调用 `rewriteProviderPayload` / `rewriteAssistantMessage` | Pi runtime hook；focused caller 是 `test/fast-mode.test.ts`；本轮必须保持 ticket 与 hook 顺序假设，并明确后续 handler/最终持久化不可观测边界 |
 | `codex-usage-status` widget、`codex-fast` legacy status | `src/usage.ts` 内部 key | `test/usage.test.ts`、合并行 UI；本轮不新增 Fast status，也不改唯一 owner |
 
-仓库内没有发现其他 package import `@pi/codex-usage-status` public exports；README、L1/L2/L3 文档是说明引用而非运行时调用方。L2 既有文档所指向的 `/Users/zhoukailian/.pi/agent/extensions/subagent/fast-inheritance.ts` 当前工作环境不存在，因此不能把该 external dispatcher 视为已验证调用方；协议 duplication drift 保留并标为待验证。
+仓库内存在 `packages/subagent` 对 `@pi/codex-usage-status/interop` public export 的动态 import 与 consumer 接线，因此不能将本协议描述为 package-only，也不能称仓库 consumer 不存在。区分验证范围：本 package 自身测试覆盖 producer/bootstrap；仓库 consumer 集成自动化覆盖 interop parser、事件消费和环境生成；真实 child process、provider 与 TUI 的端到端组合尚未验证（pending）。这类 automated integration 不等于真实运行时 E2E。
 
 ## 4. `fast-gpt-v1` 已实现运行合同
 
@@ -105,7 +105,7 @@ model.id.slice("gpt-".length) 非空且不含空白字符
 
 Active 时保持现有行为：仅 plain-object payload 且 `payload.model` 精确等于当前模型 id 时返回浅复制 `{ ...payload, service_tier: "priority" }`；无效 payload、model 不匹配、非 Active 返回 `undefined`。保留原 payload 与嵌套引用，不把 `service_tier` 写回原对象。
 
-该 hook 的返回值只证明本扩展产生了 priority 请求输出。Pi 0.84.4 没有最终 payload 或最终持久化 message 的可观测 hook；若后续 `before_provider_request` handler 改写/移除该 tier，或 provider 不接受该字段，本 package 不能证明 provider 最终采用 priority、实际加速或最终费用。Fast Active 和 Spark/default quota 展示均不得作此证明。
+该 hook 的返回值只证明本扩展产生了 priority 请求输出。Pi 0.84.4 没有最终 payload 或最终持久化 message 的可观测 hook；若后续 `before_provider_request` handler 改写/移除该 tier，或 provider 不接受该字段，本 package 不能证明 provider 最终采用 priority、实际加速或最终费用。对 `message_end` cost 修正及最终持久化 cost，同样要求没有其他 handler 改变模型/session 匹配输入、usage token 字段或本扩展已修正的 `usage.cost`；这些输入/结果被改变时，只能保证本扩展自己的 hook 输出，不能保证最终持久化 session cost。Fast Active 和 Spark/default quota 展示均不得作此证明。
 
 ### 4.3 FIFO ticket 与 cost policy（已实现）
 
@@ -153,7 +153,7 @@ usage DTO 只读取默认 `rate_limit` primary/secondary；`additional_rate_limi
 - `src/interop.ts` 产生严格的 `@pi/codex-usage-status:fast-requested/v1` 事件，payload 为无额外字段 `{ version: 1, sessionId, requested }`。
 - `PI_CODEX_FAST=1` 只作为 child 一次性 advisory bootstrap，factory 启动即删除；缺失或非精确值 Off；reload/new/resume/fork 重新 Off。
 - launcher 在实际 spawn 时按 session id 快照 requested，并只对 resolved USER-source、exact `implementer`/`code_reviewer`、frontmatter `codexFast: inherit` 的 child 传递环境变量；project source、同名 project override 和其他 user agent 不继承。
-- role/source/config policy 与真实 child process/provider E2E 不属于 package-only VERIFIED 证据。当前外部 consumer 文件路径不存在，不能声称 local dispatcher live E2E 已通过。
+- `packages/subagent` 的仓库内 consumer 及其 role/source/config policy 已有源码接线和自动化集成覆盖；这不是 package-only 验证，也不证明真实 child process/provider E2E。真实 child process、provider 与 TUI 运行时组合仍未验证（pending），不能声称 live E2E 已通过。
 
 本阶段和后续实现完成后的最终本地启用也不在本轮执行：方案要求在评审 commit 后创建独立 detached deployment worktree（不用于继续开发），仅替换 `~/.pi/agent/settings.json` 中原 `codex-usage-status` package 路径，保留旧路径回滚；用户需 `/reload` 后 `/fast on`。真实 provider smoke 若未执行必须保留 `pending`。
 
@@ -183,22 +183,21 @@ usage DTO 只读取默认 `rate_limit` primary/secondary；`additional_rate_limi
 - `/fast` 空参数、`on`、`off`、`toggle`、`status`、非法参数、JSON/print/RPC 行为保持。
 - known 文案尽量不变；unknown 激活、status、known→unknown 和 unknown→unknown 都包含 priority 仅为请求意图、usage cost 未校正/不保证；unknown→known 不遗留 caveat；通知 focused test 通过。
 - Fast 仍只通过合并 widget 展示；无独立 `codex-fast` status；命令刷新不触发 OAuth/fetch/timer；模型切换、shutdown、late result 和第二 factory Off reset 保持。
-- parent event/env exact parser、one-shot delete、session isolation、selected child policy 和既有 parity 事实保持；外部 dispatcher live E2E 未执行则标 `pending`。
+- parent event/env exact parser、one-shot delete、session isolation、selected child policy 有 package 测试及仓库 `packages/subagent/test/fast-inheritance.test.ts` consumer 集成自动化覆盖；真实 child process/provider/TUI live E2E 未执行，标为 `pending`。
 
 ### 7.4 全量验证入口与未验证项
 
-本轮已执行仓库门禁与 focused tests：
+合并后代码验证记录（上一轮代码验证；不是本次文档修复的重跑结果）：
 
 ```text
-npm test                         522 passed
+npm test                         807 passed
+fast-mode.test.ts focused tests  21 passed
 npm run typecheck                passed
 git diff --check                 passed
-fast-mode.test.ts                20 passed
-usage.test.ts                    21 passed
 Markdown 相对链接检查            passed
 ```
 
-真实 Pi TUI/provider smoke、真实 child process/provider E2E、外部 dispatcher live E2E 不是本轮已执行证据，继续保留 `pending`；本轮禁止 live 收费 provider 调用。
+这些自动化结果包含 package tests 和仓库内 consumer 集成测试，不等于真实 Pi TUI/provider 或真实 child process/provider E2E。上述 live E2E 未执行，继续保留 `pending`；未进行真实收费 provider 调用。
 
 ## 8. 方案采纳与代码评审状态
 
