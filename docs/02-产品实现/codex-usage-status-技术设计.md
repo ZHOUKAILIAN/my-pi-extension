@@ -36,7 +36,7 @@ flowchart LR
 
 以下为基准 `02c087ea` 经本轮 `fast-gpt-v1` 实现后的运行事实：
 
-- `src/fast.ts` 的 `FAST_MODEL_IDS` 保留 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`，并经 `src/index.ts` 继续导出；它仅是 known pricing/cost correction 集合，不再是 eligibility allowlist。
+- `src/fast.ts` 的 `FAST_COST_CORRECTION_MODEL_IDS` 为 canonical 费用修正型号集合，包含 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra`，并经 `src/index.ts` 导出。`FAST_MODEL_IDS` 保留为指向同一数组的 deprecated public compatibility export；两者均不是 eligibility allowlist。
 - `isFastEligible()` 对精确官方 Codex provider/API/base URL/OAuth gate 之外，接受所有精确小写 `gpt-` 前缀、非空且无空白 suffix 的型号，覆盖 Astra、mini、spark 与未来未知 GPT。
 - `FastController.rewriteProviderPayload()` 对所有 eligible、plain-object 且 `payload.model === context.model.id` 的 payload 返回浅复制，并创建最多 32 项 FIFO ticket；ticket 保存 request-time model/session 与 known/unknown cost policy。
 - `FastController.rewriteAssistantMessage()` 按 ticket 首项匹配 provider/API/model/session；旧五型号按既有规则修正 cost，unknown ticket 消费后保留原 `usage.cost`，不扫描跳过；mismatch、malformed usage、session 不一致和 shutdown 保持 fail open/清理边界。
@@ -64,7 +64,7 @@ flowchart LR
 | 导出符号/契约 | 定义位置 | 当前调用方/影响点 |
 | --- | --- | --- |
 | `FastController`、`FastContextLike`、`FastState`、`FastDisplaySnapshot`、`FastDisplayTheme` | `src/fast.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建并调用；`test/fast-mode.test.ts` 直接实例化/断言；`src/usage.ts` 消费 `FastDisplaySnapshot`/`formatFastDisplay` |
-| `FAST_MODEL_IDS`、`isFastEligible`、`getFastState`、`formatFastDisplay`、`FAST_STATUS_CONSTANTS` | `src/fast.ts`，经 `src/index.ts` 导出 | `FAST_MODEL_IDS` 由 `test/fast-mode.test.ts` 作为 known pricing 兼容导出断言；`isFastEligible` 独立负责全合法 `gpt-*` eligibility；其余调用方保持不变 |
+| `FAST_COST_CORRECTION_MODEL_IDS`、deprecated `FAST_MODEL_IDS`、`isFastEligible`、`getFastState`、`formatFastDisplay`、`FAST_STATUS_CONSTANTS` | `src/fast.ts`，经 `src/index.ts` 导出 | `FAST_COST_CORRECTION_MODEL_IDS` 是 canonical 费用修正集合；`FAST_MODEL_IDS` 指向同一数组以兼容既有消费者；`isFastEligible` 独立负责全合法 `gpt-*` eligibility；其余调用方保持不变 |
 | `FAST_REQUESTED_EVENT`、`parseFastRequestedEvent`、`publishFastRequested`、`consumeFastBootstrap`、`FAST_ENV_NAME` | `src/interop.ts`，部分经 `src/index.ts` 导出 | 本 package 的 `src/index.ts` 发布事件并消费 bootstrap；仓库 consumer `packages/subagent/src/fast-inheritance.ts` 通过 public `@pi/codex-usage-status/interop` 动态 import parser，`packages/subagent/src/index.ts` 接入 consumer；`packages/subagent/test/fast-inheritance.test.ts` 自动化覆盖该仓库集成。真实 child process/provider/TUI 端到端仍未验证 |
 | `UsageController`、`fetchUsageSnapshot`、`parseUsagePayload`、`formatUsageSnapshot`、`formatProgressBar`、`USAGE_STATUS_CONSTANTS` | `src/usage.ts`，经 `src/index.ts` 导出 | `src/index.ts` 创建/调用 `UsageController`；`test/usage.test.ts` 直接调用；本轮不改变这些额度导出符号的语义 |
 | default export `codexUsageStatusExtension` | `src/index.ts` | Pi package manifest `package.json.pi.extensions` 加载；`test/fast-mode.test.ts` 用 mock ExtensionAPI 注册/触发 hooks |

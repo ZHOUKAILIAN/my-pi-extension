@@ -1,16 +1,18 @@
 import { calculateCost, type Model, type Usage } from '@earendil-works/pi-ai';
 import { FAST_ENV_NAME } from './interop.ts';
 
-// Compatibility export: these IDs are the known pricing models, not the
-// eligibility allowlist. Every valid lowercase `gpt-<non-whitespace suffix>`
-// is Fast-eligible; only these models receive known cost correction.
-export const FAST_MODEL_IDS = [
+// These IDs are the known cost correction models, not the eligibility allowlist.
+// Every valid lowercase `gpt-<non-whitespace suffix>` is Fast-eligible.
+export const FAST_COST_CORRECTION_MODEL_IDS = [
   'gpt-5.4',
   'gpt-5.5',
   'gpt-5.6-luna',
   'gpt-5.6-sol',
   'gpt-5.6-terra',
 ] as const;
+
+/** @deprecated Use FAST_COST_CORRECTION_MODEL_IDS. */
+export const FAST_MODEL_IDS = FAST_COST_CORRECTION_MODEL_IDS;
 
 const FAST_PROVIDER = 'openai-codex';
 const FAST_API = 'openai-codex-responses';
@@ -53,8 +55,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return prototype === Object.prototype || prototype === null;
 }
 
-function isKnownPricingModel(model: FastModel | undefined): boolean {
-  return model !== undefined && FAST_MODEL_IDS.includes(model.id as (typeof FAST_MODEL_IDS)[number]);
+function isFastCostCorrectionModel(model: FastModel | undefined): boolean {
+  return model !== undefined && FAST_COST_CORRECTION_MODEL_IDS.includes(model.id as (typeof FAST_COST_CORRECTION_MODEL_IDS)[number]);
 }
 
 function hasEligibleGptId(model: FastModel): boolean {
@@ -130,7 +132,7 @@ type FastCostPolicy =
   | { readonly kind: 'unknown' };
 
 function costPolicyForModel(model: FastModel | undefined): FastCostPolicy {
-  if (model !== undefined && isKnownPricingModel(model)) {
+  if (model !== undefined && isFastCostCorrectionModel(model)) {
     return { kind: 'known', multiplier: model.id === 'gpt-5.5' ? 2.5 : 2 };
   }
   return { kind: 'unknown' };

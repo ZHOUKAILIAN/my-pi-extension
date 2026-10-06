@@ -19,6 +19,7 @@ function asFastContext(context: ExtensionContext): FastContextLike {
 export {
   FastController,
   FAST_ENV_NAME,
+  FAST_COST_CORRECTION_MODEL_IDS,
   FAST_MODEL_IDS,
   FAST_STATUS_CONSTANTS,
   formatFastDisplay,
