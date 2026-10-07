@@ -61,13 +61,16 @@ flowchart LR
 
 ## 开始阅读
 
-1. [五层文档总览](docs/README.md)
-2. [L1 产品上下文摘要](docs/01-产品定义/产品上下文摘要.md)
-3. [L1 权威产品定义](docs/01-产品定义/领域术语.md)
-4. [Feature 产品规范](docs/01-产品定义/扩展/feature-扩展.md) / [Fix 产品规范](docs/01-产品定义/扩展/fix-扩展.md) / [Subagent Dispatcher 产品规范](docs/01-产品定义/扩展/subagent-扩展.md)
-5. [L2 当前实现与 drift](docs/02-产品实现/README.md)
-6. [L2 Runtime 实现架构](docs/02-产品实现/runtime-实现架构.md) / [Subagent Dispatcher 技术设计](docs/02-产品实现/subagent-dispatcher-技术设计.md)
-7. [L3 仓库组织](docs/03-项目落地/仓库组织.md) / [扩展目录](docs/03-项目落地/扩展目录.md)
+按你关心的功能直接进入，文档正文说明当前规则、实现和缺口，不要求先读变更历史或逐层通读。
+
+| 想了解什么 | 阅读入口 |
+| --- | --- |
+| Codex 额度与 Fast | [产品规范](docs/01-产品定义/扩展/codex-usage-status-扩展.md) · [技术设计](docs/02-产品实现/codex-usage-status-技术设计.md) |
+| 通用 Subagent | [产品规范](docs/01-产品定义/扩展/subagent-扩展.md) · [技术设计](docs/02-产品实现/subagent-dispatcher-技术设计.md) |
+| Fix 问题处置 | [产品规范](docs/01-产品定义/扩展/fix-扩展.md) · [技术设计](docs/02-产品实现/fix-runtime-technical-design.md) |
+| Workflow 共享机制 | [Core 定义](docs/01-产品定义/领域术语.md) · [Runtime 架构](docs/02-产品实现/runtime-实现架构.md) |
+| 安装、配置与 package | [仓库组织](docs/03-项目落地/仓库组织.md) · [项目配置](docs/03-项目落地/项目配置.md) |
+| 文档归属与更多任务 | [五层职责](docs/README.md) · [文档地图](docs/03-项目落地/文档地图.md) |
 
 Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
