@@ -492,7 +492,7 @@ Pi 0.84.4 事实边界：`tool_call` 可在执行前 block；`tool_result` 提�
 
 #### L1 执行结果合同的 v2 回归门禁
 
-v2 必须原样继承当前基线 §5 已实现、L1 §9重新确立的合同，不得因 Call/Delegation WAL 引入第二套 attempt outcome：
+v2 必须原样继承当前基线 §5 已实现、[L1 执行反馈](../01-产品定义/扩展/subagent-扩展.md#3-怎样理解返回结果)拥有的合同，不得因 Call/Delegation WAL 引入第二套 attempt outcome：
 
 - `FailureKind` 闭集固定为 `success | incomplete | cancelled | transient_provider | non_transient_provider | unknown_transport | task_failure`；每attempt可选`phase=running|finished`且只作生命周期投影。running/isPartial不画终局失败。
 - 裁决顺序固定为：local abort → process/protocol/current-terminal完整性 → assistant aborted → 当前assistant error自身的provider分类 → stop/length非零exit → length → stop。
@@ -742,7 +742,7 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 
 ### 9.14 最终复审逐 finding 关闭映射
 
-> 2026-09-14 两条独立评审轴已在固定 proposal revision 上复核下表；全部 required Findings 为 `resolved_fixed`。这里关闭的是目标设计 Finding，不表示 v2 源码、测试或运行验证已经完成。
+> 历史评审映射，表内 L1 章节号指[重组前的固定文本](../归档/评审/subagent-产品规范重组前快照.md)，不作为现行导航。当前产品保证由 [L1](../01-产品定义/扩展/subagent-扩展.md)拥有，工程场景见本文 §10。设计 Finding 关闭不表示源码、测试或运行验证完成。
 
 | ID | 决策 / finding | 唯一规则 owner | Acceptance / 目标证据 | 最终关闭状态 |
 | --- | --- | --- | --- | --- |
@@ -797,3 +797,57 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 | capability aggregation | `capability-gate.ts` 维护闭集 `bridge/adoption/sideEffectFenceDeployment/darwinProcessProof/deliveryHost/controlAdapters/providerOsE2E`；普通对象不能伪造 evidence，任一缺失则 `publicV2=false`，且 slice7 `rootWiring=0` 永远关闭。 | 不改变现有 `delegationFoundationCapability()` 兼容返回值；当前所有 public v2 capability 仍 false。 |
 
 slice7 新增 focused tests 覆盖 forged/version/test-proof、prepared crash resume、source-lock admission barrier、malformed/symlink/hardlink/live/unknown source、pin/copy/idempotency/concurrency、人工时钟下 30 天 pin、rollback freeze/planned resume、rename 前/后与 ledger 后 fault convergence、唯一 quarantine destination、prepared/adopted/failed/frozen cleanup 的实际调用与 WAL=0、capability closed gate；未声称真实 30 天窗口、真实 bridge binary、Darwin death、power-loss 或 provider/OS E2E。
+
+## 10. 工程验收矩阵
+
+| 说明 | 边界 |
+| --- | --- |
+| 产品 owner | [L1 产品规范](../01-产品定义/扩展/subagent-扩展.md)拥有用户行为和保证；本表承载对应的协议、故障注入和回归检查，不独立改写产品语义。 |
+| 编号 | S1–S43 保留既有检查要求；章节链接按当前文档位置调整。 |
+| 当前状态 | 验收要求不是通过记录。公开 v2 未启用；当前实现与证据缺口见 §9.12 及后续模块状态。 |
+
+| 编号 | 可执行场景 | 通过条件 |
+| --- | --- | --- |
+| S1 | single/parallel/chain admission 与 startup pre-execution | Dispatch Call 与每个实际 task unit 在 discovery/spawn 前持久化；非法 shape 不建记录。Startup 扫描当前 active lineage 全部非终态 durable records，只能先 durable CAS/owner-fenced 归一，扫描本身 resolution/spawn/reattach/send=0。 |
+| S2 | `agent=implement`，canonical 为 `implementer` | raw candidates 先做 realpath/trust 校验；合法 project-over-user shadow 不算 duplicate；唯一 effective match 原子绑定 `source + discoveryRootRealpath + fileRealpath + digest`。 |
+| S3 | resolver 负向矩阵 | 越界/悬空 symlink、非法 raw candidate、effective-set duplicate canonical、alias↔canonical、alias↔alias、unknown target 全部 fail closed 到 `paused_configuration`，spawn=0；名称问题不伪装 provider failure。 |
+| S4 | startup reserve/binding 回放 | 唯一边为 `admitted/bound(canonical-bound) --initial_reserved--> initial_ready(reservationId) --spawn_started--> initial_running` 与 `recovery_ready --cycle_reserved(+1)--> cycle_ready(reservationId) --spawn_started--> recovery_running`。startup 发现既有 reserved event 只投影对应 ready(reservationId)，reserve append/计数均为0；canonical admitted/bound无reserve仍停原投影并交reservation executor。每次转移先 CAS/fenced claim，同 `(scope, continuationEpoch, fence generation)` 第二个 spawn intent被拒。 |
+| S5 | post-spawn child 生死回放 | `spawn_started/spawned` 后只 reattach 身份匹配的 live child；dead child 且无 return 时同 reserve respawn=0，下一 spawn 先 durable 新 cycle +1；initial dead 进入 cycle 1。 |
+| S6 | 三层预算 | 每个 Delegation 至多一次 initial spawn/execution；pre-spawn 显式取消时 initial=0，正常受理且未取消时 initial≤1。initial 不计 cycle；每 cycle 每模型 initial+最多2个闭集瞬态 retry，再有序 fallback；仅允许 recovery cycle 1/2/3。initial + 三轮 recovery 最多 4 次逻辑 child spawn（reattach 不计）；cycle 4 与第 5 次总逻辑 spawn均为 0。 |
+| S7 | 配置修复/人工确认 continuation | 每次有效决定单调增加 `continuationEpoch` 且决定本身不加 cycle；只允许继续 admission、使用未 spawn reserve或 reattach live child；dead child replacement 仍新建 cycle。 |
+| S8 | supervisor 混合状态与 owner transfer | 普通 recovery 只 claim `recovery_ready`。pre-spawn transfer仅在fenced WAL两次稳定证明从未`spawn_started`、无child/live ref、无action intent/outstanding action时要求旧supervisor death proof，child absence只记WAL/no-ref proof且不得虚构child death。任何历史`spawn_started`后才要求supervisor+child death proof及action reconciliation。lease TTL、单次`kill(0)`、revoke/terminate/terminal ACK均不能替代。Darwin同PID但稳定可读birth identity mismatch经identity lock内两次稳定观察即为原进程death proof且绝不signal复用PID；birth缺失/不可读/观察不稳定才`paused_integrity`、spawn=0。 |
+| S9 | cancel/interruption | shutdown/reload/signal/timeout/不明 aborted 只记 interruption。显式取消先 durable `cancel_requested`并阻止新spawn/intent。通常pre-spawn scope按无spawn/child/action事实封存reservation或写no-reservation fact后直接`cancelled`，不虚构death；post-spawn须terminate/wait、death证明与action对账。`paused_configuration`必须按Delegation历史分流：历史从未`spawn_started`才走pre-spawn completion，历史曾spawn则必须证明历史child已终止并对账outstanding action后才cancelled。resolution executor每次行动前重读fenced cancel；unresolved→`paused_uncertainty`，post-spawn死亡不可证明→`paused_integrity`；覆盖paused_configuration两条历史、cancel WAL后且从未spawn的恢复、cancel WAL后/terminate前、terminate后/outcome前、in-flight action cancel。 |
+| S10 | active lineage | 相同 parent/anchor 但 sibling fork/tree lineage 不 claim、不通知；只有相同 activeLineageId + anchor + pre-binding/canonical identity 才可继续。in-memory parent 仅进程内恢复并明确反馈。 |
+| S11 | chain cancel 与顺序 | 严格 `NEXT→admit→execute/recover→returned→advance cursor`；任一step显式取消后等待其严格取消完成，future step admission/spawn=0并只记`not_admitted_due_to_call_cancel`；全部required step slots达到取消终止条件后Call=`cancelled`，success aggregate=0。仅全部 required steps returned 才正常聚合。 |
+| S12 | parallel item/call-wide cancel | item cancel只取消该item、其他item继续，最终按原index聚合且包含该item=`cancelled`。call-wide cancel停止新admission，并把每个required slot恰好结算为三类：cancel前已returned→不可变`returned_before_call_cancel`；已admit非终态（含`resolution_ready`）→按S9收敛`cancelled`；未admit→`not_admitted_due_to_call_cancel(index)`且Delegation/spawn=0。三类全终态后Call outcome=`cancelled`；不生成/声称partial-success aggregate，但status/query按原index显示取消前返回项。startup/并发cancel/kill幂等补齐且禁止改写returned。 |
+| S13 | Call 最终门禁与取消通知 | paused/progress 不是 final outcome/delivery。正常item-cancel/chain只有满足其正常终止条件才生成aggregate；call-wide cancel三类slots全部终态后只生成Call cancelled outcome与独立proof，不生成partial-success aggregate。原调用interrupted时稳定deliveryId取消custom message同branch可见≤1；投递不可证明不重发且status可查询。 |
+| S14 | canonical revision | 同 name/source/root/file 的 digest变化只有`config_revision_accepted`后继续；跨source/name/root/path更新拒绝。 |
+| S15 | recovery completion message | 原 tool call 保持 interrupted；恢复只新增带稳定 deliveryId 的 custom message，不补写原 toolResult。单 active branch 可见同 deliveryId 消息至多 1 条。 |
+| S16 | recovery outbox 崩溃窗口 | durable outbox、active-branch receipt scan 与单 owner/fencing 生效；无法证明已投递时不重发、状态为 queryable uncertainty，不声称 exactly-once/至少一次。主 Agent 可按稳定 id 查询结果。 |
+| S17 | side-effect intent/result ACK | recovery-managed child以`--no-extensions`启动，只按版本固定allowlist顺序显式`-e`加载必要custom-tool extension，fence interceptor最后加载；ambient/auto-discovered extension=0。所有tool name/args改写必须在interceptor前完成；interceptor hash/持久并ACK最终输入，之后handler改写=0。仅Policy需fence工具在intent ACK前执行=0；result ACK基于最后middleware result，失败由独立watchdog终止并暂停。加载顺序/排他性不可证明时该工具自动恢复=0并进入`paused_integrity/uncertainty`。 |
+| S18 | 身份与 canonical revision 组合场景 | 并行两个相同 requestedTarget/cwd/discoveryScope item 仍有独立 Delegation；pre-binding 配置修复不换 id；同 canonical name/source/root/file 的 digest 只有 `config_revision_accepted` 后更新；跨 source/name/root/path 自动 rebind=0。 |
+| S19 | `persistent:false` | admission 明示行为/隐私变化与 cancel/query/`subagent_delete` 入口；Call/Delegation/private payload 保留，Child 不保留；中断可 retry-new-session，不能称完全向后兼容。 |
+| S20 | v1 adoption/rollback | bridge-v1必须先发布/安装并用真实bridge binary验证可识别独立受保护preservation marker及30天mtime/GC/rollback边界；未安装bridge时既有v1 adoption=0并保持legacy explicit-handle-only。adoption只复制/分叉到独立v2 namespace；当前更老v1 binary不承诺保护v2 adoption或直接安全回滚。rollback仍要求death proof、outstanding action=0且无in-flight outbox。 |
+| S21 | Child quarantine、namespace 与 GC | v1/v2/live Delegation 引用不被跨 namespace 删除；固定锁序无死锁；崩溃残留可重入清理。 |
+| S22 | Pi 0.84.4 interceptor E2E | `--no-extensions` + allowlist `-e` + interceptor-last 的实际加载清单/version/digest均可证明；真实 custom tool 覆盖 return-isError/throw、前置args rewrite、后续handler改写反例与最终result rewrite。interceptor持久hash必须等于实际执行输入，result ACK必须等于最终middleware result；排他性失败或ACK失败时watchdog杀child并暂停。 |
+| S23 | IPC 与进程隐私 | argv/process list、IPC endpoint/frame、伪造/旧 generation ACK、临时 prompt 权限与异常/重启清理全部通过负向测试，无敏感原文公开泄漏。 |
+| S24 | 保留与查询 | 30 天到期只触发 eligibility 检查。active/nonterminal、任一 uncertainty、pending/sending/uncertain delivery、outstanding action、active claim/live child/外部 live reference 一律 retention 不 eligible，原文/private/proof不得删除；状态继续可查询。只有满足 S43 的终态对象才可 fenced cleanup。 |
+| S25 | Fast 回归 | 仅第一个 logical child 首次 spawn 可命中；provider retry/fallback、resume、replacement、continuation 和 crash replay 注入次数均为 0。 |
+| S26 | 真实进程/生命周期 E2E | headless + PTY/TUI/provider覆盖crash/restart、active/sibling lineage、parallel、chain、owner fencing、side-effect、notification与delete/reference kill points；pre-spawn transfer证明无child事实但不生成child death，post-spawn transfer证明双death/action。Darwin覆盖同PID birth mismatch（判原进程death且signal=0）、birth不可读/缺失/两次观察不稳定（paused）、直属waitpid与两个真实Node进程kill/restart；不以TTL、单次kill0、mock或不可用pidfd措辞替代。 |
+| S27 | 五种 side-effect 人工处置与引用释放 | succeeded不重做；not_started/safe-to-retry增加continuationEpoch；still_unknown保持暂停；cancel走严格状态机；dead child后续spawn仍消耗新cycle。action/cancel未对账时`reference_release_eligible=false`、single delete=0；对账完成仍须满足normal/custom final delivery与全部slot终态，再按S40事务生成proof/release。 |
+| S28 | startup reconciler 全状态矩阵 | active lineage 的 admitted/prebinding/resolving、bound、已有reserved event、spawned-live、spawned-dead分别归一/路由到`resolution_ready`、bound reservation executor、`initial_ready/cycle_ready(reservationId)`、reattach-only、recovery_ready；startup已有reserve时append reserve/count=0。paused/cancel/delete/terminal/delivery complete走专门reconciler/终态；`paused_configuration` cancel按Delegation完整spawn历史分流。pre-spawn owner transfer两次稳定观察WAL/no-ref且只证明supervisor death，post-spawn才要求child death/action。parallel call-wide cancel回放按同fence保留returned-before-cancel、推进admitted非终态cancel、补齐未admit占位，三类全终态后Call cancelled。并发startup重复执行/spawn/count=0。 |
+| S29 | `subagent_delete` 权限、引用完整性、幂等与崩溃 | 只有同parent/active lineage actor可删；active child、取消未完成、uncertain action、未完成custom delivery、未证明normal delivery、live v1 adoption ref均fail closed。single preflight只检查`reference_release_eligible`；false时delete/prune=0，true时同一fenced WAL事务按独立非private proof→reference_released→delete_requested→prune执行，无先release循环。single删除后proof保留；whole-Call delete必须进入S43共享`call_cleanup_requested` lifecycle，不能直接删proof/private records。 |
+| S30 | 运行中 `subagent_cancel` 控制面 | tool/command/RPC/UI共享同一control service；command/UI在当前child tool运行期间无需等待下一LLM call即可durable写`cancel_requested`并返回receipt。同parent+active lineage、target/scope组合、item/call-wide语义均fail closed；并发重复请求只有一个append winner且反馈区分requested/already_requested/completed。 |
+| S31 | `subagent_delivery(action=abandon)` | 仅同parent+active lineage actor可把pending/sending/uncertain delivery写成`delivery_abandoned(no_future_send)`；resend/requeue=0，重复abandon幂等，已receipted不倒写。status不做control/send/delete；仅S39允许把既有host normal toolResult写成幂等observation。 |
+| S32 | Darwin death-proof adapter | durable process identity含host、PID、process birth/start identity、child session/path与argv digest；直属进程由waitpid裁决。重启后Darwin inspection中，PID不存在或同PID但稳定可读birth identity mismatch，经identity lock内两次稳定观察即证明原进程死亡；复用PID signal=0。同PID同birth但session/path/argv不匹配为integrity事故；仅birth identity缺失/不可读、权限不足或观察不稳定才`paused_integrity`。transfer另按S8区分pre/post-spawn并要求相应action事实。 |
+| S33 | `FailureKind` 闭集与表面映射 | 唯一闭集恰为`success/incomplete/cancelled/transient_provider/non_transient_provider/unknown_transport/task_failure`；API、registry、metadata、Tool details/UI对同attempt一致。每attempt的`phase`仅可选为`running|finished`并只作生命周期投影；缺失兼容历史记录，不新增验收状态。 |
+| S34 | 固定终态裁决顺序 | 同一fixture组合本地abort、signal/协议失败、aborted/error、非零exit、length/stop时严格按[§5 固定裁决顺序](#5-当前基线执行结果分类重试与-fallback)得唯一FailureKind；最终provider分类只读当前error自身status/errorMessage，旧tool/provider/stderr不污染。 |
+| S35 | terminal候选失效 | stop/error/aborted/length候选后出现assistant `message_start`、assistant `toolUse`或任一tool execution事件时旧候选失效；无新terminal→`unknown_transport`。普通`turn_end/agent_end`后候选仍有效。 |
+| S36 | 业务失败与过程工具错误 | 测试/命令失败但Child正常交回报告→`success`并显示“已返回”，同时保留脱敏tool diagnostics且不称验收通过；过程tool error不产生`task_failure`、不触发provider retry/fallback。 |
+| S37 | single/chain/parallel反馈传播 | single附报告+固定中性诊断段；chain仅failureKind非success停止，并传前一步报告+同段，即使无`{previous}`也不丢；parallel按原序保留每项FailureKind/报告/同段并显示“已返回N/M”，不用succeeded/通过。固定段恰为`[执行诊断：不代表验收结论；工具异常 N；模型异常 M]`。 |
+| S38 | call-wide cancel已返回项 | cancel与return竞态由同一Call owner fence线性化；cancel前returned slot只写不可变`returned_before_call_cancel`且不被倒写cancelled，非终态admitted最终cancelled，未admit写占位；三类齐全后Call=cancelled，partial-success aggregate=0，status仍可展示已返回项。 |
+| S39 | normal toolResult delivery proof | execute返回后尚无宿主持久化证明时delete=0。后续delete/status只在同active lineage扫描到唯一、与originalToolCallId匹配的host-persisted toolResult后幂等写`normal_tool_result_observed`；其等价final delivery complete。跨lineage/缺失/重复匹配fail closed，不声称返回前原子持久。 |
+| S40 | reference release无循环 | single delete preflight不要求proof/release已存在，只计算`reference_release_eligible`；false时WAL delete/prune=0，true时同一fenced WAL事务严格proof确认/写入→release→delete_requested→prune，全部kill points重放幂等且不越序。 |
+| S41 | Call Aggregate Proof与GC | proof为独立非private Call对象，覆盖slot/order/outcome与有界安全ref。single Delegation删除不删proof；whole-Call delete或normal retention只有进入S43共享fenced cleanup lifecycle、按引用顺序级联后才删除proof/private records并留五普通字段+actorScopeTag最小tombstone30天；不得直接GC proof。 |
+| S42 | attempt diagnostics完整契约 | 每attempt可选`phase=running|finished`；新runner始终输出`toolErrorCount/providerErrorCount`两个非负安全整数，历史缺任一字段逐项显示“未提供”且不解释为0；100条等有界tool详情截断不改变全量计数；所有投影无敏感/raw payload。running/isPartial只显示progress且无终局失败图。single/chain/parallel严格按S37传播固定中性段。目标实现与回归证据见[§5](#5-当前基线执行结果分类重试与-fallback)、[§9.8](#98-dispatch-call-编排delivery-proof-与-recovery-notification)和[§9.11](#911-验证矩阵目标)。 |
+| S43 | normal retention / whole-Call共享cleanup | normal retention不得直接删除。`retention_eligible`仅在Call/slots终态、final delivery/proof完整且无active/nonterminal/uncertain/pending delivery/action/active claim/live child/外部live ref时成立；随后与whole-Call delete共用`call_cleanup_requested`冻结→复核terminal/delivery/proof→按reference顺序release/级联Delegations→删除private records/CallAggregateProof→最小tombstone→`cleanup_complete`。startup在任一kill点幂等续做。single orphan Delegation也须terminal、无live refs/actions后走fenced cleanup；否则删除为0。目标WAL、锁序和kill E2E见[§9.3](#93-delegation-wal-与崩溃一致性)、[§9.9](#99-persistentfalsev1v2-namespace回滚与-gc)、[§9.10–§9.11](#910-崩溃点矩阵)。 |
