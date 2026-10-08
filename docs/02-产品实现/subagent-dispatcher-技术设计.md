@@ -40,7 +40,7 @@ flowchart TD
 | `packages/subagent/src/index.ts` | Pi extension factory、tool schema、TUI renderer、parent lifecycle。 | 已实现；Pi entry 为 `src/index.ts` |
 | `packages/subagent/src/agents.ts` | v1 user/project discovery；v2 raw candidate collection 额外执行 owner/mode/realpath/symlink 边界校验并解析 aliases。 | 已实现并测试；v1 discovery 兼容保留 |
 | `packages/subagent/src/session-identity.ts` | logical handle、child session 路径/身份派生与 parent/cwd/agent 隔离。 | 已实现并测试 |
-| `packages/subagent/src/runner.ts` | JSON-mode child lifecycle、stdout capture、重试、fallback、错误分类。 | 已实现；stdout `processLine` 仅 fail-closed 校验本实现明确建模的 Pi 0.84.4 JSON event 子集；`validateSessionFile` 的恢复边界严格仅为 on-disk `SessionEntry` JSONL（header 后不接受 stdout event）。stdout/session wire header 固定 `version=3`，on-disk header 另行兼容 v1/v2/v3（含迁移前缺省 v1 version）。不声称覆盖 Pi 其他未建模扩展、未来/真实跨版本、provider、Darwin 或跨进程 E2E。 |
+| `packages/subagent/src/runner.ts` | JSON-mode child lifecycle、stdout capture、重试、fallback、错误分类。 | 已实现；stdout `processLine` 仅 fail-closed 校验本实现明确建模的 Pi 1.1.0 JSON event 子集（保留既有历史 fixture 兼容，不承诺任意未来字段）；`validateSessionFile` 的恢复边界严格仅为 on-disk `SessionEntry` JSONL（header 后不接受 stdout event）。stdout/session wire header 固定 `version=3`，on-disk header 另行兼容 v1/v2/v3（含迁移前缺省 v1 version）。不声称覆盖 Pi 其他未建模扩展、未来/真实跨版本、provider、Darwin 或跨进程 E2E。 |
 | `packages/subagent/src/session-lock.ts` | v1 Child identity lock；v2 execution 在 `v2/` 下复用同一 fail-closed lock primitive 做 reserve/spawn/recovery 临界区。 | 已实现并测试；owner-transfer 的 Darwin birth/PID reuse 与真实跨进程验证仍待验证 |
 | `packages/subagent/src/gc.ts` | 30 天本地 child session / metadata 清理。 | 已实现并测试；切片0在原 v1 identity lock 内校验 bridge preservation pin |
 | `packages/subagent/src/execution-supervisor.ts` | owner identity/generation、fencing、双重稳定 owner/child death predicate、pre-spawn transfer 规则、child reconciliation 与 startup normalization；identity-tuple probe 为注入式且不发 signal。 | foundation 已实现并有 targeted contract/probe tests；Darwin birth/PID reuse 与真实跨进程 E2E 未验证 |
@@ -113,7 +113,9 @@ sequenceDiagram
   D-->>Main: result, handle, actual model, attempts
 ```
 
-runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和 Pi 0.84.4 的 `tool_execution_end.result`；不得继续监听不存在的 `tool_result_end`。child `close` 的 signal exit、空 stdout、缺 header、任一截断/无效非空 JSONL 记录或缺 terminal JSON 必须为失败，不能把 `code === null` 归零成功。
+runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和 Pi 1.1.0 的 `tool_execution_end.result`；不得继续监听不存在的 `tool_result_end`。child `close` 的 signal exit、空 stdout、缺 header、任一截断/无效非空 JSONL 记录或缺 terminal JSON 必须为失败，不能把 `code === null` 归零成功。
+
+Pi 1.1.0 的 stdout 与 on-disk session 双边界定向校验已建模字段，包括 assistant 的 `durationMs/thinkingLevel/providerThinkingLevel`、tool result 的 `durationMs/usage/nestedCalls`、工具结束时长和 `agent_settled.aborted`；system `toolsAdded` 按 Tool 字段闭集及 `constrainedSampling` 类型校验，`turn_start` 只有 `type`。未知字段、错类型及未建模事件 fail closed。协议校验失败使用固定安全诊断 `Pi protocol validation failed`，与进程/生命周期及 provider 请求失败分开；本地 abort 的分类和原因优先。离线 dispatcher 回归覆盖该诊断经 attempt、details、metadata 与 registry reason 传播，raw prompt/task/stderr/token 不得穿透。quarantined 记录不自动解除或重跑。
 
 同一 identity 运行中再次委派应返回 session-busy，不允许两个 child 进程同时写同一历史。进程崩溃导致的 stale lock 只能在确认 child 已不存在后清理；不得自动删除未知存活进程的锁。当前实现的保守窗口是：`starting` 标记后默认 5 秒内不接管；窗口后检查记录 PID，并扫描同主机进程表中带匹配 `--mode json --session-id <childSessionId>` 或恢复用绝对 `--session <sessionPath>` 的 child。进程表失败、旧 lock 缺少可匹配 identity/path、PID 检查返回非 `ESRCH` 或发现匹配命令时均保持 busy；只有完整扫描成功且没有匹配 child 才允许接管。该机制只证明可观察到的同主机 Pi CLI 进程不存在，不等价于 OS sandbox，也不能覆盖进程表权限、平台命令差异或扫描竞态；真实跨进程崩溃回放仍未验证。
 
@@ -127,13 +129,13 @@ runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和 P
 | --- | --- | --- |
 | `success` | 当前有效最终助手 `stop`，协议/进程完整且退出 0。 | 反馈“已返回”；不代表任务或验收通过。正常业务失败报告仍属此类。 |
 | `incomplete` | 当前有效最终助手 `length`，协议/进程完整且退出 0。 | 保留已捕获报告并提示长度截断；不自动 provider retry。 |
-| `cancelled` | 本地 abort；或更高优先级完整性检查通过后的最终助手 `aborted`。 | 不 provider retry；非本地 signal close先裁为`unknown_transport`。 |
+| `cancelled` | 本地 abort；或更高优先级完整性检查通过后的最终助手 `aborted`；或协议/header/有效 terminal 完整且退出 0 的 `agent_settled.aborted=true`。 | 不 provider retry；新增 settled 来源不得覆盖畸形流、缺 terminal、signal close 或非零退出。 |
 | `transient_provider` | 仅当前 terminal provider error 自身的 `fetch failed`、`ECONNRESET`、`ECONNREFUSED`、`ETIMEDOUT`、明确 timeout，或结构化/文本 HTTP 429/502/503/504。 | 当前模型额外重试最多两次，采用有上限的退避；随后切下一个候选模型。 |
 | `non_transient_provider` | 当前 terminal provider error 自身证明不存在、无可用渠道、未认证、模型不可用、401/403、请求合同错误。 | 不重试、不切换 fallback；不得读取过程tool status/旧error/stderr污染分类。 |
 | `unknown_transport` | 无法安全归类的 launcher/process 异常、signal exit、空 stdout、缺失当前有效 terminal JSON、截断 JSONL或stop/length非零退出。 | fail closed，不 provider retry；持久 child 可供明确继续。 |
 | `task_failure` | 旧历史或外部注入的兼容结果。 | 非重试失败；runner 不再由工具事件产生。 |
 
-当前 attempt 的裁决顺序固定为：本地 abort → spawn/流式 JSON/header/身份校验失败、空输出、畸形记录、signal close(code=null) 或缺当前有效最终助手候选的 `unknown_transport`（非本地 signal close 覆盖 `aborted`）→最终助手 `aborted` →最终助手 `error`（只读该消息自身的类型化 `status`/`errorMessage`，不读旧工具状态、旧错误或 stderr）→stop/length 但进程非零的 `unknown_transport`→最终 `length` 的 `incomplete`→最终 `stop` 的 `success`。最新候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除。每个 retry/fallback 都在同一 child session 内追加新的 prompt turn；不会重新以空上下文启动。重试次数是每个候选模型独立计数，原有闭集 allowlist 与每模型初始+2预算不扩大。所有候选用尽时，`persistent !== false` 返回 `recoverable_failed` 并保留 session、工作树和已捕获输出；`persistent:false` 仅返回尝试诊断，finally 删除临时 storage，不返回 handle 或继续入口。
+当前 attempt 的裁决顺序固定为：本地 abort → spawn/流式 JSON/header/身份校验失败、空输出、畸形记录、signal close(code=null) 或缺当前有效最终助手候选的 `unknown_transport`（非本地 signal close 覆盖 `aborted`）→有效 `agent_settled.aborted=true`（exit=0 为 `cancelled`，非零为 `unknown_transport`）→最终助手 `aborted` →最终助手 `error`（只读该消息自身的类型化 `status`/`errorMessage`，不读旧工具状态、旧错误或 stderr）→stop/length 但进程非零的 `unknown_transport`→最终 `length` 的 `incomplete`→最终 `stop` 的 `success`。最新候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除。每个 retry/fallback 都在同一 child session 内追加新的 prompt turn；不会重新以空上下文启动。重试次数是每个候选模型独立计数，原有闭集 allowlist 与每模型初始+2预算不扩大。所有候选用尽时，`persistent !== false` 返回 `recoverable_failed` 并保留 session、工作树和已捕获输出；`persistent:false` 仅返回尝试诊断，finally 删除临时 storage，不返回 handle 或继续入口。
 
 ## 6. 当前基线：模型切换与 Fast 兼容
 
@@ -166,7 +168,7 @@ GC 只处理 Dispatcher 管理的 child session/lock/metadata。Extension 在每
 | session | 默认 `persistent: true`、新 handle、显式恢复、registry 创建双进程竞态、文件/header 缺失 fail-closed、有效 header + 截断第二行的完整 JSONL quarantine、不可 resume/空建、tombstone 存在时 `cleanup-pending` dispatch 与 GC 清理顺序、30 天删除与不可 resume、parent/cwd/agent 隔离、`persistent: false` 调用内 retry、session busy、stale lock；focused lock tests 覆盖 starting grace、不可判定扫描保持 busy，以及 session UUID/path 命中保持 busy。 |
 | retry | transient 每模型恰好初始+2次；allowlist 全量正反例与优先级；退避可注入时钟；`incomplete`/正常工具错误/cancel 不重试；旧 tool 503 + 最终非瞬态 error 不污染 retry；signal exit、空 stdout、截断 JSONL 均不误报成功。 |
 | fallback | 候选顺序、去重、仅 transient 触发切换、每模型独立预算、耗尽后 recoverable failed、用户 override。 |
-| observability | Pi 0.84.4 JSON fixture 覆盖 `session`、`message_end`、`tool_execution_end.result`；provider/requestedModel/actualModel/attempt/`phase`/可选诊断计数/分类诊断和脱敏 tool result 可见且无 task/prompt/cwd/path/token/Cookie/header/raw body/嵌套诊断；计数不因详情上限归零；runner probe 覆盖 `Cookie_EQUALS_SECRET`、`Set-Cookie=`、`X-Trace-Header`、suffix `Header` 与嵌套 assistant echo。 |
+| observability | Pi 1.1.0 与既有历史 JSON fixture 覆盖 `session`、`message_end`、`tool_execution_end.result`、新增元数据及 settled 取消/完整性冲突矩阵；provider/requestedModel/actualModel/attempt/`phase`/可选诊断计数/分类诊断和脱敏 tool result 可见且无 task/prompt/cwd/path/token/Cookie/header/raw body/嵌套诊断；计数不因详情上限归零；runner probe 覆盖 `Cookie_EQUALS_SECRET`、`Set-Cookie=`、`X-Trace-Header`、suffix `Header` 与嵌套 assistant echo。 |
 | local state | 30 天 GC 已接入 Extension `session_start` 后台路径；live child lock 不删、GC/resume 竞态锁内复核+tombstone；初始 partial/后续截断 JSONL 以 `quarantined` registry 保持 GC 可达并由同一 identity lock 清理；tombstone 存在时 dispatch 不建新 registry，GC 先删 session + metadata 后删 tombstone；stale lock 还需通过 starting grace + PID + session UUID/path 进程扫描确认 child 不存在后才接管。 |
 | Fast | producer workspace 存在时，新 logical child 的首次 spawn 才可 exact eligibility/one-shot env 继承；retry/fallback/resume 的环境均为 Off；producer 缺失时 dynamic adapter 加载失败并安全 Off；event/config/env contract 有测试。 |
 | E2E | 已完成 headless Pi JSON + provider：默认持久 child 创建及同 handle 恢复。仍需真实 Pi TUI + provider 制造一次可观察瞬态失败，验证 retry、模型切换、无 session 串话和 Fast 条件；单元测试和本 smoke 均不能替代。 |
@@ -174,6 +176,17 @@ GC 只处理 Dispatcher 管理的 child session/lock/metadata。Extension 在每
 修订前基线的组合证据由真实 `dispatchAgent` 路径或等价注入的 child spawn 提供：首次持久 identity 创建的 registry 只有一个 winner；持久 session resume 与 GC 共享 identity lock；`persistent:false` 的候选耗尽、非瞬态、task、cancel 都在 finally 后清理；fallback、override、resume 的 Fast 均为 Off。当前测试进程通过原子 `open(..., "wx")` 的交错验证竞态，但尚未启动两个独立 Node 进程执行首次 registry 创建/真实 Pi provider；这仍是明确的跨进程验证缺口，不把单进程证据表述为双进程 E2E。
 
 当前 `@pi/subagent` package、可恢复 Child Session、retry/fallback runner、lock/GC/Fast consumer 和自动化测试已经存在；slice3 gated internal execution/recovery seam 也已存在，但不接现行 v1 execute；30 天 GC 已由 Extension 生命周期后台触发。`@pi/codex-usage-status` 是 optional peer，Fast 通过 public `./interop` 的安全 dynamic adapter 按 producer 可用性启用；独立 packed subagent 不预装 producer 的安装与 Pi/jiti 加载已验证。Subagent Dispatcher 不创建 Workflow Run/Artifact，因此 Workflow 的 `workerId` 采纳门禁不适用。修订前基线的方案与代码独立复审已完成，headless Pi JSON + provider 已验证默认 child 创建和同 handle 恢复；其运营缺口仍包括真实 TUI、瞬态 retry/fallback、进程崩溃回放、跨进程首次创建和 Fast child-process/provider E2E。本次 Delegation Recovery 目标设计已由 2026-09-14 两轴评审批准并正式采纳，但尚未实现；新增 drift 见下节。
+
+### 8.1 Pi 1.1.0 协议与验证边界
+
+| 范围 | 当前边界 |
+| --- | --- |
+| 自动化覆盖 | Pi 1.1.0 正常流/持久会话、未知字段与错类型拒绝、settled 取消优先级、安全诊断传播、协议与生命周期原因分离，以及 v1/v2 拒绝新版 system 消息。 |
+| 并发门禁风险 | 默认并发全量测试存在 fence 握手失败：服务端发送 ACK 并 resolve handshake 后写 child stdin，不保证 child 已收到 ACK；存在 `stdin-before-handshake` 反例。graceful/handshake 超时的逐次原因与 adoption 并发测试波动的根因未确认。串行或隔离通过不能关闭默认并发门禁。 |
+| 真实运行覆盖 | 已验证规范真实路径下的隔离 headless Pi 1.1.0/provider 创建、只读工具调用及同 handle/child session 续接；正常返回、registry settled 与完整 session 校验通过。禁用 ambient extensions/MCP/skills/context 的验证不等同于正常 TUI 安装链路或 reload 验收。 |
+| 路径身份 | `/var` 与 `/private/var` 别名可能被严格 header 身份校验拒绝；规范真实路径通过不代表任意别名受支持，也不自动解除已有 quarantine。 |
+
+评审裁决、单次命令结果与验收经过见[兼容验证记录](../归档/评审/2026-10-08-subagent-pi-1.1-兼容验证记录.md)；这些过程证据不替代当前契约或未关闭的门禁。
 
 ## 9. 目标设计（尚未实现）
 
@@ -683,7 +696,7 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 | Resolver/identity | raw invalid candidate 即使被 shadow也拒绝；合法 project-over-user shadow；effective canonical/alias 冲突；越界 symlink；parallel 同 requestedTarget/cwd/scope；prebind 修复；同 canonical digest revision accepted；跨 source/name/root/path 拒绝。 |
 | Orchestration/control | 运行中即时durable cancel。parallel item cancel不变；call-wide cancel与return/admission竞态覆盖三类slot：`returned_before_call_cancel`不可改写、admitted非终态最终cancelled、未admit占位。startup/并发kill补齐，三类齐全后Call cancelled，无partial-success aggregate；status按序可见取消前返回项。 |
 | Delivery proof / notification + disposition | slice4c internal seam：normal execute返回后先unobserved；status同lineage host scan唯一toolCallId+Call/proof匹配才写`normal_tool_result_observed`，缺失/重复/跨lineage/错proof返回 paused_integrity，不触发cancel/delete/send；interrupted路径保持stable deliveryId，owner-only outbox先scan再send，sending/append窗口不可证明即uncertain且不重发；abandon只写`no_future_send`。未接host/v1/TUI/RPC/provider adapters。 |
-| Execution result regression | 闭集FailureKind、1–7裁决顺序、每attempt可选running/finished、running无终局失败图、message_start/toolUse/tool event失效、turn_end/agent_end保留、业务失败仍已返回、tool error不provider retry。新runner两计数均为非负安全整数；历史缺字段逐项“未提供”且不作0；>100工具错误证明详情截断不改计数；敏感/raw payload负向fixture；single/chain/parallel逐项验证唯一固定中性段与传播。 |
+| Execution result regression | 闭集FailureKind、本文 §5 固定裁决顺序（含整轮取消来源及完整性优先级）、每attempt可选running/finished、running无终局失败图、message_start/toolUse/tool event失效、turn_end/agent_end保留、业务失败仍已返回、tool error不provider retry。新runner两计数均为非负安全整数；历史缺字段逐项“未提供”且不作0；>100工具错误证明详情截断不改计数；敏感/raw payload负向fixture；single/chain/parallel逐项验证唯一固定中性段与传播。 |
 | Budgets/continuation/Fast | 每Delegation initial spawn/execution≤1，pre-spawn cancel允许0；每cycle每candidate initial+2；仅cycle1/2/3，含initial总逻辑spawn≤4且第5次=0；reattach不计；continuationEpoch不刷新budget；Fast replacement/continuation/replay全Off。 |
 | Child interceptor/side effect | 真实`--no-extensions`启动；固定allowlist custom-tool extensions依序`-e`，fence interceptor最后。前置args rewrite后interceptor hash必须等于execute输入；后续handler改写反例必须暂停。result ACK基于最终middleware result，覆盖result rewrite、return-isError/throw、ACK kill points、加载顺序/排他性失败、独立watchdog；不可证明工具不自动恢复。 |
 | IPC/privacy | socket/pipe owner/mode/ACL、OS peer identity、challenge、伪造/重放/乱序/旧 generation ACK、frame size/schema/redaction；argv/process-list 无 task/prompt/secret；临时 system prompt 正常/异常/signal/startup cleanup。 |
@@ -841,7 +854,7 @@ slice7 新增 focused tests 覆盖 forged/version/test-proof、prepared crash re
 | S31 | `subagent_delivery(action=abandon)` | 仅同parent+active lineage actor可把pending/sending/uncertain delivery写成`delivery_abandoned(no_future_send)`；resend/requeue=0，重复abandon幂等，已receipted不倒写。status不做control/send/delete；仅S39允许把既有host normal toolResult写成幂等observation。 |
 | S32 | Darwin death-proof adapter | durable process identity含host、PID、process birth/start identity、child session/path与argv digest；直属进程由waitpid裁决。重启后Darwin inspection中，PID不存在或同PID但稳定可读birth identity mismatch，经identity lock内两次稳定观察即证明原进程死亡；复用PID signal=0。同PID同birth但session/path/argv不匹配为integrity事故；仅birth identity缺失/不可读、权限不足或观察不稳定才`paused_integrity`。transfer另按S8区分pre/post-spawn并要求相应action事实。 |
 | S33 | `FailureKind` 闭集与表面映射 | 唯一闭集恰为`success/incomplete/cancelled/transient_provider/non_transient_provider/unknown_transport/task_failure`；API、registry、metadata、Tool details/UI对同attempt一致。每attempt的`phase`仅可选为`running|finished`并只作生命周期投影；缺失兼容历史记录，不新增验收状态。 |
-| S34 | 固定终态裁决顺序 | 同一fixture组合本地abort、signal/协议失败、aborted/error、非零exit、length/stop时严格按[§5 固定裁决顺序](#5-当前基线执行结果分类重试与-fallback)得唯一FailureKind；最终provider分类只读当前error自身status/errorMessage，旧tool/provider/stderr不污染。 |
+| S34 | 固定终态裁决顺序 | 同一fixture组合本地abort、signal/协议失败、整轮取消信号、aborted/error、非零exit、length/stop时严格按[§5 固定裁决顺序](#5-当前基线执行结果分类重试与-fallback)得唯一FailureKind；整轮取消仅在协议/header/当前terminal完整且退出0时裁为cancelled，不覆盖完整性失败；最终provider分类只读当前error自身status/errorMessage，旧tool/provider/stderr不污染。 |
 | S35 | terminal候选失效 | stop/error/aborted/length候选后出现assistant `message_start`、assistant `toolUse`或任一tool execution事件时旧候选失效；无新terminal→`unknown_transport`。普通`turn_end/agent_end`后候选仍有效。 |
 | S36 | 业务失败与过程工具错误 | 测试/命令失败但Child正常交回报告→`success`并显示“已返回”，同时保留脱敏tool diagnostics且不称验收通过；过程tool error不产生`task_failure`、不触发provider retry/fallback。 |
 | S37 | single/chain/parallel反馈传播 | single附报告+固定中性诊断段；chain仅failureKind非success停止，并传前一步报告+同段，即使无`{previous}`也不丢；parallel按原序保留每项FailureKind/报告/同段并显示“已返回N/M”，不用succeeded/通过。固定段恰为`[执行诊断：不代表验收结论；工具异常 N；模型异常 M]`。 |

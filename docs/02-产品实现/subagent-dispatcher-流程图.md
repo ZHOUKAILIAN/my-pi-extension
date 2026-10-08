@@ -175,7 +175,11 @@ flowchart TD
   L -->|是| C[cancelled]
   L -->|否| I{spawn/协议/header/signal close/<br/>当前terminal完整?}
   I -->|否| U[unknown_transport]
-  I -->|是| AB{当前terminal=aborted?}
+  I -->|是| SA{有效agent_settled.aborted=true?}
+  SA -->|是| SE{进程exit=0?}
+  SE -->|是| C
+  SE -->|否| U
+  SA -->|否| AB{当前terminal=aborted?}
   AB -->|是| C
   AB -->|否| ER{当前terminal=error?}
   ER -->|是| P[只读该error自身status/message<br/>transient或non_transient_provider]
