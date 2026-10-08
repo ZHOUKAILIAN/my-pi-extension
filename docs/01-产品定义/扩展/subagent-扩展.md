@@ -402,7 +402,7 @@ single orphan Delegation（经 WAL/replay 证明不存在任何 live Call→Dele
 | --- | --- | --- |
 | `success` | 当前有效最终助手为 `stop` 且进程/协议完整、正常退出；表示**已返回**。 | 不触发 provider retry；不等于任务完成或验收通过。测试失败等正常业务失败报告仍属于已返回。 |
 | `incomplete` | 当前有效最终助手为 `length` 且正常退出，输出被长度截断。 | 不自动 provider retry；保留已捕获报告并明确“未完整返回”。 |
-| `cancelled` | 当前调用收到可归因本地 abort，或完整性检查通过后的最终助手 `aborted`。 | 不 provider retry；非本地 signal close 仍由更高优先级裁为 `unknown_transport`。它不同于 durable Call/Delegation 显式取消状态机。 |
+| `cancelled` | 当前调用收到可归因本地 abort，或完整性检查通过后的最终助手 `aborted`；也接受协议/header/当前有效 terminal 完整且进程退出码为 0 的 Pi 整轮取消信号 `agent_settled.aborted=true`。 | 不 provider retry；新增整轮取消来源不能覆盖协议、terminal 或进程异常。它不同于 durable Call/Delegation 显式取消状态机。 |
 | `transient_provider` | 当前最终助手 `error` 自身证明闭集瞬态 provider 错误。 | 仅此类别可使用当前模型有限 retry，再有序 fallback。 |
 | `non_transient_provider` | 当前最终助手 `error` 自身证明认证、模型、请求合同或其他非瞬态 provider 错误。 | 不 retry、不 fallback；不得被过程工具状态污染。 |
 | `unknown_transport` | spawn/进程/流式协议/header/terminal 完整性无法证明，或 stop/length 伴随非零退出。 | fail closed，不 provider retry；不得借旧 terminal 声称返回。 |
@@ -412,11 +412,21 @@ single orphan Delegation（经 WAL/replay 证明不存在任何 live Call→Dele
 
 1. 当前调用本地 abort → `cancelled`；
 2. spawn/JSON/header/身份失败、空输出、畸形记录、signal close(code=null) 或没有当前有效最终助手候选 → `unknown_transport`；
-3. 当前最终助手 `aborted` → `cancelled`；
-4. 当前最终助手 `error` → **只读该消息自身**的类型化 status/errorMessage，裁为 transient/non-transient provider；
-5. 其余 `stop/length` 但进程非零 → `unknown_transport`；
-6. 当前最终 `length` → `incomplete`；
-7. 当前最终 `stop` 且正常退出 → `success`。
+3. Pi 整轮取消信号 `agent_settled.aborted=true` → 退出码为 0 时 `cancelled`，非零时 `unknown_transport`；此信号不能代替第 2 项的有效 terminal 等完整性证据；
+4. 当前最终助手 `aborted` → `cancelled`；
+5. 当前最终助手 `error` → **只读该消息自身**的类型化 status/errorMessage，裁为 transient/non-transient provider；
+6. 其余 `stop/length` 但进程非零 → `unknown_transport`；
+7. 当前最终 `length` → `incomplete`；
+8. 当前最终 `stop` 且正常退出 → `success`。
+
+2026-10-08 用户已采纳 Pi 整轮取消来源；本次只扩展 attempt 结果判断，不改变 §4.2 的耐久用户显式取消门禁。
+
+| 组合场景（无本地 abort） | 必须结果 |
+| --- | --- |
+| 当前 terminal=`stop`，有效整轮取消信号，协议完整且退出 0 | `cancelled`，不重试 |
+| 有效整轮取消信号 + 畸形 JSON/header 错误/缺当前 terminal | `unknown_transport`，取消不得掩盖完整性失败 |
+| 有效整轮取消信号 + signal close 或非零退出 | `unknown_transport` |
+| 整轮取消字段错类型或附带未建模字段 | 按协议校验失败处理，不采纳取消来源 |
 
 终态候选只属于最新消息周期。候选后出现 assistant `message_start`、assistant `toolUse`（包括承载该 toolUse 的 assistant message）或任一 tool execution start/end event，旧候选立即失效；普通 `turn_end` / `agent_end` 不清除候选。没有新的有效 terminal 就必须 fail closed，不得复用旧 stop/error。历史工具状态、旧 provider error、stderr 或过程 `tool_execution_end.isError` 只进入有界、脱敏 diagnostics，不参与当前 provider 分类，也不触发 provider retry/fallback。
 
@@ -493,7 +503,7 @@ single orphan Delegation（经 WAL/replay 证明不存在任何 live Call→Dele
 | S31 | `subagent_delivery(action=abandon)` | 仅同parent+active lineage actor可把pending/sending/uncertain delivery写成`delivery_abandoned(no_future_send)`；resend/requeue=0，重复abandon幂等，已receipted不倒写。status不做control/send/delete；仅S39允许把既有host normal toolResult写成幂等observation。 |
 | S32 | Darwin death-proof adapter | durable process identity含host、PID、process birth/start identity、child session/path与argv digest；直属进程由waitpid裁决。重启后Darwin inspection中，PID不存在或同PID但稳定可读birth identity mismatch，经identity lock内两次稳定观察即证明原进程死亡；复用PID signal=0。同PID同birth但session/path/argv不匹配为integrity事故；仅birth identity缺失/不可读、权限不足或观察不稳定才`paused_integrity`。transfer另按S8区分pre/post-spawn并要求相应action事实。 |
 | S33 | `FailureKind` 闭集与表面映射 | 唯一闭集恰为`success/incomplete/cancelled/transient_provider/non_transient_provider/unknown_transport/task_failure`；API、registry、metadata、Tool details/UI对同attempt一致。每attempt的`phase`仅可选为`running|finished`并只作生命周期投影；缺失兼容历史记录，不新增验收状态。 |
-| S34 | 固定终态裁决顺序 | 同一fixture组合本地abort、signal/协议失败、aborted/error、非零exit、length/stop时严格按§9的1–7顺序得唯一FailureKind；最终provider分类只读当前error自身status/errorMessage，旧tool/provider/stderr不污染。 |
+| S34 | 固定终态裁决顺序 | 同一fixture组合本地abort、signal/协议失败、整轮取消信号、aborted/error、非零exit、length/stop时严格按§9的1–8顺序得唯一FailureKind；整轮取消仅在协议/header/当前terminal完整且退出0时裁为cancelled，不覆盖完整性失败；最终provider分类只读当前error自身status/errorMessage，旧tool/provider/stderr不污染。 |
 | S35 | terminal候选失效 | stop/error/aborted/length候选后出现assistant `message_start`、assistant `toolUse`或任一tool execution事件时旧候选失效；无新terminal→`unknown_transport`。普通`turn_end/agent_end`后候选仍有效。 |
 | S36 | 业务失败与过程工具错误 | 测试/命令失败但Child正常交回报告→`success`并显示“已返回”，同时保留脱敏tool diagnostics且不称验收通过；过程tool error不产生`task_failure`、不触发provider retry/fallback。 |
 | S37 | single/chain/parallel反馈传播 | single附报告+固定中性诊断段；chain仅failureKind非success停止，并传前一步报告+同段，即使无`{previous}`也不丢；parallel按原序保留每项FailureKind/报告/同段并显示“已返回N/M”，不用succeeded/通过。固定段恰为`[执行诊断：不代表验收结论；工具异常 N；模型异常 M]`。 |

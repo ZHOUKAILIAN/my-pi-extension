@@ -8,6 +8,7 @@ import * as path from "node:path";
 import { dispatchAgent, type DispatchDependencies } from "../src/dispatcher.ts";
 import { DEFAULT_RETENTION_MS, garbageCollect } from "../src/gc.ts";
 import { runPiAttempt } from "../src/runner.ts";
+import { runSubagentModes, subagentSessionMetadata } from "../src/index.ts";
 import { makeSessionIdentity } from "../src/session-identity.ts";
 import type { AgentConfig } from "../src/agents.ts";
 import type { AttemptResult } from "../src/runner.ts";
@@ -128,6 +129,54 @@ test("model retry budget is exactly initial+2 per model, then ordered fallback",
     { requested: "model-a", actual: "unknown" }, { requested: "model-b", actual: "unknown" },
   ]);
   assert.equal(calls.slice(1).every((call) => call.sessionFile !== undefined), true);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("safe protocol failure reason survives dispatcher, details, and registry without leaking private data", async () => {
+  const root = await tempRoot();
+  const promptSecret = "PRIVATE_PROMPT_SENTINEL";
+  const taskSecret = "PRIVATE_TASK_SENTINEL";
+  const stderrSecret = "Authorization: Bearer PRIVATE_TOKEN_SENTINEL";
+  const configuredAgent = agent({ systemPrompt: promptSecret });
+  const protocolProcess = new EventEmitter() as any;
+  protocolProcess.pid = 23456; protocolProcess.stdout = new PassThrough(); protocolProcess.stderr = new PassThrough(); protocolProcess.killed = false; protocolProcess.kill = () => { protocolProcess.killed = true; return true; };
+  const parsedAttempt = await runPiAttempt({
+    cwd: "/tmp/project", agent: configuredAgent, task: taskSecret, model: "model-a", attempt: 1, source: "initial",
+    sessionDir: root, childSessionId: "child-protocol", firstLogicalChildSpawn: true, parentFastRequested: false,
+    spawn: () => {
+      queueMicrotask(() => {
+        for (const record of [
+          { type: "session", version: 3, id: "child-protocol", cwd: "/tmp/project", timestamp: new Date().toISOString() },
+          { type: "agent_settled", aborted: false, futureField: taskSecret },
+          { type: "message_end", message: piAssistant("stop") },
+        ]) protocolProcess.stdout.write(`${JSON.stringify(record)}\n`);
+        protocolProcess.stderr.write(stderrSecret); protocolProcess.stdout.end(); protocolProcess.stderr.end(); protocolProcess.emit("close", 0);
+      });
+      return protocolProcess;
+    },
+  });
+  assert.equal(parsedAttempt.errorMessage, "Pi protocol validation failed");
+
+  const dispatched = await dispatchAgent({ parentSessionId: "parent-protocol", cwd: "/tmp/project", task: taskSecret, agent: configuredAgent }, {
+    rootDir: root,
+    runAttempt: async (options) => {
+      await writeSession({ sessionDir: options.sessionDir, id: options.childSessionId, cwd: options.cwd });
+      return { ...parsedAttempt, sessionId: options.childSessionId, requestedModel: options.model ?? "unknown", attempt: options.attempt, source: options.source };
+    },
+  });
+  const response = await runSubagentModes({ single: { agent: "implementer", task: taskSecret } }, async () => ({
+    ...dispatched.attempt, status: dispatched.status, handle: dispatched.handle, persistent: dispatched.persistent, attempts: dispatched.attempts,
+  }), (results) => ({ mode: "single", agentScope: "user", results }));
+  assert.equal(dispatched.failureKind, "unknown_transport");
+  assert.equal(dispatched.attempt.errorMessage, "Pi protocol validation failed");
+  assert.equal(response.details.results[0]?.errorMessage, "Pi protocol validation failed");
+  const metadata = subagentSessionMetadata(dispatched, "implementer");
+  assert.equal((metadata.attempt as any).reason, "Pi protocol validation failed");
+  const identity = makeSessionIdentity({ parentSessionId: "parent-protocol", cwd: "/tmp/project", agentName: "implementer", handle: dispatched.handle! });
+  const registry = JSON.parse(await fs.readFile(path.join(root, "registry", `${identity.key}.json`), "utf8"));
+  assert.equal(registry.attempts[0].reason, "Pi protocol validation failed");
+  const exposed = JSON.stringify({ response, metadata, registry });
+  for (const secret of [promptSecret, taskSecret, stderrSecret, "PRIVATE_TOKEN_SENTINEL"]) assert.equal(exposed.includes(secret), false);
   await fs.rm(root, { recursive: true, force: true });
 });
 

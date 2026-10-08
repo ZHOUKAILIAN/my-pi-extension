@@ -123,6 +123,58 @@ test("session records accept Pi messages and reject schema-valid JSON with missi
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("Pi 1.1.0 persisted v3 metadata and entries validate strictly", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const file = path.join(root, "pi-110-session.jsonl");
+  const base = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString() };
+  const system = { role: "system", content: "", sections: { tools: "tools" }, toolsAdded: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} }, constrainedSampling: { type: "grammar", variants: { openai_lark: "start: \\\"ok\\\";" } } }], toolsRemoved: [], timestamp: Date.now() };
+  const assistant = { ...assistantMessage(), thinkingLevel: "high", providerThinkingLevel: "high", durationMs: 10 };
+  const tool = toolResultMessage({ durationMs: 12, nestedCalls: { calls: [{ id: "nested-1", name: "read", status: "ok", arguments: {}, durationMs: 2 }], complete: true } });
+  const records = [header(), { ...base, message: system }, { ...base, id: "entry-2", message: assistant }, { ...base, id: "entry-3", message: tool },
+    { type: "usage", id: "entry-4", parentId: "entry-3", timestamp: new Date().toISOString(), kind: "cache_warm", provider: "openai", model: "m", usage: usage(), note: "warm" },
+    { type: "context_edit", id: "entry-5", parentId: "entry-4", timestamp: new Date().toISOString(), targetId: "entry-2", replacement: { content: [{ type: "text", text: "edited" }] } },
+    { type: "compaction", id: "entry-6", parentId: "entry-5", timestamp: new Date().toISOString(), summary: "summary", firstKeptEntryId: "entry-2", tokensBefore: 10, systemMessage: system }];
+  await fs.writeFile(file, records.map((record) => JSON.stringify(record)).join("\n") + "\n");
+  assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true);
+  const invalid = path.join(root, "invalid-session.jsonl");
+  const invalidSystems = [
+    { ...system, toolsAdded: [{ ...system.toolsAdded[0], futureField: true }] },
+    { ...system, toolsAdded: [{ ...system.toolsAdded[0], constrainedSampling: { type: "json_schema", strict: true } }] },
+    { ...system, toolsAdded: [{ ...system.toolsAdded[0], constrainedSampling: { type: "grammar", variants: { future_grammar: "x" } } }] },
+    { ...system, toolsAdded: [{ ...system.toolsAdded[0], constrainedSampling: { type: "grammar", variants: {}, extra: true } }] },
+  ];
+  for (const invalidMessage of [...invalidSystems, { ...assistant, futureField: true }, { ...assistant, durationMs: "10" }, { ...tool, durationMs: -1 }, { ...tool, nestedCalls: { calls: [{ id: "nested-1", name: "read", status: "unknown" }], complete: true } }]) {
+    await fs.writeFile(invalid, [header(), { ...base, id: "entry-2", message: invalidMessage }].map(JSON.stringify).join("\n") + "\n");
+    assert.equal(await validateSessionFile(invalid, "child-1", "/tmp/project"), false);
+  }
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("persisted v1/v2 reject v3 system messages while preserving valid historical entries", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const entryTimestamp = new Date().toISOString();
+  const historicalMessage = { role: "user", content: "historical", timestamp: Date.now() };
+  const system = { role: "system", content: "system", timestamp: Date.now() };
+  for (const version of [1, 2] as const) {
+    const v1 = version === 1;
+    const legacyHeader = v1
+      ? { type: "session", id: "child-1", cwd: "/tmp/project", timestamp: entryTimestamp }
+      : { ...header(), version: 2 };
+    const legacyEntry = v1
+      ? { type: "message", timestamp: entryTimestamp, message: historicalMessage }
+      : { type: "message", id: "entry-1", parentId: null, timestamp: entryTimestamp, message: historicalMessage };
+    const file = path.join(root, `v${version}.jsonl`);
+    await fs.writeFile(file, [legacyHeader, legacyEntry].map(JSON.stringify).join("\n") + "\n");
+    assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), true, `v${version} accepts a historical user message`);
+    for (const message of [system, ...["sections", "toolsAdded", "toolsRemoved"].map((field) => ({ ...system, [field]: field === "sections" ? {} : [] }))]) {
+      const invalidEntry = { ...legacyEntry, message };
+      await fs.writeFile(file, [legacyHeader, invalidEntry].map(JSON.stringify).join("\n") + "\n");
+      assert.equal(await validateSessionFile(file, "child-1", "/tmp/project"), false, `v${version} rejects ${JSON.stringify(message)}`);
+    }
+  }
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("real Pi v1, v2, and v3 session fixtures validate only under their own schema", async () => {
   const fixtureRoot = path.join(process.cwd(), "packages/subagent/test/fixtures");
   assert.equal(await validateSessionFile(path.join(fixtureRoot, "session-v1.jsonl"), "fixture-v1", "/tmp/pi-session-fixture"), true);
@@ -167,13 +219,31 @@ test("JSON mode retains Pi turn and update event protocol while validating compl
     terminal(),
     { type: "turn_end", message: assistantMessage(), toolResults: [] },
     { type: "agent_end", messages: [assistantMessage()], willRetry: false },
-    { type: "agent_settled" },
+    { type: "agent_settled", aborted: false },
   ]));
   assert.equal(attempt.failureKind, "success");
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("JSON mode accepts the complete Pi 0.84.4 session event wire set", async () => {
+test("JSON mode accepts Pi 1.1.0 message, tool, turn, and settled metadata", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const tool = toolResultMessage({ durationMs: 12, nestedCalls: { calls: [{ id: "nested-1", name: "read", status: "ok", durationMs: 3, argumentsBytes: 8 }], complete: true } });
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "turn_start" },
+    { type: "tool_execution_start", toolCallId: "nested-1", toolName: "read", args: {}, parentToolCallId: "parent-call" },
+    { type: "tool_execution_update", toolCallId: "nested-1", toolName: "read", args: {}, partialResult: {}, parentToolCallId: "parent-call" },
+    { type: "tool_execution_end", toolCallId: "call-1", toolName: "codemode", result: {}, isError: false, durationMs: 9, parentToolCallId: "parent-call" },
+    { type: "message_end", message: tool },
+    terminal("stop", { thinkingLevel: "high", providerThinkingLevel: "high", durationMs: 45 }),
+    { type: "agent_settled", aborted: false },
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  assert.deepEqual(attempt.diagnostics, { toolErrorCount: 0, providerErrorCount: 0 });
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("JSON mode accepts the complete Pi 1.1.0 session event wire set", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   const entry = { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: { role: "user", content: "queued", timestamp: Date.now() } };
   const compactionResult = {
@@ -186,6 +256,7 @@ test("JSON mode accepts the complete Pi 0.84.4 session event wire set", async ()
     { type: "queue_update", steering: ["steer"], followUp: ["follow up"] },
     { type: "compaction_start", reason: "threshold" },
     { type: "entry_appended", entry },
+    { type: "entry_appended", entry: { ...entry, id: "system-entry", message: { role: "system", content: "", toolsAdded: [{ name: "json", description: "JSON", parameters: { type: "object" }, constrainedSampling: { type: "json_schema", strict: "require" } }], timestamp: Date.now() } } },
     { type: "session_info_changed", name: "child" },
     { type: "thinking_level_changed", level: "high" },
     { type: "bash_execution_update", id: "bash-1", delta: "output" },
@@ -199,9 +270,20 @@ test("JSON mode accepts the complete Pi 0.84.4 session event wire set", async ()
     { type: "compaction_end", reason: "overflow", aborted: true, willRetry: false },
     { type: "session_info_changed" },
     terminal(), { type: "turn_end", message: assistantMessage(), toolResults: [] },
-    { type: "agent_end", messages: [assistantMessage()], willRetry: false }, { type: "agent_settled" },
+    { type: "agent_end", messages: [assistantMessage()], willRetry: false }, { type: "agent_settled", aborted: false },
   ]));
   assert.equal(attempt.failureKind, "success");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("Pi protocol incompatibility stays distinguishable from provider failures", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  for (const event of [{ type: "agent_settled", aborted: "false" }, { type: "agent_settled", aborted: false, futureField: true }]) {
+    const attempt = await runPiAttempt(await options(root, [header(), event, terminal()]));
+    assert.equal(attempt.failureKind, "unknown_transport");
+    assert.equal(attempt.errorMessage, "Pi protocol validation failed");
+    assert.notEqual(attempt.errorMessage, "provider request failed");
+  }
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -216,6 +298,15 @@ test("JSON event validation fails closed for unknown, mixed, and malformed Pi re
     { type: "summarization_retry_attempt_start", source: "branchSummary", reason: "threshold" },
     { type: "compaction_end", reason: "threshold", result: null, aborted: true, willRetry: false },
     { type: "compaction_end", reason: "threshold", result: { summary: "missing fields" }, aborted: false, willRetry: false },
+    { type: "message_end", message: assistantMessage("stop", { durationMs: "45" }) },
+    { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false, durationMs: "9" },
+    { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false, parentToolCallId: 7 },
+    { type: "agent_settled", aborted: "false" },
+    { type: "turn_start", turnIndex: 0 },
+    { type: "turn_start", timestamp: Date.now() },
+    { type: "turn_start", futureField: true },
+    { type: "entry_appended", entry: { ...validEntry, message: { role: "system", content: "", toolsAdded: [{ name: "json", description: "JSON", parameters: {}, futureField: true }], timestamp: Date.now() } } },
+    { type: "entry_appended", entry: { ...validEntry, message: { role: "system", content: "", toolsAdded: [{ name: "json", description: "JSON", parameters: {}, constrainedSampling: { type: "json_schema", strict: "yes" } }], timestamp: Date.now() } } },
     { type: "entry_appended", entry: { ...validEntry, message: { role: "assistant", content: [], timestamp: Date.now() } } },
   ];
   for (const event of malformedEvents) {
@@ -266,6 +357,19 @@ test("signal, empty output, missing header, and missing terminal all fail closed
   const cancelled = await runPiAttempt({ ...(await options(root, [header(), terminal()])), signal: controller.signal, spawn: () => { spawned = true; return fakeProcess([]); } });
   assert.equal(cancelled.failureKind, "cancelled");
   assert.equal(spawned, false);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("child process error is a safe transport reason, not a provider diagnostic", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const attempt = await runPiAttempt({ ...(await options(root, [])), spawn: () => {
+    const proc = new EventEmitter() as any; proc.pid = 12345; proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.killed = false; proc.kill = () => { proc.killed = true; return true; };
+    queueMicrotask(() => { proc.emit("error", new Error("private process detail")); proc.stdout.end(); proc.stderr.end(); proc.emit("close", null); });
+    return proc;
+  } });
+  assert.equal(attempt.failureKind, "unknown_transport");
+  assert.equal(attempt.errorMessage, "child process error");
+  assert.equal(JSON.stringify(attempt).includes("private process detail"), false);
   await fs.rm(root, { recursive: true, force: true });
 });
 
@@ -353,6 +457,52 @@ test("a provider error followed by a new stop returns the new assistant report",
   assert.equal(attempt.errorMessage, undefined);
   assert.equal(attempt.diagnostics?.providerErrorCount, 1);
   assert.equal(finalAssistantText(attempt), "Recovered report");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test("settled abort is cancellation only after protocol and process integrity pass", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const settled = { type: "agent_settled", aborted: true };
+  const normalStop = await runPiAttempt(await options(root, [header(), terminal("stop"), settled]));
+  assert.equal(normalStop.failureKind, "cancelled");
+
+  const malformed = await runPiAttempt(await options(root, [header(), { type: "agent_settled", aborted: true, futureField: true }, terminal()]));
+  assert.equal(malformed.failureKind, "unknown_transport");
+  assert.equal(malformed.errorMessage, "Pi protocol validation failed");
+
+  const malformedAndBindingFailure = await runPiAttempt({ ...(await options(root, [])), onChildProcess: async () => {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    throw new Error("private callback details");
+  }, spawn: () => {
+    const proc = new EventEmitter() as any; proc.pid = 12345; proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.killed = false; proc.stdin = new PassThrough(); proc.kill = () => { proc.killed = true; queueMicrotask(() => proc.emit("close", null)); return true; };
+    queueMicrotask(() => { proc.stdout.write(`${JSON.stringify(header())}\nnot-json\n`); proc.stdout.end(); proc.stderr.end(); proc.emit("close", null); });
+    return proc;
+  } });
+  assert.equal(malformedAndBindingFailure.failureKind, "unknown_transport");
+  assert.equal(malformedAndBindingFailure.errorMessage, "child lifecycle binding failed", "binding failure reason outranks malformed-protocol diagnostics");
+  assert.equal(JSON.stringify(malformedAndBindingFailure).includes("private callback details"), false);
+
+  const badHeader = await runPiAttempt(await options(root, [{ ...header(), cwd: "/wrong" }, terminal(), settled]));
+  assert.equal(badHeader.failureKind, "unknown_transport");
+  assert.equal(badHeader.errorMessage, "Pi protocol validation failed");
+
+  const missingTerminal = await runPiAttempt(await options(root, [header(), settled]));
+  assert.equal(missingTerminal.failureKind, "unknown_transport");
+
+  const signaled = await runPiAttempt(await options(root, [header(), terminal(), settled], null));
+  assert.equal(signaled.failureKind, "unknown_transport");
+
+  const nonzero = await runPiAttempt(await options(root, [header(), terminal(), settled], 1));
+  assert.equal(nonzero.failureKind, "unknown_transport");
+
+  const controller = new AbortController();
+  const localAbort = await runPiAttempt({ ...(await options(root, [])), signal: controller.signal, spawn: () => {
+    const proc = new EventEmitter() as any; proc.pid = 12345; proc.stdout = new PassThrough(); proc.stderr = new PassThrough(); proc.killed = false; proc.kill = () => { proc.killed = true; return true; };
+    queueMicrotask(() => { proc.stdout.write(`${JSON.stringify(header())}\nnot-json\n`); controller.abort(); proc.stdout.end(); proc.stderr.end(); proc.emit("close", null); });
+    return proc;
+  } });
+  assert.equal(localAbort.failureKind, "cancelled", "local abort keeps priority over malformed output and signal exit");
+  assert.equal(localAbort.errorMessage, "cancelled", "protocol diagnostics do not mask a local abort reason");
   await fs.rm(root, { recursive: true, force: true });
 });
 
