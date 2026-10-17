@@ -1,0 +1,72 @@
+import { readFileSync, realpathSync } from "node:fs";
+import { join } from "node:path";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Key, matchesKey } from "@earendil-works/pi-tui";
+import { Controller } from "./controller.ts";
+import { committedFiles, settings } from "./compaction.ts";
+
+export function isolatedProfile(argv: string[] = process.argv): boolean {
+  const flags = argv.slice(2);
+  const paths = flags.flatMap((flag, i) => flag === "-e" || flag === "--extension" ? [flags[i + 1]] : []);
+  return flags.some(f => f === "-ne" || f === "--no-extensions") && paths.length === 1 && !!paths[0] && /(?:^|\/)async-compaction\/src\/index\.ts$/.test(paths[0]);
+}
+// Resolve the actual launched CLI binary, not the extension's nested SDK dependency.
+export function supportedHost(argv: string[] = process.argv): boolean {
+  try {
+    const cli = realpathSync(argv[1]);
+    const match = cli.match(/^(.*\/[@]earendil-works\/pi-coding-agent)\/dist\/(?:bundle\/)?cli\.js$/);
+    if (!match) return false;
+    const pkg = JSON.parse(readFileSync(join(match[1], "package.json"), "utf8"));
+    return pkg.name === "@earendil-works/pi-coding-agent" && ["1.0.4", "1.1.0"].includes(pkg.version);
+  } catch { return false; }
+}
+export default function extension(pi: ExtensionAPI) {
+  const control = new Controller(pi);
+  let postRunWindow = false, preflight = false;
+  let detachInput: (() => void) | undefined;
+  pi.registerCommand("async-compact", {
+    description: "Enable or disable background compaction for this main TUI session",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (value !== "on" && value !== "off") { ctx.ui.notify("Usage: /async-compact on|off", "warning"); return; }
+      if (ctx.mode !== "tui" || !isolatedProfile() || !supportedHost()) { ctx.ui.notify("async-compact requires a supported Pi 1.0.4/1.1.0 main TUI launched with --no-extensions -e packages/async-compaction/src/index.ts; native compaction remains active", "warning"); return; }
+      control.set(value === "on", ctx);
+      if (value === "on" && !detachInput) detachInput = ctx.ui.onTerminalInput(data => { if (matchesKey(data, Key.escape) && control.isEnabled) control.stop(ctx); return undefined; });
+      if (value === "off") { detachInput?.(); detachInput = undefined; }
+      const unsupported = value === "on" && ctx.model && !settings(pi, ctx);
+      ctx.ui.notify(unsupported ? "async-compact on: current model or automatic compaction unsupported; native compaction remains active" : `async-compact ${value}`, unsupported ? "warning" : "info");
+    },
+  });
+  const leave = (_event: unknown, ctx: Parameters<Controller["leave"]>[0]) => { postRunWindow = false; preflight = false; control.leave(ctx); detachInput?.(); detachInput = undefined; };
+  pi.on("session_before_switch", leave);
+  pi.on("session_before_fork", leave);
+  pi.on("session_before_tree", leave);
+  pi.on("session_shutdown", leave);
+  pi.on("session_start", (_event, ctx) => { postRunWindow = false; preflight = false; control.reset(ctx); });
+  pi.on("input", () => { preflight = true; postRunWindow = false; });
+  pi.on("agent_start", () => { preflight = false; postRunWindow = false; });
+  pi.on("agent_end", (event, ctx) => { postRunWindow = true; if (event.messages.some(m => m.role === "assistant" && m.stopReason === "aborted")) control.stop(ctx); });
+  pi.on("agent_settled", () => { postRunWindow = false; });
+  pi.on("turn_end", (event, ctx) => { if (event.message.role === "assistant" && event.message.stopReason === "stop") control.schedule(ctx); });
+  pi.on("session_before_compact", async (event, ctx) => {
+    // The host skips fromHook details when preparing native fileOps. This public, non-context
+    // preparation is mutable; the host still owns generation and the final session append.
+    const previous = ctx.sessionManager.getBranch().filter(e => e.type === "compaction").at(-1);
+    const files = committedFiles(previous);
+    if (files) {
+      for (const path of files.readFiles) event.preparation.fileOps.read.add(path);
+      for (const path of files.modifiedFiles) event.preparation.fileOps.edited.add(path);
+    }
+    if (event.reason !== "threshold") { control.stop(ctx); return; }
+    if (ctx.mode !== "tui" || !isolatedProfile() || !supportedHost()) return;
+    if (!postRunWindow || preflight) {
+      if (!event.signal.aborted) control.fallback(ctx);
+      return; // Preflight cannot offer a candidate; Pi still owns native compaction.
+    }
+    const compaction = await control.offer(ctx, event.preparation, event.signal);
+    if (!compaction && !event.signal.aborted) control.fallback(ctx);
+    return compaction ? { compaction } : undefined;
+  });
+  pi.on("session_compact", (event, ctx) => control.compact(ctx, event.compactionEntry));
+  pi.on("session_compact_failed", (_event, ctx) => control.failed(ctx));
+}
