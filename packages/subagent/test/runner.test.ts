@@ -225,6 +225,28 @@ test("JSON mode retains Pi turn and update event protocol while validating compl
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("Pi 1.0.4 JSON settlement keeps business duration keys and shared nested durations valid", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const system = { role: "system", content: "", sections: {}, toolsAdded: [{ name: "read", description: "Read", parameters: { type: "object", properties: {} }, constrainedSampling: { type: "json_schema", strict: "prefer" } }], timestamp: Date.now() };
+  const legacyToolResult = toolResultMessage({
+    content: [{ type: "text", text: "tool result durationMs=opaque-string" }],
+    details: { durationMs: "business-detail", nested: { durationMs: 17 } },
+    nestedCalls: { calls: [{ id: "nested-1", name: "read", status: "ok", durationMs: 3 }], complete: true },
+  });
+  const attempt = await runPiAttempt(await options(root, [
+    header(),
+    { type: "message_end", message: system },
+    { type: "tool_execution_end", toolCallId: "read-1", toolName: "read", result: { durationMs: 11, nested: { durationMs: "payload" } }, isError: false },
+    { type: "message_end", message: legacyToolResult },
+    terminal("stop", { thinkingLevel: "off", providerThinkingLevel: "legacy", content: [{ type: "text", text: "assistant durationMs=opaque-string" }] }),
+    { type: "agent_settled" },
+  ]));
+  assert.equal(attempt.failureKind, "success");
+  assert.equal(attempt.toolResults.length, 1);
+  assert.equal(attempt.messages.length, 3);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("JSON mode accepts Pi 1.1.0 message, tool, turn, and settled metadata", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
   const tool = toolResultMessage({ durationMs: 12, nestedCalls: { calls: [{ id: "nested-1", name: "read", status: "ok", durationMs: 3, argumentsBytes: 8 }], complete: true } });
@@ -276,9 +298,36 @@ test("JSON mode accepts the complete Pi 1.1.0 session event wire set", async () 
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("legacy protocol rejects Pi 1.1 duration fields in top-level and nested stdout records", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const legacy = { type: "agent_settled" };
+  const cases = [
+    [header(), terminal("stop", { durationMs: 1 }), legacy],
+    [header(), legacy, terminal("stop", { durationMs: 1 })],
+    [header(), { type: "tool_execution_end", toolCallId: "call-1", toolName: "read", result: {}, isError: false, durationMs: 1 }, terminal(), legacy],
+    [header(), { type: "turn_end", message: assistantMessage(), toolResults: [toolResultMessage({ durationMs: 1 })] }, terminal(), legacy],
+    [header(), { type: "message_update", usage: usage(), assistantMessageEvent: { type: "done", reason: "stop", message: assistantMessage("stop", { durationMs: 1 }) } }, terminal(), legacy],
+    [header(), { type: "agent_end", messages: [assistantMessage("stop", { durationMs: 1 })], willRetry: false }, terminal(), legacy],
+    [header(), { type: "entry_appended", entry: { type: "message", id: "entry-1", parentId: null, timestamp: new Date().toISOString(), message: toolResultMessage({ durationMs: 1 }) } }, terminal(), legacy],
+  ];
+  for (const lines of cases) {
+    const attempt = await runPiAttempt(await options(root, lines));
+    assert.equal(attempt.failureKind, "unknown_transport");
+    assert.equal(attempt.errorMessage, "Pi protocol validation failed");
+  }
+
+  const legacySuccess = await runPiAttempt(await options(root, [header(), terminal("stop"), legacy]));
+  assert.equal(legacySuccess.failureKind, "success");
+  const legacyCancelled = await runPiAttempt(await options(root, [header(), terminal("aborted"), legacy]));
+  assert.equal(legacyCancelled.failureKind, "cancelled");
+  const legacyNonZero = await runPiAttempt(await options(root, [header(), terminal("stop"), legacy], 7));
+  assert.equal(legacyNonZero.failureKind, "unknown_transport");
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("Pi protocol incompatibility stays distinguishable from provider failures", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
-  for (const event of [{ type: "agent_settled", aborted: "false" }, { type: "agent_settled", aborted: false, futureField: true }]) {
+  for (const event of [{ type: "agent_settled", aborted: "false" }, { type: "agent_settled", aborted: false, futureField: true }, { type: "agent_settled", futureField: true }]) {
     const attempt = await runPiAttempt(await options(root, [header(), event, terminal()]));
     assert.equal(attempt.failureKind, "unknown_transport");
     assert.equal(attempt.errorMessage, "Pi protocol validation failed");
@@ -460,8 +509,14 @@ test("a provider error followed by a new stop returns the new assistant report",
   await fs.rm(root, { recursive: true, force: true });
 });
 
-test("settled abort is cancellation only after protocol and process integrity pass", async () => {
+test("legacy settlement is normal completion unless its terminal says aborted", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "runner-test-"));
+  const legacyNormal = await runPiAttempt(await options(root, [header(), terminal("stop", { thinkingLevel: "off" }), { type: "agent_settled" }]));
+  assert.equal(legacyNormal.failureKind, "success");
+  const legacyAborted = await runPiAttempt(await options(root, [header(), terminal("aborted", { thinkingLevel: "off" }), { type: "agent_settled" }]));
+  assert.equal(legacyAborted.failureKind, "cancelled");
+  const legacyMissingTerminal = await runPiAttempt(await options(root, [header(), { type: "agent_settled" }]));
+  assert.equal(legacyMissingTerminal.failureKind, "unknown_transport");
   const settled = { type: "agent_settled", aborted: true };
   const normalStop = await runPiAttempt(await options(root, [header(), terminal("stop"), settled]));
   assert.equal(normalStop.failureKind, "cancelled");
@@ -488,6 +543,10 @@ test("settled abort is cancellation only after protocol and process integrity pa
 
   const missingTerminal = await runPiAttempt(await options(root, [header(), settled]));
   assert.equal(missingTerminal.failureKind, "unknown_transport");
+
+  const mixedSettlementFamilies = await runPiAttempt(await options(root, [header(), terminal(), { type: "agent_settled" }, { type: "agent_settled", aborted: false }]));
+  assert.equal(mixedSettlementFamilies.failureKind, "unknown_transport");
+  assert.equal(mixedSettlementFamilies.errorMessage, "Pi protocol validation failed");
 
   const signaled = await runPiAttempt(await options(root, [header(), terminal(), settled], null));
   assert.equal(signaled.failureKind, "unknown_transport");
