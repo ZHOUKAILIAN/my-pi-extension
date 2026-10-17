@@ -7,7 +7,7 @@
 | 想了解什么 | 产品定义：必须保证什么 | 技术说明：当前如何实现 |
 | --- | --- | --- |
 | Codex 额度与 Fast | [产品规范](01-产品定义/扩展/codex-usage-status-扩展.md) | [技术设计](02-产品实现/codex-usage-status-技术设计.md) |
-| 异步上下文压缩 | [产品规范](01-产品定义/扩展/async-compaction-扩展.md)（`REVIEWING`） | [技术方案与实现差距](02-产品实现/async-compaction-技术设计.md)；未实现 |
+| 异步上下文压缩 | [产品规范](01-产品定义/扩展/async-compaction-扩展.md)（`DECIDED`，方案已采纳） | [实现与验证差距](02-产品实现/async-compaction-技术设计.md)；默认关闭，离线 SDK/TUI 恢复已验证，真实网络/终端预览未验收 |
 | 通用 Subagent 委派 | [产品规范](01-产品定义/扩展/subagent-扩展.md) | [技术设计](02-产品实现/subagent-dispatcher-技术设计.md) |
 | Fix 问题处置 | [产品规范](01-产品定义/扩展/fix-扩展.md) | [技术设计](02-产品实现/fix-runtime-technical-design.md) |
 | Workflow 共享机制 | [Core 定义](01-产品定义/领域术语.md) | [Runtime 架构](02-产品实现/runtime-实现架构.md) |
