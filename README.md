@@ -93,11 +93,11 @@ pi --no-extensions -e ./packages/async-compaction/src/index.ts
 ## 验证
 
 ```bash
-npm test
+npm run test:agent
 npm run typecheck
 git diff --check
 ```
 
-这些命令验证当前仓库的代码与文档一致性，不代表真实 provider、长时 TUI 或生产环境 E2E 已通过。
+`test:agent` 执行与 `npm test` 相同的完整 Node 测试范围，并将完整报告保存在本机临时日志中；使用方法见[项目配置](docs/03-项目落地/项目配置.md#node-测试摘要)。这些命令不代表真实 provider、长时 TUI 或生产环境 E2E 已通过。
 
 历史选型和评审证据保存在 [docs/归档](docs/归档/README.md)，但不属于当前执行规则或正式真理源。
