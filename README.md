@@ -30,10 +30,12 @@ flowchart LR
     User --> Fix["/fix · @pi/fix"]
     User --> Subagent["subagent 工具 · @pi/subagent"]
     User --> Usage["额度状态栏 · /fast"]
+    User --> Async["/async-compact · @pi/async-compaction<br/>隔离主 TUI · 默认关闭"]
 
     Fix --> Runtime["@pi/workflow-runtime"]
     Fix --> Contracts["@pi/workflow-contracts"]
     Usage -. 可选 Fast interop .-> Subagent
+    Async -->|threshold 时校验复用候选| NativeCompaction["Pi 原生压缩<br/>提交与上下文重建"]
 ```
 
 | 类别 | 当前能力 | 明确边界 |
