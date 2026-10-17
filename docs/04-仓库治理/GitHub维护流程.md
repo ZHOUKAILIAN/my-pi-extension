@@ -37,10 +37,10 @@ PR 至少说明：
 - 执行的验证命令及结果；
 - 未执行检查、已知缺口和剩余风险。
 
-最低自动验证：
+最低自动验证（Agent 优先使用 `test:agent`，它运行与 `npm test` 相同的完整测试范围）：
 
 ```bash
-npm test
+npm run test:agent
 npm run typecheck
 ```
 

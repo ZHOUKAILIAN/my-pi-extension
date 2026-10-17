@@ -89,10 +89,10 @@ L5 只保留当前工作连续性，不覆盖正式层。归档可保留历史�
 - **所有 coding 修改必须经过 `implementer` → `code_reviewer` 流程**：只要任务需要产生源码、测试、脚本、构建/运行配置或 UI 的代码 diff，不论入口名称、规模、技术栈或是否为简单修复，都必须先由 `implementer` subagent 执行代码改动，再启动独立的 `code_reviewer` agent 进行代码评审；不因改动规模小、测试已通过或实现者自检通过而跳过。纯文档、纯调查、只读评审或未修改代码的任务不适用本条。
 - `implementer` 负责所有 coding 改动及自检，不能替代 `code_reviewer`；`code_reviewer` 负责独立检查需求符合度、仓库规范、状态/合同/版本/恢复/审计风险和测试覆盖。
 - `code_reviewer` 发现 P0/P1 或需要修复的 P2 后，必须由实现者修复，并对修复后的代码再次执行 `code_reviewer`；未完成复审不得将代码实现标记为完成。
-- 合并前至少运行：
+- Agent 优先使用 `npm run test:agent` 运行完整 Node 测试套件；它与 `npm test` 执行相同测试范围，并将完整日志写入本机临时目录。合并前至少运行：
 
 ```bash
-npm test
+npm run test:agent
 npm run typecheck
 ```
 

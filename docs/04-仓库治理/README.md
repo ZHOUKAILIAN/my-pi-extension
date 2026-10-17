@@ -14,6 +14,6 @@
 - 产品行为变化先更新 L1；L2 同步实现，或明确记录尚未实现的 drift。
 - 纯实现修复或重构若不改变产品契约，只更新 L2 和验证证据。
 - package、目录、构建或项目默认变化必须同步第三层。
-- 合并前运行 `npm test` 和 `npm run typecheck`。
+- Agent 优先运行 `npm run test:agent` 和 `npm run typecheck`；`test:agent` 执行与 `npm test` 相同的完整测试范围。
 - 文档移动或链接变化必须检查仓库内 Markdown 相对链接。
 - 第五层临时状态和归档材料不得被当作正式执行规则。
