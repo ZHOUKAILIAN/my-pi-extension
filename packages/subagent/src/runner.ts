@@ -294,6 +294,40 @@ function validAssistantMessageEvent(value: unknown): boolean {
   }
 }
 
+type JsonProtocolFamily = "pi-1.0" | "pi-1.1";
+
+/**
+ * Pi 1.1 adds duration metadata to assistant/tool wire records and tool-end
+ * events. The field is optional in 1.1 and absent from Pi 1.0.4's types;
+ * providerThinkingLevel, thinkingLevel, diagnostics, usage, and nested-call
+ * metadata are shared and must not be used as a version discriminator.
+ */
+function jsonProtocolFamilyForAgentMessage(value: unknown): JsonProtocolFamily | undefined {
+  if (!isRecord(value)) return undefined;
+  if ((value.role === "assistant" || value.role === "toolResult") && Object.prototype.hasOwnProperty.call(value, "durationMs")) return "pi-1.1";
+  return undefined;
+}
+
+/**
+ * Find version-specific fields through every stdout envelope that carries an
+ * AgentMessage or tool result. This is intentionally separate from structural
+ * validation: the field may arrive before settlement, so the family constraint
+ * is remembered and checked again when settlement identifies the wire family.
+ */
+function jsonProtocolFamilyForEvent(event: Record<string, unknown>): JsonProtocolFamily | undefined {
+  if (event.type === "tool_execution_end" && Object.prototype.hasOwnProperty.call(event, "durationMs")) return "pi-1.1";
+  const messages: unknown[] = [];
+  if (event.type === "message_start" || event.type === "message_end") messages.push(event.message);
+  else if (event.type === "turn_end") messages.push(event.message, ...(Array.isArray(event.toolResults) ? event.toolResults : []));
+  else if (event.type === "agent_end") messages.push(...(Array.isArray(event.messages) ? event.messages : []));
+  else if (event.type === "entry_appended" && isRecord(event.entry)) messages.push(event.entry.message);
+  else if (event.type === "message_update" && isRecord(event.assistantMessageEvent)) {
+    if (event.assistantMessageEvent.type === "done") messages.push(event.assistantMessageEvent.message);
+    else if (event.assistantMessageEvent.type === "error") messages.push(event.assistantMessageEvent.error);
+  }
+  return messages.some((message) => jsonProtocolFamilyForAgentMessage(message) === "pi-1.1") ? "pi-1.1" : undefined;
+}
+
 const JSON_EVENT_TYPES = new Set([
   "agent_start", "agent_end", "agent_settled",
   "turn_start", "turn_end",
@@ -313,12 +347,23 @@ function validRetryStartEvent(event: Record<string, unknown>): boolean {
   return exactKeys(event, ["type", "attempt", "maxAttempts", "delayMs", "errorMessage"]) && validNonNegativeInteger(event.attempt) && validNonNegativeInteger(event.maxAttempts) && validNonNegativeInteger(event.delayMs) && validRetryMessage(event.errorMessage);
 }
 
-/** Strict Pi 1.1.0 JSON event validator. Unknown event types and fields fail closed. */
+/**
+ * Pi 1.0.4 and 1.1.x use the same JSON event names, but settlement has two
+ * deliberately closed wire shapes. The shape is the protocol discriminator;
+ * no package version is inferred from arbitrary fields.
+ */
+function jsonProtocolFamilyForSettledEvent(event: Record<string, unknown>): JsonProtocolFamily | undefined {
+  if (exactKeys(event, ["type"])) return "pi-1.0";
+  if (exactKeys(event, ["type", "aborted"]) && typeof event.aborted === "boolean") return "pi-1.1";
+  return undefined;
+}
+
+/** Strict JSON event validator for the explicitly supported Pi wire shapes. */
 function validJsonEvent(event: Record<string, unknown>): boolean {
   if (typeof event.type !== "string" || !JSON_EVENT_TYPES.has(event.type)) return false;
   switch (event.type) {
     case "agent_start": return exactKeys(event, ["type"]);
-    case "agent_settled": return exactKeys(event, ["type", "aborted"]) && typeof event.aborted === "boolean";
+    case "agent_settled": return jsonProtocolFamilyForSettledEvent(event) !== undefined;
     case "agent_end": return exactKeys(event, ["type", "messages", "willRetry"]) && Array.isArray(event.messages) && event.messages.every(validAgentMessage) && typeof event.willRetry === "boolean";
     // Pi's JSON stdout maps AgentEvent directly; turn_start has no metadata.
     case "turn_start": return exactKeys(event, ["type"]);
@@ -797,6 +842,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
   let processFailure = false;
   let wasAborted = Boolean(options.signal?.aborted);
   let settledAborted = false;
+  let jsonProtocolFamily: JsonProtocolFamily | undefined;
 
   const blockedTexts = [options.task, options.agent.systemPrompt];
   const notify = () => options.onUpdate?.(sanitizeAttemptResult(result, options.model, blockedTexts));
@@ -813,7 +859,22 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       return;
     }
     if (!validJsonEvent(event)) { malformed = true; return; }
-    if (event.type === "agent_settled" && event.aborted) settledAborted = true;
+    const eventProtocol = event.type === "agent_settled" ? jsonProtocolFamilyForSettledEvent(event)! : undefined;
+    const fieldProtocol = jsonProtocolFamilyForEvent(event);
+    for (const requiredProtocol of [eventProtocol, fieldProtocol]) {
+      if (requiredProtocol === undefined) continue;
+      if (jsonProtocolFamily !== undefined && jsonProtocolFamily !== requiredProtocol) {
+        malformed = true;
+        return;
+      }
+      jsonProtocolFamily = requiredProtocol;
+    }
+    if (event.type === "agent_settled") {
+      // Pi 1.0.4 has no abort bit: a valid legacy settlement is not a
+      // cancellation signal. Its terminal assistant message remains the only
+      // protocol-level abort indication for that wire family.
+      settledAborted = settledAborted || (eventProtocol === "pi-1.1" && event.aborted === true);
+    }
     if (event.type === "message_start" && event.message?.role === "assistant") {
       terminal = undefined;
     }
