@@ -1299,6 +1299,8 @@ Node execution、身份、Guard、checkpoint；业务门禁 owner 待拆]
 
 ## 9. 验证入口
 
+`scripts/release-install.test.ts` 验证日常三扩展组合在 Pi 1.0.4 下的生产依赖安装与真实 loader/runner：`/fix` 注册、空参数返回用法、没有活跃 Worker 时允许导航、`session_start/shutdown` 无宿主吞掉的异常。测试只使用临时 agent 目录，不读取个人凭据、不创建真实 Worker。`@pi/fix` 生产安装不再携带自己的 Pi TUI，组件由宿主提供；原有 0.84.4 开发测试继续保留。1.0.4 的真实 provider、Worker 执行、编辑器和恢复全流程仍未验收。
+
 实现变化后至少运行：
 
 ```bash
