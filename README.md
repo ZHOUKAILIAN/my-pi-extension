@@ -1,6 +1,6 @@
 # my-pi-extension
 
-个人 Pi 扩展集合，包含问题处置 Workflow、通用子 Agent 委派、Codex 额度与 Fast 控制，以及默认关闭的异步压缩本地预览。
+个人 Pi 扩展集合，包含问题处置 Workflow、通用子 Agent 委派、Codex 额度与 Fast 控制、异步压缩本地预览，以及可选的个人 Cloudflare 项目指标。
 
 ## 结论先行
 
@@ -10,6 +10,7 @@
 | 问题处置 Workflow | `/fix` · `@pi/fix` | 调查、处置、评审、验证与人工验收；v2 主流程原型已实现。 |
 | 通用子 Agent 委派 | `subagent` 工具 · `@pi/subagent` | 隔离委派任务，支持持久 child session、恢复、瞬态重试与模型 fallback；已实现。 |
 | Codex 额度与 Fast 控制 | 状态栏、`/fast` · `@pi/codex-usage-status` | 展示 Codex 额度，并控制符合条件请求的 Fast 优先处理；已实现。 |
+| 个人项目指标 | `npm run metrics` · `@pi/project-metrics` | Fast 开启次数、后台生成耗时及前台压缩阶段耗时；私有 CF 上报与 CLI 查询已实现，远端采集需显式配置。 |
 
 这四个扩展职责独立：
 
@@ -54,13 +55,15 @@ flowchart LR
 | `@pi/codex-usage-status` | Pi extension | 额度状态栏、`/fast` 与 Fast interop producer | 已实现，真实 provider/TUI E2E 待验证 |
 | `@pi/workflow-runtime` | 共享 library | Workflow 状态机、Worker Session、Guard、重试、checkpoint 和恢复 | Pi SDK Runtime 原型已实现；部分 Fix 业务门禁仍待 owner 收敛 |
 | `@pi/workflow-contracts` | 共享 library | Stage、Artifact、Checkpoint、Worker 与提交接口合同 | 由 Workflow 入口和 Runtime 使用 |
-| `@pi/fix-metrics-cloudflare` | 服务端 PoC | 指标接收、快照、漏斗 API 与看板 | 仅合成数据，未接入真实 Fix telemetry；不是 Pi extension |
+| `@pi/project-metrics` | Node client + CLI + Worker | 跨扩展的私有待投递、幂等接收与统计查询 | 仅三类项目指标；按配置启用，提供 CLI，不提供业务看板 |
+| `@pi/fix-metrics-cloudflare` | 服务端 PoC | 合成 Fix 指标接收、快照、漏斗 API 与页面示例 | 仅合成数据；不是个人项目指标看板，也不是 Pi extension |
 
 ### 依赖关系
 
 - `@pi/fix` 依赖 `@pi/workflow-runtime` 与 `@pi/workflow-contracts`。
 - `@pi/subagent` 是独立的通用委派扩展，不属于 Workflow Runtime 层级。
 - `@pi/codex-usage-status` 独立于 Workflow Runtime；subagent 可选消费它提供的 Fast interop。
+- Fast 与 Async package 依赖 `@pi/project-metrics` 的 Node client；启用传输不改变两者的宿主兼容范围或加载限制。
 - `@pi/fix-metrics-cloudflare` 是独立服务端 PoC，不参与 Pi extension 运行时依赖。
 
 ## 开始阅读
@@ -71,6 +74,7 @@ flowchart LR
 | --- | --- |
 | 异步压缩 | [产品规范](docs/01-产品定义/扩展/async-compaction-扩展.md) · [技术说明](docs/02-产品实现/async-compaction-技术设计.md) |
 | Codex 额度与 Fast | [产品规范](docs/01-产品定义/扩展/codex-usage-status-扩展.md) · [技术设计](docs/02-产品实现/codex-usage-status-技术设计.md) |
+| 个人 CF 项目指标 | [产品规范](docs/01-产品定义/项目指标.md) · [实现与验证边界](docs/02-产品实现/项目指标-技术设计.md) · [安装和私有配置](docs/03-项目落地/项目配置.md#项目指标本地安装与采集) |
 | 通用 Subagent | [产品规范](docs/01-产品定义/扩展/subagent-扩展.md) · [技术设计](docs/02-产品实现/subagent-dispatcher-技术设计.md) |
 | Fix 问题处置 | [产品规范](docs/01-产品定义/扩展/fix-扩展.md) · [技术设计](docs/02-产品实现/fix-runtime-technical-design.md) |
 | Workflow 共享机制 | [Core 定义](docs/01-产品定义/领域术语.md) · [Runtime 架构](docs/02-产品实现/runtime-实现架构.md) |
@@ -89,6 +93,32 @@ pi --no-extensions -e ./packages/async-compaction/src/index.ts
 ```
 
 `--no-extensions` 禁用自动发现，仅保留这一条显式 `-e`；不要叠加其他 hook 扩展。此命令不写入全局 settings。候选在运行时默认 Off，手动压缩继续走原生路径；真实终端与 provider 性能尚未验收；离线 InteractiveMode 的收起、连续压缩和 JSONL 恢复已验证，具体限制见 [L2](docs/02-产品实现/async-compaction-技术设计.md)。
+
+## 本地安装与自动采集
+
+先使用包含本功能的仓库版本，在仓库根目录安装 npm workspace 依赖：
+
+```bash
+npm ci --ignore-scripts
+export PI_METRICS_CONFIG="$HOME/.pi/agent/project-metrics/config.json"
+```
+
+本机私有配置中的 `enabled: true` 表示允许远端采集；它还需指定自己的 Worker、namespace、独立读写密钥文件和待投递目录。配置文件与密钥不得进入 Git，JSON 内的文件路径必须是绝对路径。完整模板、私有权限及加载方式见[项目配置](docs/03-项目落地/项目配置.md#项目指标本地安装与采集)。`@pi/project-metrics` 是仓库内 workspace 依赖；本地加载前必须安装整个工作区，不能假设它已发布到 npm。
+
+配置一次并使环境变量对 Pi 进程生效后，加载新版 Fast 或 Async 扩展即可自动上报**实际产生的事件**，不需每次重新打开采集。不额外发送启动事件，不自动开启 Fast/Async 开关，也不回填历史。没有配置或 `enabled: false` 时不进行远端采集。
+
+两种扩展使用各自兼容宿主；Async 必须保持单扩展隔离入口，不能因为共用指标库就把两者加载到同一会话。新增项目指标的本地持久化、待投递与网络在后台调度，不被业务命令或压缩 hook 等待；原有 Session 诊断仍由 Pi 按宿主 API 处理。请求最多五秒，正常退出只给新增本地保存统一一秒预算，不等上传。
+
+在相同工作区和配置环境中查询或补报：
+
+```bash
+npm run metrics -- status
+npm run metrics -- stats                 # 默认 live 已接收数据
+npm run metrics -- stats --validation    # 单独查询隔离验证样本
+npm run metrics -- flush                 # 显式补报本配置目标的已保存队列
+```
+
+当前没有在线业务看板。业务趋势图需要另行实现前端；CF 自带的请求量、错误率、CPU 或数据库用量图属于运维指标，不会自动成为这里三项业务指标的图表。
 
 ## 验证
 

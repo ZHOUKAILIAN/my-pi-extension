@@ -61,7 +61,7 @@ flowchart LR
 
 - eligibility 与 cost correction 是两个独立控制面：能请求 `priority` 不等于能可靠计算 Fast 费用。
 - Spark 及其他 unknown GPT 型号只读取并展示默认 `rate_limit` bucket；不解析、不展示专属 Spark bucket，不把默认 bucket 的状态解释为 Spark 可用性，也不把 Fast Active 解释为 Spark 可用性。
-- 默认 Off，不自动重试或 fallback，不持久化 requested intent。
+- 默认 Off，不自动重试或 fallback，不持久化可恢复的 requested 运行状态。§2.4 的本地开启事实不用于恢复 Fast 开关。
 
 ### 2.3 Parent-Fast 继承例外
 
@@ -72,6 +72,18 @@ Fast 的 factory 默认 Off，一次性、受信任 launcher 例外如下：
 - `PI_CODEX_FAST=1` 是 child factory 的一次性 advisory trusted-launcher input，不是认证、安全边界或持久化配置。child 启动立即读取并删除它；缺失及任何非精确值均 Off。child reload/new/resume/fork 重新建 factory 后回到 Off。
 - 继承的只是 requested intent；child 自己再次执行 provider、API、base URL、OAuth 和模型 eligibility。Parent requested On 但 Inactive 时，eligible child 仍可 Active。已 spawn child 不受后续 toggle 影响；chain 与排队 parallel item 在各自实际 spawn 时取快照，而不是按整个 tool invocation 取快照。
 - role/source/config policy 属于 Subagent dispatcher integration，不是本 package 单独可验证的产品权限或认证机制；package 只保证协议和 child bootstrap 语义。Fast 激活通知必须明确说明新 spawn 的 selected user `implementer`/`code_reviewer` 会继承 requested Fast，同时对 unknown 型号保留 priority intent/cost 未校正提示。
+
+### 2.4 本地用户开启事实
+
+Fast 在包内记录用户手动开启事实，用于核对已记录的开启次数；这不是请求调用数，也不证明 provider 采用了 priority 或实际加速。
+
+- 只有合法用户命令使 requested 从 Off 变为 On 才尝试记录，包括 `hasUI=true` 的 TUI/RPC 和当前模型 Inactive 的情况。重复 `on`、关闭、查询状态、非法参数、非 UI 命令、模型切换、初始化、继承和 shutdown 不产生开启事实。
+- 每次事实在 Off→On 时捕获独立事件 ID、UTC 发生时间、用户命令来源和 schema 版本，后台持久化不得重取开关或把写入完成时间当作发生时间；命令不等待计量 I/O，退出完整性按[项目指标](../项目指标.md#3-投递与失败)的统一预算判定。不包含账号、授权、请求正文、Session 身份、工作目录或任务内容。完整记录按事件 ID 去重计数，不通过渲染、重放或复制制造新开启。
+- 记录保存在扩展自有的 Pi 本地状态目录，与 Session、assistant 回复及模型请求无关；无 assistant 即退出和 `--no-session` 也能保留正常写入完成的事件。自有目录与文件分别限制为 `0700`、`0600`，不得跟随不安全的存储目标或覆盖已有事件。
+- 计量记录不是运行配置，不从它恢复 requested，也不自动纳入 Pi Session export/share；不新增常驻状态栏或默认自动上报。显式远端采集许可见[个人项目指标](../项目指标.md)。
+- 通知或继承广播在状态变化后失败，也不应遮蔽已发生的开启。计量写入失败不回滚 Fast、不替换原业务错误；只作不含原异常的安全提示，无法确认或不完整记录不能宣称计数成功。不承诺崩溃或断电前尚未完成的 I/O 一定保存。
+
+本节只定义本地 producer；CF采集许可与通用投递规则见[个人项目指标](../项目指标.md)，具体接线、存储、测试和未部署边界由 L2 维护。
 
 额度状态遵循以下数据语义：
 
@@ -133,6 +145,8 @@ Fast 的 factory 默认 Off，一次性、受信任 launcher 例外如下：
 | F8 | parent requested Off | 任意新 spawn 均不带 Fast；状态按 session id 隔离，false/`session_shutdown` 清除对应 parent intent。 |
 | F9 | selected child inheritance | parent requested On 仅使 resolved USER-source 且 exact name/config 命中的 `implementer`、`code_reviewer` child 获得一次性 `PI_CODEX_FAST=1`；其他 user、project 和同名 project override 不继承。 |
 | F10 | bootstrap and timing | child 只读取并删除精确 `"1"`；child eligibility 独立决定 Active；reload/new/resume/fork Off；chain/queued parallel 按实际 spawn 快照；launcher 继承是 advisory、无持久化且不构成 package-only VERIFIED 证据。 |
+| F11 | 用户开启事实 | 只有用户 requested Off→On 产生一次独立本地事件；重复 on、关闭、status、非法/非 UI 命令、初始化/继承/模型切换/shutdown 不计。RPC 与 Inactive 的有效用户开启遵循同一口径；新 factory 不从记录恢复开关。 |
+| F12 | 记录持久化与隔离 | 无 assistant 和 `--no-session` 的正常写入仍可核对；文件身份、白名单、权限及不覆盖/不跟链接满足约束。写入或安全提示失败不改变 Fast，原通知/广播失败不遮蔽已发生的开启；不访问 CF、认证或用户会话原文。 |
 
 ## 7. 实现边界
 

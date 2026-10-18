@@ -1,5 +1,9 @@
-import test from 'node:test';
+import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, realpathSync } from 'node:fs';
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import extension, {
   FAST_COST_CORRECTION_MODEL_IDS,
   FAST_MODEL_IDS,
@@ -11,6 +15,67 @@ import extension, {
   isFastEligible,
   parseFastRequestedEvent,
 } from '../src/index.ts';
+
+// All extension-command harnesses in this file use a disposable Pi agent directory.
+const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+let suiteAgentDir: string;
+before(() => {
+  suiteAgentDir = mkdtempSync(join(realpathSync(tmpdir()), 'fast-mode-agent-'));
+  process.env.PI_CODING_AGENT_DIR = suiteAgentDir;
+});
+after(async () => {
+  if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+  else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+  await rm(suiteAgentDir, { recursive: true, force: true });
+});
+
+function isolatedEvents(t: { after(fn: () => void): void }): string {
+  const prior = process.env.PI_CODING_AGENT_DIR;
+  const root = mkdtempSync(join(suiteAgentDir, 'case-'));
+  process.env.PI_CODING_AGENT_DIR = root;
+  t.after(() => { if (prior !== undefined) process.env.PI_CODING_AGENT_DIR = prior; });
+  return join(root, 'metrics', 'codex-fast-enabled', 'v1');
+}
+
+async function eventRecords(path: string): Promise<Array<{ name: string; record: any }>> {
+  let names: string[];
+  try { names = await readdir(path); } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  }
+  return Promise.all(names.filter(name => name.endsWith('.json')).map(async (name) => ({ name, record: JSON.parse(await readFile(join(path, name), 'utf8')) })));
+}
+async function waitForEvents(path: string, count: number) {
+  const until = Date.now() + 1200;
+  for (;;) {
+    const records = await eventRecords(path);
+    if (records.length === count) return records;
+    if (Date.now() >= until) throw new Error(`expected ${count} completed Fast records, found ${records.length}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+async function waitForNotice(ctx: any) {
+  const until = Date.now() + 1200;
+  while (ctx._notices.at(-1)?.message !== '本次计量记录无法确认') {
+    if (Date.now() >= until) throw new Error('background warning missing');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+
+function commandHarness(emit: (name: string, data: unknown) => void = () => {}, dependencies: Parameters<typeof extension>[1] = {}): {
+  handlers: Map<string, Function>;
+  command: (args: string, ctx: any) => Promise<void>;
+} {
+  const handlers = new Map<string, Function>();
+  let command: ((args: string, ctx: any) => Promise<void>) | undefined;
+  extension({
+    on: (name: string, handler: Function) => handlers.set(name, handler),
+    events: { emit, on: () => () => {} },
+    registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
+  } as any, dependencies);
+  assert.ok(command);
+  return { handlers, command };
+}
 
 const FAST_ACTIVE_TEXT = '⚡ Fast';
 const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.';
@@ -402,6 +467,151 @@ test('known and unknown tickets stay FIFO-isolated and unknown cost remains unch
   controller.shutdown();
 });
 
+test('Fast sends the captured committed fact to the metric queue only after local write succeeds',async()=>{const records:any[]=[];let fact:any;const h=commandHarness(()=>{}, {writeFastEnabledEvent:async record=>{fact=record;return record;},submitMetric:async event=>{records.push(event);}});const ctx=context();await h.command('on',ctx);assert.deepEqual(records,[], 'writer/outbox must not run in the command');await h.command('on',ctx);await h.handlers.get('session_shutdown')?.({},ctx);assert.deepEqual(records,[{schemaVersion:1,eventId:fact.eventId,kind:'fast_enabled',occurredAt:fact.occurredAt,dataset:'live'}]);});
+
+test('only actual UI Off→On commands record independent events; model/initialization/shutdown never do', async (t) => {
+  const path = isolatedEvents(t);
+  const emitted: unknown[] = [];
+  const { handlers, command } = commandHarness((_name, data) => emitted.push(data));
+  const ctx = context();
+  handlers.get('session_start')?.({}, ctx);
+  assert.deepEqual(await eventRecords(path), []);
+  await command('on', ctx);
+  let records = await waitForEvents(path, 1);
+  assert.equal(records.length, 1);
+  assert.equal(records[0].name, `${records[0].record.eventId}.json`);
+  assert.deepEqual(Object.keys(records[0].record), ['schemaVersion', 'eventId', 'occurredAt', 'source']);
+  assert.equal(records[0].record.schemaVersion, 1);
+  assert.equal(records[0].record.source, 'user_command');
+  await command('on', ctx);
+  await command('status', ctx);
+  await command('invalid', ctx);
+  await command('off', ctx);
+  await command('toggle', ctx);
+  records = await waitForEvents(path, 2);
+  assert.equal(records.length, 2);
+  assert.notEqual(records[0].record.eventId, records[1].record.eventId);
+  await command('toggle', ctx);
+  await command('  ', ctx);
+  records = await waitForEvents(path, 3);
+  assert.equal(records.length, 3);
+  assert.equal(new Set(records.map(({ record }) => record.eventId)).size, 3);
+  const json = context(model(), { mode: 'json', hasUI: false });
+  await command('off', json);
+  await command('on', json);
+  assert.equal((await eventRecords(path)).length, 3);
+  handlers.get('model_select')?.({ model: model('gpt-'), previousModel: ctx.model, source: 'set' }, ctx);
+  handlers.get('session_shutdown')?.({}, ctx);
+  assert.equal((await eventRecords(path)).length, 3);
+  assert.deepEqual(emitted.filter((data: any) => data.requested === true).length, 3);
+
+  const next = commandHarness();
+  const newCtx = context();
+  next.handlers.get('session_start')?.({}, newCtx);
+  assert.equal(next.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, newCtx), undefined);
+  assert.equal((await eventRecords(path)).length, 3);
+});
+
+test('RPC and ineligible user intent count; inherited startup and model changes do not', async (t) => {
+  const path = isolatedEvents(t);
+  const previous = process.env.PI_CODEX_FAST;
+  try {
+    process.env.PI_CODEX_FAST = '1';
+    const child = commandHarness();
+    const inherited = context(model('gpt-'), { mode: 'rpc', hasUI: true });
+    child.handlers.get('session_start')?.({}, inherited);
+    child.handlers.get('model_select')?.({ model: model('gpt-5.4'), previousModel: inherited.model, source: 'set' }, inherited);
+    child.handlers.get('session_shutdown')?.({}, inherited);
+    assert.deepEqual(await eventRecords(path), []);
+    const parent = commandHarness();
+    await parent.command('on', context(model('gpt-'), { mode: 'rpc', hasUI: true }));
+    const records = await waitForEvents(path, 1);
+    assert.equal(records.length, 1);
+    assert.equal(records[0].record.source, 'user_command');
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODEX_FAST;
+    else process.env.PI_CODEX_FAST = previous;
+  }
+});
+
+test('no-assistant and no-session command paths persist without appending a session entry', async (t) => {
+  const path = isolatedEvents(t);
+  for (const noSession of [false, true]) {
+    const { command } = commandHarness();
+    const ctx = context(model(), {
+      sessionManager: {
+        getSessionId: () => noSession ? 'memory-only' : 'no-assistant',
+        getSessionFile: () => undefined,
+      },
+    });
+    await command('on', ctx);
+  }
+  assert.equal((await waitForEvents(path, 2)).length, 2);
+});
+
+test('original UI notification or bus errors after Off→On do not suppress the record or get replaced', async (t) => {
+  const path = isolatedEvents(t);
+  const notificationError = new Error('original notification error');
+  const brokenNotification = commandHarness();
+  const badCtx = context();
+  badCtx.ui.notify = () => { throw notificationError; };
+  await assert.rejects(brokenNotification.command('on', badCtx), (error: unknown) => error === notificationError);
+  assert.equal((await waitForEvents(path, 1)).length, 1);
+  assert.equal(brokenNotification.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, badCtx)?.service_tier, 'priority');
+
+  const busError = new Error('original bus error');
+  const brokenBus = commandHarness(() => { throw busError; });
+  const ctx = context();
+  await assert.rejects(brokenBus.command('on', ctx), (error: unknown) => error === busError);
+  assert.equal((await waitForEvents(path, 2)).length, 2);
+  assert.equal(brokenBus.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
+});
+
+test('storage and safety-notice failures neither leak path/error nor roll back Fast or bus', async (t) => {
+  const path = isolatedEvents(t);
+  const badRoot = join(path, 'no-such-root');
+  process.env.PI_CODING_AGENT_DIR = badRoot;
+  const emitted: unknown[] = [];
+  const { command, handlers } = commandHarness((_name, data) => emitted.push(data));
+  const ctx = context();
+  await command('on', ctx);
+  await waitForNotice(ctx);
+  assert.deepEqual(ctx._notices.at(-1), { message: '本次计量记录无法确认', type: 'warning' });
+  assert.equal(ctx._notices.some(({ message }: { message: string }) => message.includes(badRoot)), false);
+  assert.deepEqual(emitted.at(-1), { version: 1, sessionId: 'session-1', requested: true });
+  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
+  assert.deepEqual(await eventRecords(path), []);
+  const notices: string[] = [];
+  const another = commandHarness();
+  const noticeFailure = context();
+  noticeFailure.ui.notify = (message: string) => { notices.push(message); if (message === '本次计量记录无法确认') throw new Error('notice failed'); };
+  await another.command('on', noticeFailure);
+  const until = Date.now() + 1200;
+  while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(notices.at(-1), '本次计量记录无法确认');
+  assert.equal(another.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, noticeFailure)?.service_tier, 'priority');
+});
+
+test('unsafe directory permission and simultaneous bus failure keep the original exception', async (t) => {
+  const path = isolatedEvents(t);
+  const root = process.env.PI_CODING_AGENT_DIR as string;
+  await mkdir(join(root, 'metrics'), { mode: 0o755 });
+  const busError = new Error('original bus error');
+  const notices: string[] = [];
+  const { command, handlers } = commandHarness(() => { throw busError; });
+  const ctx = context();
+  ctx.ui.notify = (message: string) => {
+    notices.push(message);
+    if (message === '本次计量记录无法确认') throw new Error('safety notify error');
+  };
+  await assert.rejects(command('on', ctx), (error: unknown) => error === busError);
+  const until = Date.now() + 1200;
+  while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(notices.at(-1), '本次计量记录无法确认');
+  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
+  assert.deepEqual(await eventRecords(path), []);
+});
+
 test('a new extension factory starts Fast Off even after another instance was turned On', async () => {
   const makeHarness = () => {
     const handlers = new Map<string, Function>();
@@ -574,12 +784,12 @@ test('/fast refreshes the merged widget without re-running usage work', async ()
     await command?.('on', ctx);
     assert.equal(authCalls, before.authCalls);
     assert.equal(fetchCalls, before.fetchCalls);
-    assert.equal(timerCalls, before.timerCalls);
+    assert.equal(timerCalls, before.timerCalls, 'Fast command does not start a local-commit deadline');
     assert.match(widgetRows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.fetch = originalFetch;
-    handlers.get('session_shutdown')?.({}, ctx);
+    await handlers.get('session_shutdown')?.({}, ctx);
   }
 });
 

@@ -6,7 +6,7 @@
 | --- | --- |
 | 产品契约 | [Codex Usage Status + Fast 产品规范](../01-产品定义/扩展/codex-usage-status-扩展.md) |
 | 源码 | [`packages/codex-usage-status/src/`](../../packages/codex-usage-status/src/) |
-| 当前状态 | 额度、Fast、费用修正和 Subagent 继承接线已有实现与自动化测试；真实 TUI/provider/child 组合 E2E 未验证 |
+| 当前状态 | 额度、Fast、费用修正、Subagent 继承及本地开启事件已有实现；成功写入的事件已接显式许可下的项目指标本地outbox/Worker投递。真实RPC、CF部署及投递验收状态见[项目指标实现](项目指标-技术设计.md)；真实 TUI/provider/child 组合未验证；查询仅CLI，无私有看板 |
 
 ## 1. 模块与接线
 
@@ -21,6 +21,9 @@ flowchart LR
     fast -->|请求改写与费用处理| hooks[Provider / Message hooks]
     entry --> interop[interop.ts]
     interop -->|requested 事件| child[Subagent consumer]
+    entry --> event[fast-enabled-event.ts]
+    event -->|完整本地事件文件| local[Pi agentDir / metrics / codex-fast-enabled / v1]
+    entry -->|成功提交记录ID/时间| metrics[项目指标私有 outbox / CLI]
 ```
 
 | 文件 | 责任 |
@@ -29,6 +32,7 @@ flowchart LR
 | [`usage.ts`](../../packages/codex-usage-status/src/usage.ts) | 授权作用域、额度查询、快照有效性、唯一合并 widget |
 | [`fast.ts`](../../packages/codex-usage-status/src/fast.ts) | 请求意图、模型资格判断、payload 改写、响应关联和费用修正；只提供展示快照 |
 | [`interop.ts`](../../packages/codex-usage-status/src/interop.ts) | 进程内 requested 事件与 child 一次性启动参数；通过 `@pi/codex-usage-status/interop` 提供公共协议 |
+| [`fast-enabled-event.ts`](../../packages/codex-usage-status/src/fast-enabled-event.ts) | 每次有效用户开启写一份独立私有的本地事件文件；不处理读取、恢复或投递 |
 
 `session_start`、`input`、`model_select`、`agent_settled` 更新状态；`before_provider_request` 交给 Fast 改写请求，`message_end` 交给 Fast 处理费用。`session_shutdown` 发布 requested=false，并清理 Controller 的计时器、状态和队列。
 
@@ -107,6 +111,14 @@ flowchart LR
 
 未知型号激活、查询状态，以及涉及未知型号的模型切换（包括 unknown→unknown）会提示：priority 只是请求意图，费用未校正/不保证。切回已知型号使用对应通知和费用策略。TUI 通知可带颜色，RPC 保持纯文本。
 
+### 本地开启事件 producer
+
+`index.ts` 的 `/fast` handler 记录命令执行前的 requested，并在 `finally` 中检查 `hasUI=true` 且实际 Off→On。`on`、空参数和 `toggle` 依原有命令语义触发；重复 `on`、Off 方向、`status`、非法/非 UI 命令均不写。通知或 requested bus 发布在状态改变后抛错时仍尝试写入，保留原业务错误；事件写入失败仅尝试发送固定警告 `本次计量记录无法确认`，警告失败也不逃逸，Fast 不回滚。启动、child 继承、模型切换和 shutdown 不调用 producer。RPC 的 `hasUI=true` 命令与 TUI 同口径，模型 Inactive 时仍记录用户 requested 意图。
+
+producer 用 Pi 0.84.4 公开的 `getAgentDir()`，在 `<agentDir>/metrics/codex-fast-enabled/v1/` 写入每次开启的独立 `<eventId>.json`。JSON 精确字段为 `{ "schemaVersion": 1, "eventId": "UUID", "occurredAt": "UTC ISO 8601", "source": "user_command" }`；文件名中的 UUID 与内容一致。`metrics`、`codex-fast-enabled`、`v1` 创建时均为 `0700`；已存在的自有目录必须是 `0700`，符号链接或非目录拒绝，拒绝不合规权限而不调整 Pi 根或其他目录。事件临时文件 `0600`，先完整写入并同步，再通过排他 hard link 提交到最终文件名，提交后删除临时文件；已存在的文件/链接不覆盖。只有完整合法的 `.json` 文件可按 eventId 去重计数，`.tmp`、损坏或未完成文件不计成功；当前没有读取方。此目录是本地元数据而非 outbox；不会扫描旧文件作远端回填，崩溃/断电前未完成的 I/O 不保证保存。成功提交的记录ID和时间由命令接缝交给[项目指标投递链](项目指标-技术设计.md)，仅在显式配置启用时入独立私有outbox。
+
+记录独立于 SessionManager、assistant、授权和额度查询：无 assistant 或 `--no-session` 的正常命令写入仍留在本地；不调用 `appendEntry`，不从事件恢复 requested，也不经 Pi Session export/share。本地记录模块不读 session、凭证、prompt、账号或模型内容，不发 HTTP；投递由独立项目指标client读取显式私有配置并执行，不产生跨会话常驻展示。本地存储文件不能等同云端已接收统计；Cloudflare 尚未部署。
+
 ## 4. Subagent 继承
 
 | 边界 | 当前机制 |
@@ -123,7 +135,9 @@ flowchart LR
 
 | 范围 | 证据入口 / 状态 |
 | --- | --- |
-| Fast、FIFO、费用、通知与 hooks | [`fast-mode.test.ts`](../../packages/codex-usage-status/test/fast-mode.test.ts) |
+| Fast、FIFO、费用、通知、hooks 及开启事件命令链 | [`fast-mode.test.ts`](../../packages/codex-usage-status/test/fast-mode.test.ts) |
+| 本地事件 schema、私有权限、排他写入、链接与非目录拒绝 | [`fast-enabled-event.test.ts`](../../packages/codex-usage-status/test/fast-enabled-event.test.ts) |
+| Fast 0.84.4 真实RPC命令与本地Worker loopback | 已执行离线：Off→On有效命令得到2条本地记录、2条已接收，pending=0；不是Cloudflare验收 |
 | 额度 DTO、授权、刷新、过期、UI 与副作用 | [`usage.test.ts`](../../packages/codex-usage-status/test/usage.test.ts) |
 | 仓库内 child 继承接线 | [`fast-inheritance.test.ts`](../../packages/subagent/test/fast-inheritance.test.ts) |
 | 真实 TUI / provider / child 组合 | 未验证；自动化不等于真实运行时 E2E |
@@ -133,4 +147,4 @@ flowchart LR
 
 额度失败不阻塞、取消或改变模型请求；本扩展不自动重试/fallback 模型请求，也不持久化 Fast 意图。授权和 usage 接口是外部依赖，不能可靠读取时显示不可用，不估算额度。
 
-自动化入口为根目录 `npm test` 与 `npm run typecheck`。固定 revision 的评审与验证记录见[证据归档](../归档/评审/codex-usage-status-fast-gpt-v1-交付记录.md)，不作为当前测试执行结果。
+自动化入口为根目录 `npm run test:agent` 与 `npm run typecheck`。固定 revision 的评审与验证记录见[证据归档](../归档/评审/codex-usage-status-fast-gpt-v1-交付记录.md)，不作为当前测试执行结果。

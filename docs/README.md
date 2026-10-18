@@ -12,6 +12,7 @@
 | Fix 问题处置 | [产品规范](01-产品定义/扩展/fix-扩展.md) | [技术设计](02-产品实现/fix-runtime-technical-design.md) |
 | Workflow 共享机制 | [Core 定义](01-产品定义/领域术语.md) | [Runtime 架构](02-产品实现/runtime-实现架构.md) |
 | Feature / 独立 Workflow UI | [Feature](01-产品定义/扩展/feature-扩展.md)、[Workflow UI](01-产品定义/扩展/workflow-ui-扩展.md) | 尚无对应 package；见[实现入口](02-产品实现/README.md) |
+| 个人 CF 项目指标（CLI） | [产品规范](01-产品定义/项目指标.md) | [实现与部署差距](02-产品实现/项目指标-技术设计.md) |
 | Fix 指标服务 PoC | 范围与限制见 package 说明 | [package README](../packages/fix-metrics-cloudflare/README.md) |
 
 只研究 Codex 或通用 Subagent 时，无需先读 Workflow Core。完整任务导航见[文档地图](03-项目落地/文档地图.md)。

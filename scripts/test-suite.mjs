@@ -54,6 +54,7 @@ export async function launchNativeSuite({ root = repoRoot, additionalFiles = [],
   return new Promise((done) => {
     const childEnv = { ...process.env };
     delete childEnv.NODE_TEST_CONTEXT;
+    delete childEnv.PI_METRICS_CONFIG;
     const child = spawn(command.executable, command.args, { cwd: root, env: childEnv, stdio: captureOutput ? ['ignore', 'pipe', 'pipe'] : 'inherit' });
     const stdout = [];
     const stderr = [];

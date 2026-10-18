@@ -17,25 +17,32 @@ function helpArgumentPrefix(argv) {
 }
 
 export async function runAgentTests({ argv = process.argv.slice(2), root = repoRoot } = {}) {
-  let exitCode;
-  const helpArgv = helpArgumentPrefix(argv);
-  if (helpArgv) {
-    const quiet = { write() {} };
-    const helpExitCode = await runCli({ argv: helpArgv, cwd: root, files: [], nodeArgs: [], snapshot: 'git', output: quiet, errorOutput: quiet });
-    if (helpExitCode === 0) exitCode = await runCli({ argv: helpArgv, cwd: root, files: [], nodeArgs: [], snapshot: 'git' });
+  const metricsConfig = process.env.PI_METRICS_CONFIG;
+  delete process.env.PI_METRICS_CONFIG;
+  try {
+    let exitCode;
+    const helpArgv = helpArgumentPrefix(argv);
+    if (helpArgv) {
+      const quiet = { write() {} };
+      const helpExitCode = await runCli({ argv: helpArgv, cwd: root, files: [], nodeArgs: [], snapshot: 'git', output: quiet, errorOutput: quiet });
+      if (helpExitCode === 0) exitCode = await runCli({ argv: helpArgv, cwd: root, files: [], nodeArgs: [], snapshot: 'git' });
+    }
+    if (exitCode === undefined) {
+      const command = await buildNodeTestCommand({ root, rejectTestHooks: true });
+      exitCode = await runCli({
+        argv,
+        cwd: root,
+        files: command.files,
+        nodeArgs: command.nodeArgs,
+        snapshot: 'git',
+      });
+    }
+    if (exitCode !== 0) process.exitCode = exitCode;
+    return exitCode;
+  } finally {
+    if (metricsConfig === undefined) delete process.env.PI_METRICS_CONFIG;
+    else process.env.PI_METRICS_CONFIG = metricsConfig;
   }
-  if (exitCode === undefined) {
-    const command = await buildNodeTestCommand({ root, rejectTestHooks: true });
-    exitCode = await runCli({
-      argv,
-      cwd: root,
-      files: command.files,
-      nodeArgs: command.nodeArgs,
-      snapshot: 'git',
-    });
-  }
-  if (exitCode !== 0) process.exitCode = exitCode;
-  return exitCode;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

@@ -46,6 +46,8 @@ test("SDK threshold fallback commits natively while physical background slot is 
     assert.equal(background, 1, JSON.stringify(errors));
     await session.prompt(user(3)); // bounded wait expires while the background request is still pending
     assert.ok(sm.getBranch().some(e => e.type === "compaction" && !e.fromHook), JSON.stringify(errors));
+    const stage = sm.getBranch().find(e => e.type === "custom" && e.customType === "async-compact-timing" && e.data?.kind === "foreground_compaction");
+    assert.ok(stage && stage.data.outcome === "completed" && stage.data.durationMs >= 0, "waiting then native fallback is one completed foreground stage");
     assert.equal(background, 1);
     assert.equal(sm.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-usage").length, 0);
     await session.prompt(user(4));

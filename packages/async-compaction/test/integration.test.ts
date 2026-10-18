@@ -61,6 +61,7 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     assert.equal(sm.getSessionId(), id);
     const projected = sm.buildSessionProjection().messages.map(text).join("\n");
     for (const value of ["user-2", "assistant-2", "user-3", "assistant-3"]) assert.ok(projected.includes(value), value);
+    assert.doesNotMatch(projected, /async-compact-timing|schemaVersion/, "diagnostic entries never enter model context");
     const jsonl = readFileSync(sm.getSessionFile()!, "utf8");
     for (const value of ["user-1", "assistant-1", "user-2", "assistant-2", "user-3", "assistant-3"]) assert.ok(jsonl.includes(value), value);
     assert.equal(errors.length, 0, JSON.stringify(errors));
@@ -73,6 +74,16 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     assert.equal(compressed[1].summary, compact.summary, "host event for matching summary may report the older entry");
     assert.notEqual(compressed[1].id, compact.id);
     assert.ok(sm.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-usage").some(e => e.data?.attemptId === compressed[1].details?.attemptId && e.data?.outcome === "adopted"));
+    const timings = sm.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-timing").map(e => e.data);
+    assert.ok(timings.some(d => d.kind === "background_generation" && d.durationMs >= 0 && d.outcome === "completed"), "physical background completion gets its own timing sample");
+    assert.ok(timings.some(d => d.kind === "foreground_compaction" && d.durationMs >= 0 && d.outcome === "completed"), "native threshold completion gets a separate foreground stage sample");
+    for (const sample of timings) assert.deepEqual(Object.keys(sample).sort(), ["durationMs", "kind", "model", "outcome", "provider", "sampleId", "schemaVersion", "startedAtUTC"].sort());
+    const jsonlWithTiming = readFileSync(sm.getSessionFile()!, "utf8");
+    assert.match(jsonlWithTiming, /async-compact-timing/);
+    const restored = SessionManager.open(sm.getSessionFile()!, dir, cwd);
+    const restoredTimings = restored.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-timing");
+    assert.equal(restoredTimings.length, timings.length, "both timing kinds survive JSONL reopen");
+    assert.deepEqual(restoredTimings.map(e => e.data.kind).sort(), timings.map(e => e.kind).sort());
     await session.compact();
     const manual = sm.getBranch().filter(e => e.type === "compaction").at(-1);
     assert.ok(manual && manual.id !== compact.id);

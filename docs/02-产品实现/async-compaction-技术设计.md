@@ -93,6 +93,7 @@ flowchart TD
 | `controller.ts` | 管理开关、会话代际、后台模型请求与响应结算、内存候选、冷却和取消 |
 | `compaction.ts` | 稳定前缀选择、摘要提示词构造、文件记录、来源及预算校验 |
 | `reporting.ts` | 按需过程提示、用量记录和去重 |
+| `timing.ts` | schemaVersion 1 的本地阶段耗时记录、epoch 隔离及历史 renderer |
 
 Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只有宿主负责提交压缩记录。
 
@@ -192,13 +193,14 @@ threshold 路径依次执行：
 | 换模型、provider、system/tools 或相关设置 | 候选保守失效；不自动启动跨厂商请求 |
 | 用户停止当前运行 | 终端裸 Esc 或 Pi TUI 识别的 Kitty/CSI-u Esc 触发本扩展的取消，不消费按键或主动中止正常前台推理；停止后的迟到结果只结算用量，不继续留作后续采用 |
 | timeout、限流、失败 | 记录终态，释放本扩展任务槽，按预算冷却；原上下文继续有效 |
-| shutdown | 禁止启动和采用，取消任务并有界结算已知用量；未结算部分记 unknown，不阻塞退出，不使用失效 context 写入新会话 |
+| shutdown | 禁止启动和采用，取消任务并有界结算已知用量；未结算后台计时以 `scope_left` 记 unknown，不阻塞退出，不使用失效 context 写入新会话 |
+| timing scope | Session/Extension 实例生命周期 epoch 独立于候选 generation；Off、Esc 和 native commit 不截断已开始计时，leave/reset 使旧样本不可写入新 scope。threshold 前台样本在匹配成功/失败 hook 入口结算；manual、overflow、Off 和不支持场景不开始样本 |
 
 执行摘要时显示 `async-compact generating` 过程提示，hook 等待期间显示 `waiting for background summary`；启用且受支持的 threshold 路径，包括 input preflight 禁止采用的旁路，在交还原生时显示 `native fallback`，原生完成/失败或离开后收起。manual/overflow 仍走宿主原生提示，不标为候选兜底。非模型上下文 custom progress entry 含 attemptId 与渲染 revision；阶段变化和终态用 entry 触发重绘。不占 footer、不抢输入，也不覆盖宿主工作消息或其他 overlay。
 
 每次尝试单独记录已知 usage：SDK 合成的全零用量或没有可证明计量的响应标为 unknown，不解释为免费；error/aborted 响应有正数计量时保存这些值并标为 partial（余量未知）；stop/length/toolUse 的正数计量标为 reported。以物理响应终结状态而非本地取消标志判断完整性，迟到成功响应可为 reported。采用结果的已知 usage 交给原生 CompactionEntry；未采用请求需额外账目，不能假定自动进入原生会话总计。不进入模型上下文的 custom usage entry 记录 attemptId、型号、终态、已知用量及采用关系，详情按需展开，常规行展示已知 input/output/cache/total tokens 与 SDK 估算 cost，展开行显示费用分项及 reasoning/cacheWrite1h 子集；partial 保留已知数和未知余量，unknown 不标为零。已采用计入原生 totals，额外请求单列，避免重复。
 
-候选和原文副本只保存在内存，不新增摘要缓存文件。可持久化的诊断只包含上述最小字段，不保存原始 prompt、headers、provider body 或凭证。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复。
+候选和原文副本只保存在内存，不新增摘要缓存文件。usage 及阶段耗时诊断只通过 Pi 非模型上下文 custom entry 写入 Session JSONL，不新增独立数据库或传输；阶段记录为 schemaVersion 1，包含 sampleId、kind、startedAtUTC（时钟不可读时为 null）、durationMs、outcome、model/provider 和有限 unknownReason；时钟无效或物理终态不可观察时，durationMs 为 null 且 outcome 为 unknown，不伪造纪元时间或零耗时。不保存会话标识、原始 prompt、headers、provider body 或凭证。后台生成从 streamSimple 调用前开始，在 result resolve/reject 第一时间单调计时结算；前台阶段从符合条件的 threshold handler 入口开始，到宿主 compact/compact_failed 入口结算。阶段结束后以两个独立 renderer 标签显示秒数或“未知”。`reporting.ts` 对 progress/usage append 的公共出口做 best-effort 隔离，Controller 与命令提示异常也不传播到模型/原生 hook；诊断写入失败时不宣称记录成功、不补造样本、不重试，继续既有候选、取消、usage 与原生压缩路径。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复；`--no-session` 记录仅在当前进程可见。
 
 ## 8. 验证计划
 
@@ -219,6 +221,7 @@ threshold 路径依次执行：
 
 | 目标 / 问题 | 当前事实 | 处理 |
 | --- | --- | --- |
+| 本地阶段耗时 | `timing.ts` 记录后台生成与前台压缩 hook 阶段；单调时钟计算、wall-clock 仅作 UTC 定位、终态去重、未知值及历史本地展示已实现。streamSimple 或 result 同步抛错时计时为 observation_failed，并保留未确认物理终态的请求槽；两个 SDK 同步故障类型有包内单测 | 两个支持版本的实际 CLI 前台 hook 耗时与 JSONL 恢复仍需独立 verifier 验证；日/周环比看板尚未实现，不替代 A12 效果验收 |
 | 后台生成、验证、原生接入 | `packages/async-compaction/src/` 已实现完整用户切点、有效投影 hash、原生 threshold hook；离线 fake provider 连续两次相同摘要的实际提交已验证 | 失败/overflow 组合与其他 handler 条件提交仍需验证；仅隔离 CLI profile 允许采用 |
 | 原生压缩入口复用 | 已注册 threshold hook 并交还 Pi 提交；单次隔离 SDK 命中已验证 | 以候选复用率、全量压缩等待及原生行为兼容为验收输入 |
 | 主对话识别与提示 | 命令仅接受 TUI、指定版本的实际 CLI 路径、`--no-extensions -e packages/async-compaction/src/index.ts` 且单一显式 extension；Pi 1.0.4 实际 CLI + PTY、本地合成 SSE 验证启停、阶段重绘与编辑草稿保留；1.0.4/1.1.0 SDK 验证裸 Esc 和 Kitty/CSI-u Esc | 其他启动组合未开放；人工物理终端体验见效果验收项 |
