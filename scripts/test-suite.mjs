@@ -41,11 +41,12 @@ export async function buildNodeTestCommand({ root = repoRoot, reporter, reporter
   const discoveredFiles = await discoverSuiteFiles(root);
   const files = [...discoveredFiles, ...additionalFiles.map((file) => resolve(root, file))];
   if (!files.length) throw new Error('No Node test files found');
-  const args = ['--experimental-strip-types'];
+  const nodeArgs = ['--experimental-strip-types'];
+  const args = [...nodeArgs];
   if (reporter) args.push(`--test-reporter=${reporter}`);
   if (reporterDestination) args.push(`--test-reporter-destination=${reporterDestination}`);
   args.push('--test', ...discoveredFiles.map((file) => relative(root, file)), ...additionalFiles);
-  return { executable: process.execPath, args, files };
+  return { executable: process.execPath, args, files, nodeArgs };
 }
 
 export async function launchNativeSuite({ root = repoRoot, additionalFiles = [], captureOutput = false } = {}) {
