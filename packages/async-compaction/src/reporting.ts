@@ -21,6 +21,7 @@ export class Reporting {
   private active = new Map<string, { phase: Phase; revision: number }>();
   private recorded = new Set<string>();
   private pi: ExtensionAPI;
+  private append(type: string, data: unknown) { try { this.pi.appendEntry(type, data); } catch { /* diagnostics are best-effort and never alter compaction */ } }
   constructor(pi: ExtensionAPI) {
     this.pi = pi;
     pi.registerEntryRenderer<{ attemptId: string; revision: number }>("async-compact-progress", entry => ({ render: width => {
@@ -42,18 +43,18 @@ export class Reporting {
   phase(id: string, phase: Phase) {
     const revision = (this.active.get(id)?.revision ?? 0) + 1;
     this.active.set(id, { phase, revision });
-    this.pi.appendEntry("async-compact-progress", { attemptId: id, revision });
+    this.append("async-compact-progress", { attemptId: id, revision });
   }
   finish(data: RecordData) {
     this.hide(data.attemptId);
 
     if (this.recorded.has(data.attemptId)) return;
     this.recorded.add(data.attemptId);
-    this.pi.appendEntry("async-compact-usage", data);
+    this.append("async-compact-usage", data);
   }
   hide(id: string, refresh = false) {
     if (!this.active.delete(id)) return;
     // A context-free entry causes InteractiveMode to render immediately, even without another user event.
-    if (refresh) this.pi.appendEntry("async-compact-progress", { attemptId: id, revision: 0 });
+    if (refresh) this.append("async-compact-progress", { attemptId: id, revision: 0 });
   }
 }

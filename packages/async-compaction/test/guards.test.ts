@@ -77,16 +77,20 @@ test("enabled threshold input preflight preserves native ownership and shows/cle
     events.get("agent_end")!({ messages: [] }, ctx);
     events.get("input")!({ type: "input", text: "/skill:large-prompt", source: "interactive" }, ctx);
     assert.equal(await events.get("session_before_compact")!(event("threshold"), ctx), undefined);
+    assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 0, "the sample is persisted at the matching terminal hook, not at start");
     assert.equal(entries.filter(e => e.kind === "async-compact-progress").length, 1, "preflight bypass shows fallback without offering");
     const progress = entries[0];
     assert.deepEqual(renderer(progress).render(80), ["async-compact native fallback"]);
     events.get("session_compact")!({ compactionEntry: {} }, ctx);
+    assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 1, "threshold input preflight still records a stage without a background attempt");
+    assert.equal(entries.find(e => e.kind === "async-compact-timing")?.data.kind, "foreground_compaction");
     assert.deepEqual(renderer(progress).render(80), [], "terminal native event clears it without new input");
     assert.equal(await events.get("session_before_compact")!(event("manual"), ctx), undefined);
     assert.equal(entries.filter(e => e.kind === "async-compact-progress").length, 2, "manual does not add a fallback phase");
     await handler("off", ctx);
     assert.equal(await events.get("session_before_compact")!(event("threshold"), ctx), undefined);
     assert.equal(entries.filter(e => e.kind === "async-compact-progress").length, 2, "Off remains silent");
+    assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 1, "Off and unsupported opportunities do not create a foreground sample");
   } finally { process.argv = argv; }
 });
 test("effective compaction settings respect auto-disabled and model override", () => {
@@ -100,7 +104,7 @@ test("progress renders only while active; usage entries are deduplicated and con
   const entries: { kind: string; data: unknown }[] = [];
   let renderer!: (entry: { data: { attemptId: string } }) => { render(width: number): string[] };
   let usageRenderer!: (entry: { data: unknown }, options: unknown, theme: { fg: (color: string, text: string) => string }) => { render(width: number): string[] };
-  const pi = { appendEntry: (kind: string, data: unknown) => entries.push({ kind, data }), registerEntryRenderer: (kind: string, fn: typeof renderer) => { if (kind === "async-compact-progress") renderer = fn; else usageRenderer = fn as typeof usageRenderer; } };
+  const pi = { appendEntry: (kind: string, data: unknown) => entries.push({ kind, data }), registerEntryRenderer: (kind: string, fn: typeof renderer) => { if (kind === "async-compact-progress") renderer = fn; else if (kind === "async-compact-usage") usageRenderer = fn as typeof usageRenderer; } };
   const report = new Reporting(pi as never);
   report.start("a");
   assert.deepEqual(renderer({ data: { attemptId: "a", revision: 1 } }).render(80), ["async-compact generating"]);
