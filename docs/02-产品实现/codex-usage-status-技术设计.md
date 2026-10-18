@@ -140,10 +140,11 @@ producer 用 Pi 0.84.4 公开的 `getAgentDir()`，在 `<agentDir>/metrics/codex
 | Fast 0.84.4 真实RPC命令与本地Worker loopback | 已执行离线：Off→On有效命令得到2条本地记录、2条已接收，pending=0；不是Cloudflare验收 |
 | 额度 DTO、授权、刷新、过期、UI 与副作用 | [`usage.test.ts`](../../packages/codex-usage-status/test/usage.test.ts) |
 | 仓库内 child 继承接线 | [`fast-inheritance.test.ts`](../../packages/subagent/test/fast-inheritance.test.ts) |
-| 真实 TUI / provider / child 组合 | 未验证；自动化不等于真实运行时 E2E |
-| 安装与宿主依赖 | [项目配置](../03-项目落地/项目配置.md#pi-package-依赖安排)，以 manifest/lockfile 为准 |
+| Pi 1.0.4 loader、ExtensionRunner、命令/event bus、UI widget、请求替换、AI cost helper 与 shutdown | 使用本机 1.0.4 的真实 loader/runner 加载 package 并执行，核对组件 factory/`belowEditor`/ANSI 截断和 1.0.4 `calculateCost` 输出，无模型 HTTP 请求；可用 `PI_CODING_AGENT_1_0_4_PATH=<package-dir> node --experimental-strip-types --test packages/codex-usage-status/test/pi-1.0.4-compat.test.ts` 重复验证。peerDependencies 保留 Pi 0.84.4 系列，并显式支持 1.0.4 的 `pi-coding-agent`、`pi-ai`、`pi-tui`；没有扩大到其他 1.x 版本。依据为本机宿主 package manifest（其 AI/TUI 依赖均为 1.0.4）、ExtensionRunner/loader 实现与兼容测试 |
+| Pi 1.0.4 tree cancellation | ExtensionRunner 源码确认 before-event 的 `{ cancel: true }` 会提前返回，AgentSession 只在未取消的流程后发 `session_tree`；package 的取消/退出隔离仍由 `fast-nonblocking.test.ts` 模拟接缝验证，未以真实 SessionManager 执行 tree 导航 |
+| 真实交互式终端、真实账户额度请求、provider 对外请求及真实 child spawn | 未验证；兼容 smoke test 不访问凭据、不发模型请求，也不构成 TUI/provider/child E2E |
 
-扩展只保证自身 hook 的输出。Pi 0.84.4 没有最终 payload 或最终持久化 message 的可观测 hook：后续请求 handler 可能改写 priority，其他消息 handler 可能改写 model/session、usage token 或 cost。因此支持费用关联与持久化结果的组合要求这些输入和结果不被其他 handler 改变；不能从 Active 推断 provider 接受 priority、实际加速或最终费用。
+扩展只保证自身 hook 的输出。Pi 0.84.4 与 1.0.4 均没有最终 provider payload 或最终持久化 message 的可观测 hook；1.0.4 增加的 `before_provider_headers` 只允许修改请求头，不能证明最终请求 payload。后续请求 handler 可能改写 priority，其他消息 handler 可能改写 model/session、usage token 或 cost。因此支持费用关联与持久化结果的组合要求这些输入和结果不被其他 handler 改变；不能从 Active 推断 provider 接受 priority、实际加速或最终费用。
 
 额度失败不阻塞、取消或改变模型请求；本扩展不自动重试/fallback 模型请求，也不持久化 Fast 意图。授权和 usage 接口是外部依赖，不能可靠读取时显示不可用，不估算额度。
 

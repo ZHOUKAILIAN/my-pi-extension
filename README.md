@@ -83,6 +83,14 @@ flowchart LR
 
 Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
+## 安装日常扩展
+
+```bash
+pi install git:github.com/ZHOUKAILIAN/my-pi-extension@v0.1.0
+```
+
+固定版本入口加载 `/fix`、`/fast` 和 `subagent`，不引用本地开发目录；组合加载验证使用 Pi 1.0.4。已有本地安装需先移除重复声明，再 `/reload` 或重启。安装、单入口过滤和回退说明见[项目配置](docs/03-项目落地/项目配置.md#github-固定版本安装)。异步压缩不在日常加载清单内。
+
 ## 异步压缩本地预览
 
 在本仓库根目录使用已安装的 Pi 1.0.4（该版本通过隔离类型检查和 fake-provider SDK 单次 threshold 测试）：

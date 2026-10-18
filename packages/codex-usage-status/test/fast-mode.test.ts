@@ -1,10 +1,12 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import extension, {
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { commitFastEnabledEvent, type FastEnabledRecord } from '../src/fast-enabled-event.ts';
+import realExtension, {
   FAST_COST_CORRECTION_MODEL_IDS,
   FAST_MODEL_IDS,
   FAST_STATUS_CONSTANTS,
@@ -16,6 +18,38 @@ import extension, {
   parseFastRequestedEvent,
 } from '../src/index.ts';
 
+// Track the actual writer promises (including default disk writes) independently from Pi's bounded shutdown drain.
+const shutdowns: Array<() => Promise<unknown>> = [];
+const trackedWriters: Array<{ agentDir: string; promise: Promise<FastEnabledRecord> }> = [];
+function waitForImmediateTasks(): Promise<void> {
+  return new Promise(resolve => setImmediate(resolve));
+}
+async function waitForTrackedWriters(agentDir?: string, onWaiting?: () => void): Promise<void> {
+  // recordInBackground starts each writer from setImmediate; let callbacks queued before this barrier register their promises.
+  await waitForImmediateTasks();
+  const pending = trackedWriters.filter(write => agentDir === undefined || write.agentDir === agentDir).map(write => write.promise);
+  onWaiting?.();
+  await Promise.allSettled(pending);
+}
+const extension: typeof realExtension = (pi, dependencies = {}) => {
+  const agentDir = getAgentDir();
+  const writer = dependencies.writeFastEnabledEvent ?? ((record: FastEnabledRecord) => commitFastEnabledEvent(record, agentDir));
+  const writeFastEnabledEvent = (record: FastEnabledRecord): Promise<FastEnabledRecord> => {
+    const promise = Promise.resolve().then(() => writer(record));
+    trackedWriters.push({ agentDir, promise });
+    return promise;
+  };
+  return realExtension(new Proxy(pi, {
+    get(target, key) {
+      if (key === 'on') return (event: string, handler: Function) => {
+        if (event === 'session_shutdown') shutdowns.push(async () => handler({}, context()));
+        return Reflect.get(target, key).call(target, event, handler);
+      };
+      return Reflect.get(target, key);
+    },
+  }), { ...dependencies, writeFastEnabledEvent });
+};
+
 // All extension-command harnesses in this file use a disposable Pi agent directory.
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 let suiteAgentDir: string;
@@ -24,6 +58,10 @@ before(() => {
   process.env.PI_CODING_AGENT_DIR = suiteAgentDir;
 });
 after(async () => {
+  // Some cases intentionally throw from their injected event bus during shutdown;
+  // the real shutdown handler still drains writes before rethrowing that error.
+  await Promise.allSettled(shutdowns.map(shutdown => shutdown()));
+  await waitForTrackedWriters();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
   await rm(suiteAgentDir, { recursive: true, force: true });
@@ -468,6 +506,70 @@ test('known and unknown tickets stay FIFO-isolated and unknown cost remains unch
 });
 
 test('Fast sends the captured committed fact to the metric queue only after local write succeeds',async()=>{const records:any[]=[];let fact:any;const h=commandHarness(()=>{}, {writeFastEnabledEvent:async record=>{fact=record;return record;},submitMetric:async event=>{records.push(event);}});const ctx=context();await h.command('on',ctx);assert.deepEqual(records,[], 'writer/outbox must not run in the command');await h.command('on',ctx);await h.handlers.get('session_shutdown')?.({},ctx);assert.deepEqual(records,[{schemaVersion:1,eventId:fact.eventId,kind:'fast_enabled',occurredAt:fact.occurredAt,dataset:'live'}]);});
+
+test('suite cleanup awaits the actual gated writer after bounded shutdown has returned', async (t) => {
+  const path = isolatedEvents(t);
+  const agentDir = process.env.PI_CODING_AGENT_DIR as string;
+  let releaseWriter!: () => void;
+  let markWriterStarted!: () => void;
+  const writerGate = new Promise<void>(resolve => { releaseWriter = resolve; });
+  const writerStarted = new Promise<void>(resolve => { markWriterStarted = resolve; });
+  let writerSucceeded = false;
+  const { command, handlers } = commandHarness(() => {}, {
+    writeFastEnabledEvent: async record => {
+      markWriterStarted();
+      await writerGate;
+      const committed = await commitFastEnabledEvent(record, agentDir);
+      writerSucceeded = true;
+      return committed;
+    },
+  });
+  const ctx = context();
+  let cleanupFinished = false;
+  let markCleanupWaiting!: () => void;
+  const cleanupWaiting = new Promise<void>(resolve => { markCleanupWaiting = resolve; });
+  let cleanup: Promise<void> | undefined;
+
+  try {
+    await command('on', ctx);
+    await writerStarted;
+    const shutdownStartedAt = Date.now();
+    const shutdown = handlers.get('session_shutdown')?.({}, ctx);
+    let shutdownGuard: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        shutdown,
+        new Promise<never>((_resolve, reject) => { shutdownGuard = setTimeout(() => reject(new Error('session_shutdown exceeded its expected bounded drain')), 2500); }),
+      ]);
+    } finally {
+      if (shutdownGuard) clearTimeout(shutdownGuard);
+    }
+    assert.ok(Date.now() - shutdownStartedAt >= 1000, 'the writer gate remained closed through the real one-second drain budget');
+    assert.equal(writerSucceeded, false, 'shutdown returned while the controlled writer is still pending');
+    assert.equal(existsSync(agentDir), true, 'agent directory still exists after bounded shutdown returns');
+
+    cleanup = (async () => {
+      await waitForTrackedWriters(agentDir, markCleanupWaiting);
+      assert.equal(writerSucceeded, true, 'the actual injected writer completed its disk commit');
+      assert.equal((await eventRecords(path)).length, 1, 'the successful write is observable before directory removal');
+      await rm(agentDir, { recursive: true, force: true });
+      cleanupFinished = true;
+    })();
+    await cleanupWaiting;
+    assert.equal(cleanupFinished, false, 'cleanup is waiting for the tracked writer');
+    assert.equal(existsSync(agentDir), true, 'cleanup has not removed the directory while the writer is gated');
+
+    releaseWriter();
+    await cleanup;
+    cleanup = undefined;
+    assert.equal(cleanupFinished, true);
+    assert.equal(existsSync(agentDir), false, 'directory removal follows successful write completion');
+  } finally {
+    releaseWriter();
+    if (cleanup) await cleanup;
+    await waitForTrackedWriters(agentDir);
+  }
+});
 
 test('only actual UI Off→On commands record independent events; model/initialization/shutdown never do', async (t) => {
   const path = isolatedEvents(t);
