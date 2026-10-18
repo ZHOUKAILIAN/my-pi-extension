@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { FastController, type FastContextLike } from './fast.ts';
+import { writeFastEnabledEvent } from './fast-enabled-event.ts';
 import {
   consumeFastBootstrap,
   FAST_REQUESTED_EVENT,
@@ -69,10 +70,26 @@ export default function codexUsageStatusExtension(pi: ExtensionAPI): void {
     description: 'Toggle Codex Fast priority processing: /fast [on|off|toggle|status]',
     handler: async (args, context) => {
       const fastContext = asFastContext(context);
-      if (fastController.handleCommand(args, fastContext)) {
-        publishRequested(pi, fastContext, fastController.requestedOn);
+      const previouslyRequested = fastController.requestedOn;
+      try {
+        if (fastController.handleCommand(args, fastContext)) {
+          publishRequested(pi, fastContext, fastController.requestedOn);
+        }
+        usageController.updateFastDisplay(fastController.getDisplaySnapshot());
+      } finally {
+        // A notification or bus listener can throw after the intent has already changed.
+        if (fastContext.hasUI && !previouslyRequested && fastController.requestedOn) {
+          try {
+            await writeFastEnabledEvent();
+          } catch {
+            try {
+              fastContext.ui.notify('本次计量记录无法确认', 'warning');
+            } catch {
+              // A failed safety notice must not replace the command's original error.
+            }
+          }
+        }
       }
-      usageController.updateFastDisplay(fastController.getDisplaySnapshot());
     },
   });
 
