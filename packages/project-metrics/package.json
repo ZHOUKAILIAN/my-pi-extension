@@ -1,0 +1,11 @@
+{
+  "name": "@pi/project-metrics",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./contracts": { "types": "./src/contracts.ts", "import": "./src/contracts.ts" },
+    "./client": { "types": "./src/client.ts", "import": "./src/client.ts" },
+    "./worker": { "types": "./src/worker.ts", "import": "./src/worker.ts" }
+  },
+  "scripts": { "test": "node --experimental-strip-types --import ./test/safe-environment.mjs --test test/*.test.ts" }
+}

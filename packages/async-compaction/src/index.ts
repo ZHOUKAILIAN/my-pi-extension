@@ -5,6 +5,7 @@ import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.ts";
 import { committedFiles, settings } from "./compaction.ts";
 import type { TimingClock } from "./timing.ts";
+import { drainLocal } from '@pi/project-metrics/client';
 
 export function isolatedProfile(argv: string[] = process.argv): boolean {
   const flags = argv.slice(2);
@@ -44,7 +45,14 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
   pi.on("session_before_switch", leave);
   pi.on("session_before_fork", leave);
   pi.on("session_before_tree", leave);
-  pi.on("session_shutdown", leave);
+  pi.on("session_shutdown", async (event, ctx) => {
+    const started = Date.now();
+    try { leave(event, ctx); }
+    finally {
+      control.timing.closeMetricScope();
+      await drainLocal(Math.max(0, 1000 - (Date.now() - started)));
+    }
+  });
   pi.on("session_start", (_event, ctx) => { foreground = null; postRunWindow = false; preflight = false; control.reset(ctx); });
   pi.on("input", () => { preflight = true; postRunWindow = false; });
   pi.on("agent_start", () => { preflight = false; postRunWindow = false; });

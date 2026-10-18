@@ -1,5 +1,7 @@
 import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { randomUUID } from 'node:crypto';
+import { createMetricScope, noteMetricFailure, submitMetric } from '@pi/project-metrics/client';
 
 export type TimingKind = "background_generation" | "foreground_compaction";
 export type TimingOutcome = "completed" | "failed" | "cancelled" | "unknown";
@@ -24,9 +26,12 @@ export class Timing {
   private scope = 0;
   private pi: ExtensionAPI;
   private clock: TimingClock;
-  private nextId = 0;
-  constructor(pi: ExtensionAPI, clock: TimingClock = { monotonic: () => performance.now(), utc: () => Date.now() }) {
-    this.pi = pi; this.clock = clock;
+  private idFactory: () => string;
+  private enqueue: typeof submitMetric;
+  private metricScope = createMetricScope();
+  closeMetricScope() { this.metricScope.close(); }
+  constructor(pi: ExtensionAPI, clock: TimingClock = { monotonic: () => performance.now(), utc: () => Date.now() }, dependencies: { idFactory?: () => string; submitMetric?: typeof submitMetric } = {}) {
+    this.pi = pi; this.clock = clock; this.idFactory = dependencies.idFactory ?? randomUUID; this.enqueue = dependencies.submitMetric ?? submitMetric;
     pi.registerEntryRenderer<TimingSample>("async-compact-timing", (entry, _options, theme) => {
       const d = entry?.data;
       const kind: TimingKind | null = d?.kind === "background_generation" || d?.kind === "foreground_compaction" ? d.kind : null;
@@ -42,7 +47,7 @@ export class Timing {
     });
   }
   get epoch() { return this.scope; }
-  invalidate() { this.scope++; }
+  invalidate() { this.scope++; this.metricScope.close(); this.metricScope = createMetricScope(); }
   capture(): TimingStamp {
     let monotonic = Number.NaN, utc: number | null = null;
     try { monotonic = this.clock.monotonic(); } catch { /* invalid stamp remains unknown */ }
@@ -51,9 +56,8 @@ export class Timing {
   }
   begin(kind: TimingKind, model: string | null, provider: string | null, start = this.capture()) {
     const epoch = this.scope;
-    let sampleId: string;
-    try { sampleId = crypto.randomUUID(); }
-    catch { sampleId = `async-compact-${++this.nextId}`; }
+    let sampleId = 'unavailable';
+    try { sampleId = randomUUID(); } catch { /* local diagnostic ID is optional */ }
     let finished = false;
     return {
       sampleId, epoch,
@@ -70,8 +74,11 @@ export class Timing {
           try { startedAtUTC = new Date(start.utc).toISOString(); } catch { unknownReason ??= "clock_invalid"; }
         } else unknownReason ??= "clock_invalid";
         if (startedAtUTC === null) { durationMs = null; outcome = "unknown"; }
-        const data: TimingSample = { schemaVersion: 1, sampleId, kind, startedAtUTC, durationMs, outcome, model, provider, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}) };
+        const data: TimingSample = { schemaVersion: 1, sampleId: sampleId ?? 'unavailable', kind, startedAtUTC, durationMs, outcome, model, provider, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}) };
         safe(() => this.pi.appendEntry("async-compact-timing", data));
+        let eventId: string | null = null;
+        try { eventId = this.idFactory(); } catch { noteMetricFailure(); /* never synthesize a remote global identifier */ }
+        if (eventId) safe(() => { void this.enqueue({ schemaVersion: 1, eventId, kind, occurredAt: startedAtUTC, durationMs, outcome, model, provider, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}), dataset: 'live' }, this.metricScope).catch(() => {}); });
       },
     };
   }

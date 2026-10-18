@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, lstat, readFile, readdir, mkdir, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, lstat, readFile, readdir, mkdir, symlink, writeFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeFastEnabledEvent } from '../src/fast-enabled-event.ts';
@@ -8,7 +8,7 @@ import { writeFastEnabledEvent } from '../src/fast-enabled-event.ts';
 const EVENT_ID = '4a19dc3b-8397-4d74-834f-a19ec67e891c';
 
 async function agentDir(t: { after(fn: () => Promise<void>): void }): Promise<string> {
-  const root = await mkdtemp(join(tmpdir(), 'fast-event-test-'));
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'fast-event-test-'));
   t.after(async () => { await (await import('node:fs/promises')).rm(root, { recursive: true, force: true }); });
   return root;
 }
@@ -55,6 +55,8 @@ test('exclusive commit never overwrites a colliding ID or a symlink target', asy
   assert.equal(await readFile(path, 'utf8'), original);
   assert.deepEqual((await readdir(dir)).sort(), [`${otherId}.json`, `${EVENT_ID}.json`].sort());
 });
+
+test('refuses a symlinked agent root without writing through it',async t=>{const root=await agentDir(t),outside=await agentDir(t);const alias=join(root,'agent-link');await symlink(outside,alias);await assert.rejects(writeFastEnabledEvent(alias,()=>EVENT_ID));assert.deepEqual(await readdir(outside),[]);});
 
 test('refuses symlink, non-directory, and non-private storage components without modifying the target', async (t) => {
   for (const part of ['metrics', 'codex-fast-enabled', 'v1'] as const) {

@@ -1,0 +1,4 @@
+import { createHash } from 'node:crypto';
+import { canonicalEvent, type Dataset, type MetricEvent } from './contracts.ts';
+export function eventHash(event:MetricEvent):string{return createHash('sha256').update(canonicalEvent(event),'utf8').digest('hex');}
+export function canonicalTarget(endpoint:string,namespace:string,dataset:Dataset):string{const u=new URL(endpoint);const local=(u.hostname==='127.0.0.1'||u.hostname==='localhost')&&u.protocol==='http:';if(u.protocol!=='https:'&&!local)throw new Error('unsafe_endpoint');if(u.username||u.password||u.search||u.hash||!namespace||namespace.length>128||/[\u0000-\u001f\u007f]/u.test(namespace))throw new Error('unsafe_target');if(u.pathname!=='/'&&u.pathname!=='')throw new Error('endpoint_must_be_root');u.pathname='/';return createHash('sha256').update(`${u.origin}\n${namespace}\n${dataset}`,'utf8').digest('hex');}

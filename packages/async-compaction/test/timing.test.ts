@@ -74,6 +74,21 @@ test("renderer validates full persisted schema, known values, unknown and malfor
   assert.doesNotThrow(() => render({ ...base, kind: "background_generation", durationMs: 300, outcome: "completed" }, { fg: () => { throw Error("theme private"); } }));
 });
 
+test("timing submits one terminal DTO independently of local append; stale scope and UUID failure never invent a remote ID",async()=>{const submitted:any[]=[],entries:any[]=[];let remoteIdCalls=0;const pi={registerEntryRenderer(){},appendEntry:(type:string,data:any)=>{entries.push({type,data});if(type==='async-compact-timing')throw Error('local append failed');}} as any;const t=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{remoteIdCalls++;return '4a19dc3b-8397-4d74-834f-a19ec67e891c';},submitMetric:async e=>{submitted.push(e);}});const sample=t.begin('background_generation','m','p');assert.equal(remoteIdCalls,0,'remote ID is not allocated before the terminal hook');sample.finish('completed');assert.equal(remoteIdCalls,1);sample.finish('failed');await tick();assert.equal(submitted.length,1);assert.notEqual(submitted[0].eventId,sample.sampleId,'remote ID is separately generated at the terminal boundary');assert.deepEqual(submitted[0],{schemaVersion:1,eventId:'4a19dc3b-8397-4d74-834f-a19ec67e891c',kind:'background_generation',occurredAt:new Date(1000).toISOString(),durationMs:0,outcome:'completed',model:'m',provider:'p',dataset:'live'});const old=t.begin('foreground_compaction',null,null);t.invalidate();old.finish('unknown','scope_left');assert.equal(submitted.length,1);const noId=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{throw Error('uuid failure');},submitMetric:async e=>{submitted.push(e);}});noId.begin('background_generation',null,null).finish('completed');await tick();assert.equal(submitted.length,1);assert.match(entries.at(-1).data.sampleId,/^[0-9a-f-]{36}$/u,'local diagnostic ID remains distinct from the missing remote ID');});
+
+test('Async metric submit is not awaited by the terminal hook; sync throw and unresolved promise leave diagnostics intact', async () => {
+  for (const submitMetric of [() => { throw new Error('sync metric failure'); }, () => new Promise<void>(() => {})]) {
+    const entries: unknown[] = [];
+    const timing = new Timing({ registerEntryRenderer() {}, appendEntry: (_type: string, data: unknown) => entries.push(data) } as any,
+      { monotonic: () => 10, utc: () => 1000 }, { submitMetric: submitMetric as any });
+    const begin = timing.begin('background_generation', 'm', 'p');
+    assert.doesNotThrow(() => begin.finish('completed'));
+    assert.equal(entries.length, 1);
+    assert.deepEqual((entries[0] as { outcome: string }).outcome, 'completed');
+    timing.closeMetricScope();
+  }
+});
+
 test("timing UUID, clock and append failures are isolated", () => {
   const renderers = new Map<string, Function>(); let calls = 0;
   const t = new Timing({ registerEntryRenderer: (n: string, r: Function) => renderers.set(n, r), appendEntry: () => { throw Error("private append"); } } as any, { monotonic: () => { if (++calls === 1) throw Error(); return 5; }, utc: () => 1 });

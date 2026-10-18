@@ -1,6 +1,6 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, realpathSync } from 'node:fs';
 import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,7 +20,7 @@ import extension, {
 const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 let suiteAgentDir: string;
 before(() => {
-  suiteAgentDir = mkdtempSync(join(tmpdir(), 'fast-mode-agent-'));
+  suiteAgentDir = mkdtempSync(join(realpathSync(tmpdir()), 'fast-mode-agent-'));
   process.env.PI_CODING_AGENT_DIR = suiteAgentDir;
 });
 after(async () => {
@@ -43,10 +43,26 @@ async function eventRecords(path: string): Promise<Array<{ name: string; record:
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
     throw error;
   }
-  return Promise.all(names.map(async (name) => ({ name, record: JSON.parse(await readFile(join(path, name), 'utf8')) })));
+  return Promise.all(names.filter(name => name.endsWith('.json')).map(async (name) => ({ name, record: JSON.parse(await readFile(join(path, name), 'utf8')) })));
+}
+async function waitForEvents(path: string, count: number) {
+  const until = Date.now() + 1200;
+  for (;;) {
+    const records = await eventRecords(path);
+    if (records.length === count) return records;
+    if (Date.now() >= until) throw new Error(`expected ${count} completed Fast records, found ${records.length}`);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+}
+async function waitForNotice(ctx: any) {
+  const until = Date.now() + 1200;
+  while (ctx._notices.at(-1)?.message !== '本次计量记录无法确认') {
+    if (Date.now() >= until) throw new Error('background warning missing');
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
 }
 
-function commandHarness(emit: (name: string, data: unknown) => void = () => {}): {
+function commandHarness(emit: (name: string, data: unknown) => void = () => {}, dependencies: Parameters<typeof extension>[1] = {}): {
   handlers: Map<string, Function>;
   command: (args: string, ctx: any) => Promise<void>;
 } {
@@ -56,7 +72,7 @@ function commandHarness(emit: (name: string, data: unknown) => void = () => {}):
     on: (name: string, handler: Function) => handlers.set(name, handler),
     events: { emit, on: () => () => {} },
     registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
-  } as any);
+  } as any, dependencies);
   assert.ok(command);
   return { handlers, command };
 }
@@ -451,6 +467,8 @@ test('known and unknown tickets stay FIFO-isolated and unknown cost remains unch
   controller.shutdown();
 });
 
+test('Fast sends the captured committed fact to the metric queue only after local write succeeds',async()=>{const records:any[]=[];let fact:any;const h=commandHarness(()=>{}, {writeFastEnabledEvent:async record=>{fact=record;return record;},submitMetric:async event=>{records.push(event);}});const ctx=context();await h.command('on',ctx);assert.deepEqual(records,[], 'writer/outbox must not run in the command');await h.command('on',ctx);await h.handlers.get('session_shutdown')?.({},ctx);assert.deepEqual(records,[{schemaVersion:1,eventId:fact.eventId,kind:'fast_enabled',occurredAt:fact.occurredAt,dataset:'live'}]);});
+
 test('only actual UI Off→On commands record independent events; model/initialization/shutdown never do', async (t) => {
   const path = isolatedEvents(t);
   const emitted: unknown[] = [];
@@ -459,7 +477,7 @@ test('only actual UI Off→On commands record independent events; model/initiali
   handlers.get('session_start')?.({}, ctx);
   assert.deepEqual(await eventRecords(path), []);
   await command('on', ctx);
-  let records = await eventRecords(path);
+  let records = await waitForEvents(path, 1);
   assert.equal(records.length, 1);
   assert.equal(records[0].name, `${records[0].record.eventId}.json`);
   assert.deepEqual(Object.keys(records[0].record), ['schemaVersion', 'eventId', 'occurredAt', 'source']);
@@ -470,12 +488,12 @@ test('only actual UI Off→On commands record independent events; model/initiali
   await command('invalid', ctx);
   await command('off', ctx);
   await command('toggle', ctx);
-  records = await eventRecords(path);
+  records = await waitForEvents(path, 2);
   assert.equal(records.length, 2);
   assert.notEqual(records[0].record.eventId, records[1].record.eventId);
   await command('toggle', ctx);
   await command('  ', ctx);
-  records = await eventRecords(path);
+  records = await waitForEvents(path, 3);
   assert.equal(records.length, 3);
   assert.equal(new Set(records.map(({ record }) => record.eventId)).size, 3);
   const json = context(model(), { mode: 'json', hasUI: false });
@@ -507,7 +525,7 @@ test('RPC and ineligible user intent count; inherited startup and model changes 
     assert.deepEqual(await eventRecords(path), []);
     const parent = commandHarness();
     await parent.command('on', context(model('gpt-'), { mode: 'rpc', hasUI: true }));
-    const records = await eventRecords(path);
+    const records = await waitForEvents(path, 1);
     assert.equal(records.length, 1);
     assert.equal(records[0].record.source, 'user_command');
   } finally {
@@ -528,7 +546,7 @@ test('no-assistant and no-session command paths persist without appending a sess
     });
     await command('on', ctx);
   }
-  assert.equal((await eventRecords(path)).length, 2);
+  assert.equal((await waitForEvents(path, 2)).length, 2);
 });
 
 test('original UI notification or bus errors after Off→On do not suppress the record or get replaced', async (t) => {
@@ -538,14 +556,14 @@ test('original UI notification or bus errors after Off→On do not suppress the 
   const badCtx = context();
   badCtx.ui.notify = () => { throw notificationError; };
   await assert.rejects(brokenNotification.command('on', badCtx), (error: unknown) => error === notificationError);
-  assert.equal((await eventRecords(path)).length, 1);
+  assert.equal((await waitForEvents(path, 1)).length, 1);
   assert.equal(brokenNotification.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, badCtx)?.service_tier, 'priority');
 
   const busError = new Error('original bus error');
   const brokenBus = commandHarness(() => { throw busError; });
   const ctx = context();
   await assert.rejects(brokenBus.command('on', ctx), (error: unknown) => error === busError);
-  assert.equal((await eventRecords(path)).length, 2);
+  assert.equal((await waitForEvents(path, 2)).length, 2);
   assert.equal(brokenBus.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
 });
 
@@ -557,6 +575,7 @@ test('storage and safety-notice failures neither leak path/error nor roll back F
   const { command, handlers } = commandHarness((_name, data) => emitted.push(data));
   const ctx = context();
   await command('on', ctx);
+  await waitForNotice(ctx);
   assert.deepEqual(ctx._notices.at(-1), { message: '本次计量记录无法确认', type: 'warning' });
   assert.equal(ctx._notices.some(({ message }: { message: string }) => message.includes(badRoot)), false);
   assert.deepEqual(emitted.at(-1), { version: 1, sessionId: 'session-1', requested: true });
@@ -567,6 +586,8 @@ test('storage and safety-notice failures neither leak path/error nor roll back F
   const noticeFailure = context();
   noticeFailure.ui.notify = (message: string) => { notices.push(message); if (message === '本次计量记录无法确认') throw new Error('notice failed'); };
   await another.command('on', noticeFailure);
+  const until = Date.now() + 1200;
+  while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(notices.at(-1), '本次计量记录无法确认');
   assert.equal(another.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, noticeFailure)?.service_tier, 'priority');
 });
@@ -584,6 +605,8 @@ test('unsafe directory permission and simultaneous bus failure keep the original
     if (message === '本次计量记录无法确认') throw new Error('safety notify error');
   };
   await assert.rejects(command('on', ctx), (error: unknown) => error === busError);
+  const until = Date.now() + 1200;
+  while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(notices.at(-1), '本次计量记录无法确认');
   assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
   assert.deepEqual(await eventRecords(path), []);
@@ -761,12 +784,12 @@ test('/fast refreshes the merged widget without re-running usage work', async ()
     await command?.('on', ctx);
     assert.equal(authCalls, before.authCalls);
     assert.equal(fetchCalls, before.fetchCalls);
-    assert.equal(timerCalls, before.timerCalls);
+    assert.equal(timerCalls, before.timerCalls, 'Fast command does not start a local-commit deadline');
     assert.match(widgetRows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
   } finally {
     globalThis.setTimeout = originalSetTimeout;
     globalThis.fetch = originalFetch;
-    handlers.get('session_shutdown')?.({}, ctx);
+    await handlers.get('session_shutdown')?.({}, ctx);
   }
 });
 
