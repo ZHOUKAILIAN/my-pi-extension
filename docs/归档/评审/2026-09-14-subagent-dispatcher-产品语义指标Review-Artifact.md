@@ -37,7 +37,7 @@
 | `AR3-4`：normal retention / whole-Call cleanup | `resolved_fixed` | normal retention 不直接删除；与 whole-Call delete 共用 `call_cleanup_requested` fenced lifecycle，覆盖 reference-order cascade、proof/private 删除、最小 tombstone、startup kill-point 续做和 orphan Delegation；由 S24/S41/S43 闭合。 |
 | 此前已闭合产品规则 | 无回退 | S1–S43 连续；Call cancelled 不产生 partial-success aggregate，status 可见性、normal/custom delivery、WAL/resolver/recovery/cancel/side-effect/migration/privacy边界未被本 revision 改写或削弱。 |
 
-逐 Finding owner、Acceptance 与目标证据映射见 [L2 §9.13](../../02-产品实现/subagent-dispatcher-技术设计.md#913-最终复审逐-finding-关闭映射)。`resolved_fixed` 在本 Artifact 中表示设计 Finding 已在固定 proposal revision 关闭，不表示对应 v2 代码已经实现。
+逐 Finding owner、Acceptance 与目标证据映射见 [L2 §9.14](../../02-产品实现/subagent-dispatcher-技术设计.md#914-最终复审逐-finding-关闭映射)。`resolved_fixed` 在本 Artifact 中表示设计 Finding 已在固定 proposal revision 关闭，不表示对应 v2 代码已经实现。
 
 ## 证据限制与残余未验证项
 

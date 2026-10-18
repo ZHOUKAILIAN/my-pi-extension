@@ -175,7 +175,11 @@ flowchart TD
   L -->|是| C[cancelled]
   L -->|否| I{spawn/协议/header/signal close/<br/>当前terminal完整?}
   I -->|否| U[unknown_transport]
-  I -->|是| AB{当前terminal=aborted?}
+  I -->|是| SA{有效agent_settled.aborted=true?}
+  SA -->|是| SE{进程exit=0?}
+  SE -->|是| C
+  SE -->|否| U
+  SA -->|否| AB{当前terminal=aborted?}
   AB -->|是| C
   AB -->|否| ER{当前terminal=error?}
   ER -->|是| P[只读该error自身status/message<br/>transient或non_transient_provider]
@@ -403,6 +407,6 @@ flowchart TD
 
 ## 11. 继续前提
 
-本页所示目标已由[产品语义/指标轴](../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营轴](../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)在同一固定 revision 批准，并由[Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)正式采纳。AR3-1～AR3-5 及此前 required Findings 已为 `resolved_fixed`；L1 Acceptance 保持 S1–S43 连续，完整映射见[技术设计 §9.13](subagent-dispatcher-技术设计.md#913-最终复审逐-finding-关闭映射)。
+本页所示目标已由[产品语义/指标轴](../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营轴](../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)在同一固定 revision 批准，并由[Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)正式采纳。AR3-1～AR3-5 及此前 required Findings 已为 `resolved_fixed`；L1 Acceptance 保持 S1–S43 连续，完整映射见[技术设计 §9.14](subagent-dispatcher-技术设计.md#914-最终复审逐-finding-关闭映射)。
 
 状态为`DECIDED / sliced implementation`。切片0已有 bridge-v1 本地实现与 focused tests，但发布/部署、真实 binary/kill-point 与同 UID 路径竞态仍未证明；capability 仍为 `verified=false/adoptionAllowed=false`，因此 adoption 仍为 0。切片1+2 foundation 已实现并有自动化测试；切片3 仅完成 gated internal execution/recovery seam，未接入现行 v1 execute，且真实 child、OS/restart、owner transfer 与 Darwin 证据仍缺失。采用既有 v1 session 前仍必须先完成并验证完整 `bridge-v1` 前置；cancel/delivery/side-effect/delete/migration 等后续切片仍未实现或接线。实现必须保留当前 v1 基线、逐切片代码评审并补齐 S1–S43 证据；目标图不得被表述为当前能力。

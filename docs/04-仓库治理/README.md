@@ -9,10 +9,11 @@
 
 ## 当前门禁
 
-- 修改前先完成五层路由并找到唯一 owner；L1 同时区分 Core 与 Extension owner。
+- 修改前先完成五层路由并找到唯一 owner；L1 同时区分 Core 与 Extension owner。按任务读取相关文档，不要求逐层通读。
+- 活跃正文描述完整现状，不承载变更经过或本轮任务安排；[现状写作规则](../../AGENTS.md#文档写作只描述现状)由 `AGENTS.md` 拥有，证据保存位置见 [GitHub 维护流程](GitHub维护流程.md#文档写回)。
 - 产品行为变化先更新 L1；L2 同步实现，或明确记录尚未实现的 drift。
 - 纯实现修复或重构若不改变产品契约，只更新 L2 和验证证据。
 - package、目录、构建或项目默认变化必须同步第三层。
-- 合并前运行 `npm test` 和 `npm run typecheck`。
+- Agent 优先运行 `npm run test:agent` 和 `npm run typecheck`；`test:agent` 执行与 `npm test` 相同的完整测试范围。
 - 文档移动或链接变化必须检查仓库内 Markdown 相对链接。
 - 第五层临时状态和归档材料不得被当作正式执行规则。

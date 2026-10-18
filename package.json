@@ -6,7 +6,8 @@
   ],
   "scripts": {
     "typecheck": "tsc -b",
-    "test": "node --experimental-strip-types --test packages/*/test/*.test.ts"
+    "test": "node scripts/test-suite.mjs",
+    "test:agent": "node scripts/test-agent.mjs"
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.84.4",

@@ -13,6 +13,7 @@
 
 ### Extensions
 
+- [Async Compaction Extension 产品规范](扩展/async-compaction-扩展.md)：`DECIDED`（方案 A 已采纳）；当前实现与未验收范围见对应 L2
 - [Feature Extension 产品规范](扩展/feature-扩展.md)：`DECIDED`
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
 - [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`DECIDED`

@@ -1,0 +1,86 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { ModelRuntime, SessionManager, SettingsManager, DefaultResourceLoader, createAgentSession } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
+import extension from "../src/index.ts";
+
+const usage = (input: number) => ({ input, output: 30, cacheRead: 0, cacheWrite: 0, totalTokens: input + 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
+const text = (m: { content: unknown }) => typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter(c => c.type === "text").map(c => c.text).join("") : "";
+const user = (n: number) => `user-${n} ` + "words ".repeat(160);
+const tick = () => new Promise(r => setTimeout(r, 5));
+
+test("actual SDK threshold reuses an earlier user cut without waiting for background work", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "async-compact-sdk-")), agentDir = join(cwd, "agent"), dir = join(cwd, "sessions");
+  mkdirSync(agentDir); mkdirSync(dir);
+  const argv = process.argv; process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
+  let release!: () => void;
+  const gate = new Promise<void>(r => release = r);
+  let background = 0, completed = 0, calls = 0;
+  const errors: unknown[] = [];
+  const runtime = await ModelRuntime.create({ authPath: join(cwd, "missing-auth.json"), modelsPath: null, refreshOnCreate: false });
+  runtime.registerProvider("fake", { baseUrl: "http://127.0.0.1:1", api: "fake-api", apiKey: "test-only", streamSimple: (model, context, options) => {
+    const summary = context.messages.some(m => /Summarize the following effective conversation/.test(text(m)));
+    const number = summary ? 0 : ++calls;
+    const s = createAssistantMessageEventStream();
+    void (async () => {
+      if (summary && options?.signal) { background++; await gate; }
+      const value = summary ? options?.signal ? "CACHED SUMMARY with constraints" : "NATIVE SUMMARY" : `assistant-${number} ` + "answer ".repeat(40);
+      const message = { role: "assistant" as const, content: summary && options?.signal ? [{ type: "thinking" as const, thinking: "synthetic hidden thinking" }, { type: "text" as const, text: value }] : [{ type: "text" as const, text: value }], api: model.api, provider: model.provider, model: model.id, usage: usage(summary ? 100 : [800, 2800, 3800][number - 1] ?? 3800), stopReason: "stop" as const, timestamp: Date.now() };
+      s.push({ type: "start", partial: { ...message, content: [], stopReason: "pending" } });
+      s.push({ type: "text", contentIndex: 0, delta: value });
+      s.push({ type: "done", reason: "stop", message }); s.end(); if (summary && options?.signal) completed++;
+    })(); return s;
+  }, models: [{ id: "m", name: "M", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 4096, maxTokens: 512 }] });
+  const sm = SessionManager.create(cwd, dir);
+  const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, extensionFactories: [extension] }); await loader.reload();
+  const { session } = await createAgentSession({ cwd, agentDir, model: runtime.getModel("fake", "m"), thinkingLevel: "off", modelRuntime: runtime, resourceLoader: loader, sessionManager: sm, settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, retry: { enabled: false } }), noTools: true });
+  await session.bindExtensions({ mode: "tui", uiContext: { notify() {}, onTerminalInput: () => () => {} } as never, onError: e => errors.push(e) });
+  try {
+    await session.prompt("/async-compact on");
+    const id = sm.getSessionId();
+    await session.prompt(user(1));
+    sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "history.ts" } }, { type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "changed.ts" } }], api: "fake-api", provider: "fake", model: "m", usage: usage(1), stopReason: "toolUse", timestamp: Date.now() });
+    sm.appendMessage({ role: "toolResult", toolCallId: "read-1", toolName: "read", content: [{ type: "text", text: "read" }], isError: false, timestamp: Date.now() });
+    sm.appendMessage({ role: "toolResult", toolCallId: "edit-1", toolName: "edit", content: [{ type: "text", text: "edited" }], isError: false, timestamp: Date.now() });
+    await session.prompt(user(2));
+    assert.equal(background, 1, `turn_end returned before summary gate opened: ${JSON.stringify({ errors, branch: sm.getBranch().map(e => e.type), usage: session.getContextUsage() })}`);
+    release(); for (let i = 0; i < 100 && !completed; i++) await tick(); await tick();
+    await session.prompt(user(3));
+    const branch = sm.getBranch(), compact = branch.find(e => e.type === "compaction");
+    assert.ok(compact, JSON.stringify(errors));
+    assert.equal(compact.details?.attemptId?.length > 0, true);
+    assert.match(compact.summary, /CACHED SUMMARY with constraints/);
+    assert.doesNotMatch(compact.summary, /synthetic hidden thinking/);
+    assert.deepEqual(compact.details?.readFiles, ["history.ts"]);
+    assert.deepEqual(compact.details?.modifiedFiles, ["changed.ts"]);
+    assert.equal(compact.firstKeptEntryId, branch.find(e => e.type === "message" && e.message.role === "user" && text(e.message).includes("user-2"))?.id);
+    assert.equal(sm.getSessionId(), id);
+    const projected = sm.buildSessionProjection().messages.map(text).join("\n");
+    for (const value of ["user-2", "assistant-2", "user-3", "assistant-3"]) assert.ok(projected.includes(value), value);
+    const jsonl = readFileSync(sm.getSessionFile()!, "utf8");
+    for (const value of ["user-1", "assistant-1", "user-2", "assistant-2", "user-3", "assistant-3"]) assert.ok(jsonl.includes(value), value);
+    assert.equal(errors.length, 0, JSON.stringify(errors));
+    await session.prompt(user(4));
+    for (let i = 0; i < 100 && background < 2; i++) await tick();
+    assert.equal(background, 2, "second independent background candidate after the first native adoption");
+    await session.prompt(user(5));
+    const compressed = sm.getBranch().filter(e => e.type === "compaction");
+    assert.ok(compressed.length >= 2, JSON.stringify(errors));
+    assert.equal(compressed[1].summary, compact.summary, "host event for matching summary may report the older entry");
+    assert.notEqual(compressed[1].id, compact.id);
+    assert.ok(sm.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-usage").some(e => e.data?.attemptId === compressed[1].details?.attemptId && e.data?.outcome === "adopted"));
+    await session.compact();
+    const manual = sm.getBranch().filter(e => e.type === "compaction").at(-1);
+    assert.ok(manual && manual.id !== compact.id);
+    assert.equal(manual.fromHook, false, "manual compaction must not reuse cached candidate");
+    assert.deepEqual(manual.details?.readFiles, ["history.ts"], "native details must carry hooked file lists without model help");
+    assert.deepEqual(manual.details?.modifiedFiles, ["changed.ts"]);
+    assert.match(manual.summary, /<read-files>[\s\S]*history\.ts/);
+    assert.match(manual.summary, /<modified-files>[\s\S]*changed\.ts/);
+    assert.equal(sm.getSessionId(), id, "two compactions remain in the same session");
+  } finally { release(); session.dispose(); process.argv = argv; rmSync(cwd, { recursive: true, force: true }); }
+});

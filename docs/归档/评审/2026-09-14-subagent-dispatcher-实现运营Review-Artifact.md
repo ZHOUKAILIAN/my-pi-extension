@@ -42,7 +42,7 @@
 | Side-effect / interceptor / IPC | `resolved_fixed`，无回退 | `--no-extensions`、allowlist、interceptor-last、最终 input/result ACK、watchdog 与 uncertainty fail-closed 保持。 |
 | Bridge-v1 / migration / rollback / privacy | `resolved_fixed`，无回退 | bridge-v1 前置、独立 v2 namespace、30 天窗口、argv/temp/IPC/投影隐私与固定 GC 锁序保持。 |
 
-完整 ID 级映射见 [L2 §9.13](../../02-产品实现/subagent-dispatcher-技术设计.md#913-最终复审逐-finding-关闭映射)。以上关闭的是固定设计 revision 的 Review Finding，不是代码缺陷关闭或实现完成声明。
+完整 ID 级映射见 [L2 §9.14](../../02-产品实现/subagent-dispatcher-技术设计.md#914-最终复审逐-finding-关闭映射)。以上关闭的是固定设计 revision 的 Review Finding，不是代码缺陷关闭或实现完成声明。
 
 ## 证据限制与残余未验证项
 
