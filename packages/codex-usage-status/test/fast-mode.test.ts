@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import extension, {
+  FAST_COST_CORRECTION_MODEL_IDS,
   FAST_MODEL_IDS,
   FAST_STATUS_CONSTANTS,
   FastController,
@@ -88,10 +89,11 @@ function assistant(modelValue: any, usageOverrides: Record<string, unknown> = {}
   };
 }
 
-test('eligibility accepts all valid lowercase gpt IDs while FAST_MODEL_IDS remains known pricing only', () => {
+test('eligibility accepts all valid lowercase gpt IDs while cost correction IDs remain a separate compatibility export', () => {
   const ctx = context();
-  assert.deepEqual([...FAST_MODEL_IDS], ['gpt-5.4', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
-  for (const id of [...FAST_MODEL_IDS, 'gpt-5.4-astra', 'gpt-5.4-mini', 'gpt-5.4-spark', 'gpt-future-2027']) {
+  assert.deepEqual([...FAST_COST_CORRECTION_MODEL_IDS], ['gpt-5.4', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
+  assert.strictEqual(FAST_MODEL_IDS, FAST_COST_CORRECTION_MODEL_IDS);
+  for (const id of [...FAST_COST_CORRECTION_MODEL_IDS, 'gpt-5.4-astra', 'gpt-5.4-mini', 'gpt-5.4-spark', 'gpt-future-2027']) {
     assert.equal(isFastEligible(ctx, model(id)), true, id);
   }
   for (const id of ['gpt-', 'GPT-5.4', 'gpt -5.4', 'gpt-5.4 mini', 'gpt-5.4\tmini', 'codex-5.4']) {

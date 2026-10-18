@@ -103,7 +103,7 @@ flowchart LR
 | `gpt-5.4`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra` | 原生费用乘 2 |
 | 其他 eligible `gpt-*` | 消费 ticket，`usage.cost` 原样保留 |
 
-`FAST_MODEL_IDS` 是上述已知计费集合的公共导出，不是模型资格白名单。费用计算使用原生 pricing tier，将 input/output/cacheRead/cacheWrite 分量分别缩放后求和；费用已相同时不再替换。usage 的 token 计数必须为非负安全整数，reasoning 不超过 output、cacheWrite1h 不超过 cacheWrite，cost 分量必须有限；缺失或非法时不修正。合法的 error/aborted assistant message 也按已发生的 usage 处理。
+`FAST_COST_CORRECTION_MODEL_IDS` 是上述已知计费集合的 canonical 公共导出；deprecated `FAST_MODEL_IDS` 为兼容性导出，并与其指向同一数组。两者均只表示 known pricing/cost correction 型号，不是 eligibility allowlist；资格由前述 Codex gate 与 `gpt-*` 形状独立判定。费用计算使用原生 pricing tier，将 input/output/cacheRead/cacheWrite 分量分别缩放后求和；费用已相同时不再替换。usage 的 token 计数必须为非负安全整数，reasoning 不超过 output、cacheWrite1h 不超过 cacheWrite，cost 分量必须有限；缺失或非法时不修正。合法的 error/aborted assistant message 也按已发生的 usage 处理。
 
 未知型号激活、查询状态，以及涉及未知型号的模型切换（包括 unknown→unknown）会提示：priority 只是请求意图，费用未校正/不保证。切回已知型号使用对应通知和费用策略。TUI 通知可带颜色，RPC 保持纯文本。
 
