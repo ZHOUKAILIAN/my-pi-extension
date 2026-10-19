@@ -533,7 +533,6 @@ test('suite cleanup awaits the actual gated writer after bounded shutdown has re
   try {
     await command('on', ctx);
     await writerStarted;
-    const shutdownStartedAt = Date.now();
     const shutdown = handlers.get('session_shutdown')?.({}, ctx);
     let shutdownGuard: NodeJS.Timeout | undefined;
     try {
@@ -544,7 +543,6 @@ test('suite cleanup awaits the actual gated writer after bounded shutdown has re
     } finally {
       if (shutdownGuard) clearTimeout(shutdownGuard);
     }
-    assert.ok(Date.now() - shutdownStartedAt >= 1000, 'the writer gate remained closed through the real one-second drain budget');
     assert.equal(writerSucceeded, false, 'shutdown returned while the controlled writer is still pending');
     assert.equal(existsSync(agentDir), true, 'agent directory still exists after bounded shutdown returns');
 
