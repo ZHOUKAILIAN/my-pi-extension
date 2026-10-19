@@ -12,8 +12,8 @@ export interface WorkerSessionLike {
   readonly isStreaming?: boolean;
   readonly isIdle?: boolean;
   readonly model?: WorkerModel;
-  steer(text: string, images?: SupplementImages): Promise<void>;
-  prompt(text: string, options?: { streamingBehavior?: 'steer' | 'followUp'; source?: 'extension' }): Promise<void>;
+  steer(text: string, images?: SupplementImages): Promise<unknown>;
+  prompt(text: string, options?: { streamingBehavior?: 'steer' | 'followUp'; source?: 'extension' }): Promise<unknown>;
   setModel?(model: WorkerModel): Promise<void>;
   subscribe?(listener: (event: unknown) => void): () => void;
   dispose?(): void;
@@ -183,7 +183,7 @@ export class WorkflowInteractionPort {
       if (recorded.payload.state === 'rejected_after_fence') return { result: { submissionAttemptId, state: 'rejected_after_fence' as const, error: 'Worker close fence already committed' } };
       const supplementId = String(recorded.payload.supplementId); const sequence = Number(recorded.payload.sequence);
       this.pendingCalls.set(input.runId, [...(this.pendingCalls.get(input.runId) ?? []), supplementId]);
-      let operation: Promise<void>;
+      let operation: Promise<unknown>;
       try {
         // Calling (not awaiting) is intentional. The promise is carried out of
         // the queue so turn_start/turn_end can be folded before it settles.

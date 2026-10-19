@@ -37,6 +37,8 @@ import {
   type ModelCandidate,
   type RunStore,
   type WorkerModel,
+  type MachineExtensionsBundleV1,
+  type MachineExtensionContext,
 } from '@pi/workflow-runtime';
 import {
   FIX_NODE_IDS,
@@ -55,6 +57,43 @@ import {
 import { loadEffectivePolicy } from './effective-policy.ts';
 import { parseFixCommand, resolveModelRef, type ModelRef } from './policy.ts';
 import { FIX_REVIEW_ACTIONS, FIX_REVIEW_REASONS, buildReviewPayload, checkVerificationAccepted, collectDecision, guardVerification, withGuardCode } from './v2-helpers.ts';
+
+export function createFixMachineExtensionsBundle(): MachineExtensionsBundleV1 {
+  return {
+    version: 1,
+    async create(context: MachineExtensionContext) {
+      const [fast, asyncCompaction] = await Promise.all([
+        import('@pi/codex-usage-status').catch(() => undefined),
+        import('@pi/async-compaction').catch(() => undefined),
+      ]);
+      let closed = false;
+      const fastFactory = (fast as unknown as { createManagedExtensionFactory?: typeof import('@pi/codex-usage-status').createManagedExtensionFactory } | undefined)?.createManagedExtensionFactory;
+      const asyncFactory = (asyncCompaction as unknown as { createManagedExtensionFactory?: typeof import('@pi/async-compaction').createManagedExtensionFactory } | undefined)?.createManagedExtensionFactory;
+      const factories = [
+        ...(fastFactory ? [{ name: 'codex-usage-status', factory: fastFactory(context) }] : []),
+        ...(asyncFactory ? [{ name: 'async-compaction', factory: asyncFactory(context) }] : []),
+      ];
+      const extensions = factories.map(({ name, factory }) => ({ name, factory: async (pi: Parameters<typeof factory>[0]) => { if (!closed) await factory(pi); } }));
+      const fastReason = !fast ? 'missing_package' as const : fastFactory ? 'available' as const : 'unbound_factory' as const;
+      const asyncReason = !asyncCompaction ? 'missing_package' as const : asyncFactory ? 'available' as const : 'unbound_factory' as const;
+      return {
+        extensions,
+        capabilities: [
+          { capability: 'fast' as const, status: fastReason === 'available' ? 'active' as const : 'inactive' as const, reason: fastReason },
+          { capability: 'async_compaction' as const, status: asyncReason === 'available' ? 'active' as const : 'inactive' as const, reason: asyncReason },
+        ],
+        shutdown: async (deadline: number) => {
+          closed = true;
+          let firstError: unknown;
+          for (const { factory } of factories) {
+            try { await (factory as typeof factory & { managedShutdown?: (deadline: number) => Promise<void> }).managedShutdown?.(deadline); } catch (error) { firstError ??= error; }
+          }
+          if (firstError !== undefined) throw firstError;
+        },
+      };
+    },
+  };
+}
 
 // ============================================================
 // fix v2 Extension 适配层（骨架 + prepareRun）
@@ -360,6 +399,10 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
       host.trace(`${nodeId} · artifact attempt ${progress.attempt}/${progress.maxAttempts} · ${progress.reason}`);
       return;
     }
+    if (progress.type === 'capability') {
+      host.trace(`${progress.capability} capability ${progress.status} (${progress.reason})`, progress.status === 'inactive' ? 'error' : 'info');
+      return;
+    }
     if (progress.type === 'schema_fallback') {
       // 未知 node.id 退宽松 schema 的降级可见事件（结构与语义校验仍由权威层兜底）。
       host.trace(`${nodeId} · schema fallback: no per-kind schema bound for node "${progress.nodeId}"; falling back to loose schema`, 'error');
@@ -369,7 +412,7 @@ const makeProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, nodeId
       const detail = `tool start: ${progress.name} ${summarize(progress.args)}`;
       host.setWorkflowStatus(ctx, `fix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);
       host.trace(`${nodeId} · ${detail}`);
-    } else {
+    } else if (progress.type === 'tool_end') {
       const detail = `tool end: ${progress.name}${progress.isError ? ' ERROR' : ''} ${summarize(progress.result)}`;
       host.setWorkflowStatus(ctx, `fix ${nodeId} · ${model.provider}/${model.id} · ${detail}`);
       host.trace(`${nodeId} · ${detail}`, progress.isError ? 'error' : 'info');
@@ -386,6 +429,10 @@ const makeLiveProgressHandler = (host: FixHost, ctx: ExtensionCommandContext, no
         ? { ref, runId: live.runId, nodeId, eventKind: 'visible_text', text: progress.text.slice(-4000), occurredAt: new Date().toISOString() }
         : { ref, runId: live.runId, nodeId, eventKind: 'tool_start', toolName: progress.name, args: progress.args, occurredAt: new Date().toISOString() });
       host.sendMessage?.({ customType: 'fix-worker-event', content: `当前 Worker 有新的可见活动（${nodeId}，opaque ref ${ref}）`, display: true, details: { runId: live.runId, ref, nodeId, eventKind: progress.type === 'text' ? 'visible_text' : 'tool_start' } });
+    }
+    if (progress.type === 'capability') {
+      host.trace(`${progress.capability} capability ${progress.status} (${progress.reason})`, progress.status === 'inactive' ? 'error' : 'info');
+      return;
     }
     if (progress.type === 'model_applied') {
       host.setWorkflowStatus(ctx, `fix ${nodeId} · ${progress.model.provider}/${progress.model.id} · 模型已生效`, true);
@@ -417,6 +464,7 @@ export function prepareRun(
   host: FixHost,
   injected?: WorkerExecutor,
   live?: LiveRunBinding,
+  machineExtensionsBundle?: MachineExtensionsBundleV1,
 ): {
   policyDigest: string;
   effective: EffectivePolicy;
@@ -467,6 +515,7 @@ export function prepareRun(
               cwd: ctx.cwd,
               workerId: `reviewer:${id}:${i + 1}`,
               onProgress: live ? makeLiveProgressHandler(host, ctx, id, model, live) : makeProgressHandler(host, ctx, id, model),
+              ...(machineExtensionsBundle ? { machineExtensionsBundle } : {}),
               ...(live ? { live: { ...live } } : {}),
             });
         built.push(makeReviewerNode(id, executor));
@@ -499,6 +548,7 @@ export function prepareRun(
       cwd: ctx.cwd,
       workerId: `worker:${nodeId}`,
       onProgress: live ? makeLiveProgressHandler(host, ctx, nodeId, model, live) : makeProgressHandler(host, ctx, nodeId, model),
+      ...(machineExtensionsBundle ? { machineExtensionsBundle } : {}),
       ...(live ? { live: { ...live } } : {}),
     });
     workers[workerNodeId] = worker;
@@ -1401,7 +1451,7 @@ async function runReviewCommand(
 export async function handleFixCommand(
   ctx: ExtensionCommandContext,
   args: string,
-  deps: { store: PiSessionRunStore; host: FixHost; injected?: WorkerExecutor; policyDigest?: string; live?: LiveFixRunManager },
+  deps: { store: PiSessionRunStore; host: FixHost; injected?: WorkerExecutor; policyDigest?: string; live?: LiveFixRunManager; machineExtensionsBundle?: MachineExtensionsBundleV1 },
 ): Promise<void> {
   const trimmed = args.trim();
   if (/^review(\s|$)/.test(trimmed)) {
@@ -1426,7 +1476,7 @@ export async function handleFixCommand(
       binding = deps.live.createBinding(ctx, runId);
       installLiveModelControls(ctx, deps.live, binding);
       deps.host.appendEntry('workflow-command', { operation: 'start', runId, traceId: runId, time: Date.now() });
-      const prepared = prepareRun(ctx, deps.host, undefined, binding);
+      const prepared = prepareRun(ctx, deps.host, undefined, binding, deps.machineExtensionsBundle);
       binding.store.saveCheckpoint({
         runId, schemaVersion: 1, stage: 'INTAKE', at: Date.now(), id: `${runId}-initial`, problem: parsed.problem,
         workflowVersion: FIX_WORKFLOW_VERSION, policyDigest: prepared.policyDigest,
@@ -1447,7 +1497,7 @@ export async function handleFixCommand(
   try {
     activeTraceId = runId;
     deps.host.setWorkflowStatus(ctx, 'fix INTAKE · preparing worker');
-    const prepared = prepareRun(ctx, deps.host, deps.injected);
+    const prepared = prepareRun(ctx, deps.host, deps.injected, undefined, deps.machineExtensionsBundle);
     deps.host.trace('trace started · new workflow');
     deps.host.appendEntry('workflow-command', { operation: 'start', runId, traceId: runId, time: Date.now() });
     deps.store.saveCheckpoint({
@@ -1481,7 +1531,7 @@ export async function handleFixCommand(
 // session_start(reason='resume') 恢复入口：取最近未完成 checkpoint，用户确认后重新 prepareRun
 // 并从 checkpoint 阶段继续；WAITING_FOR_USER 阶段跳过重复确认（决策已由用户发起）。
 // host 缺省时用 makeFixHost(pi) 自建（与 default export 闭包等价，host 无内部状态）。
-export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, host?: FixHost, live?: LiveFixRunManager): Promise<void> {
+export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandContext, host?: FixHost, live?: LiveFixRunManager, machineExtensionsBundle?: MachineExtensionsBundleV1): Promise<void> {
   const gateway = host ?? makeFixHost(pi);
   const injected = (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker;
   const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data));
@@ -1523,7 +1573,7 @@ export async function resumeFromSession(pi: ExtensionAPI, ctx: ExtensionCommandC
   try {
     binding = live && !injected ? live.createBinding(ctx, checkpoint.runId) : undefined;
     if (binding && live) installLiveModelControls(ctx, live, binding);
-    const prepared = prepareRun(ctx, gateway, injected, binding);
+    const prepared = prepareRun(ctx, gateway, injected, binding, machineExtensionsBundle);
     const runStore: RunStore = binding?.store ?? store;
     if (binding && !binding.store.loadLast(checkpoint.runId)) runStore.saveCheckpoint(checkpoint);
     activeTraceId = checkpoint.runId;
@@ -1712,6 +1762,7 @@ export function installLiveModelControls(ctx: ExtensionContext, live: LiveFixRun
 export default function fixExtensionV2(pi: ExtensionAPI) {
   const host = makeFixHost(pi);
   const live = new LiveFixRunManager();
+  const machineExtensionsBundle = createFixMachineExtensionsBundle();
 
   pi.on('input', async (event: InputEvent, ctx): Promise<InputEventResult> => {
     let owner: ReturnType<LiveFixRunManager['ownerFor']>;
@@ -1757,7 +1808,7 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
     if (event.reason === 'resume') {
       const unfinished = RunControlWal.list().filter((runId) => runId.startsWith('fix-'));
       if (unfinished.length) ctx.ui.notify(`发现 ${unfinished.length} 个可恢复的 Fix 运行；请确认后使用 Pi /resume`, 'warning');
-      await resumeFromSession(pi, ctx, host, live);
+      await resumeFromSession(pi, ctx, host, live, machineExtensionsBundle);
     }
   });
 
@@ -1778,7 +1829,7 @@ export default function fixExtensionV2(pi: ExtensionAPI) {
     description: 'Start a Fix workflow: /fix <问题描述>',
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const store = new PiSessionRunStore(ctx.sessionManager, (type, data) => pi.appendEntry(type, data));
-      await handleFixCommand(ctx, args, { store, host, injected: (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker, live });
+      await handleFixCommand(ctx, args, { store, host, injected: (pi as ExtensionAPI & { fixWorker?: WorkerExecutor }).fixWorker, live, machineExtensionsBundle });
     },
   });
 }

@@ -58,6 +58,7 @@ test('Fast committed record and Async real Timing.finish reach Worker D1 and CLI
 
   const database = new DatabaseSync(':memory:');
   database.exec(await readFile(new URL('../migrations/0003_project_metrics.sql', import.meta.url), 'utf8'));
+  database.exec(await readFile(new URL('../migrations/0004_agent_type.sql', import.meta.url), 'utf8'));
   database.prepare('INSERT INTO project_metrics_meta(singleton,namespace) VALUES(1,?)').run(namespace);
   const env = { DB: d1(database), TARGET_NAMESPACE: namespace, METRICS_WRITE_TOKEN: writeToken, METRICS_READ_TOKEN: readToken, PROJECT_METRICS_ENABLED: 'true' };
   const server = createServer(async (request, response) => {
@@ -121,7 +122,8 @@ test('Fast committed record and Async real Timing.finish reach Worker D1 and CLI
   const stats = await runCli(['stats', '--days', '7', '--validation'], config);
   assert.equal(stats.code, 0);
   const report = JSON.parse(stats.stdout);
-  assert.equal(report.coverage, 'received_only');
+  assert.equal(report.base.coverage, 'received_only');
+  assert.equal(report.schemaVersion, 2);
   assert.equal('events' in report, false);
   assert.equal(report.local.enabled, true);
   database.close();
@@ -133,6 +135,7 @@ test('CLI accepts real SQLite Worker finite-large ratios and displays non-compar
   t.after(() => rm(privateRoot, { recursive: true, force: true }));
   const database = new DatabaseSync(':memory:');
   database.exec(await readFile(new URL('../migrations/0003_project_metrics.sql', import.meta.url), 'utf8'));
+  database.exec(await readFile(new URL('../migrations/0004_agent_type.sql', import.meta.url), 'utf8'));
   database.prepare('INSERT INTO project_metrics_meta(singleton,namespace) VALUES(1,?)').run(namespace);
   t.after(() => database.close());
   const env = { DB: d1(database), TARGET_NAMESPACE: namespace, METRICS_WRITE_TOKEN: writeToken, METRICS_READ_TOKEN: readToken, PROJECT_METRICS_ENABLED: 'true' };
@@ -167,8 +170,8 @@ test('CLI accepts real SQLite Worker finite-large ratios and displays non-compar
     assert.equal(cli.stderr, '');
     assert.equal(cli.stdout.includes(readToken), false);
     const report = JSON.parse(cli.stdout);
-    assert.equal(report.coverage, 'received_only');
-    for (const comparisons of [report.completeDays.comparisons, report.completeDays.overallComparisons]) {
+    assert.equal(report.base.coverage, 'received_only');
+    for (const comparisons of [report.base.completeDays.comparisons, report.base.completeDays.overallComparisons]) {
       assert.equal(comparisons.length, 1);
       assert.equal(comparisons[0].comparable, baseline !== Number.MIN_VALUE);
       assert.equal(comparisons[0].percentChange, baseline === Number.MIN_VALUE ? null : 8.64e17);

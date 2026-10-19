@@ -13,7 +13,7 @@ const usage = { input: 800, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens
 test("real JSONL reopen initializes InteractiveMode with committed context, no stale progress or new background work", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "async-compact-resume-")), agentDir = join(cwd, "agent"), dir = join(cwd, "sessions");
   mkdirSync(agentDir); mkdirSync(dir);
-  const argv = process.argv;
+  const argv = process.argv, previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
   process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
   let release!: () => void;
   const gate = new Promise<void>(r => release = r);
@@ -70,5 +70,5 @@ test("real JSONL reopen initializes InteractiveMode with committed context, no s
     assert.equal(reopened.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-usage").length, 0, "old instance must not write into reopened session");
     assert.equal(SessionManager.open(file, dir, cwd).getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-usage").length, 0, "old late response must not append to restored JSONL");
     restored.dispose();
-  } finally { release(); old.dispose(); mode?.ui.stop(); process.argv = argv; rmSync(cwd, { recursive: true, force: true }); }
+  } finally { release(); old.dispose(); mode?.ui.stop(); process.argv = argv; if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; rmSync(cwd, { recursive: true, force: true }); }
 });

@@ -9,6 +9,7 @@ import { createChildEnvironment } from "./fast-inheritance.ts";
 import { markRetryClassification, retryClassificationOf } from "./retry-classification.ts";
 import { readStableOwnerFileSync } from "./secure-fs.ts";
 import { SIDE_EFFECT_FENCE_TIMEOUT_MS, sideEffectFenceClientProofValid, sideEffectFenceEnvironment, type SideEffectFenceClientConfig } from "./side-effect-fence.ts";
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
 // Runner is shared by v1 and gated v2; keep its retry bound policy-neutral.
 export const MAX_RETRIES_PER_MODEL = 2;
 export const DEFAULT_RETRY_DELAY_MS = 50;
@@ -82,6 +83,7 @@ export interface RunAttemptOptions {
   env?: NodeJS.ProcessEnv;
   firstLogicalChildSpawn: boolean;
   parentFastRequested: boolean;
+  machineSettingsFile?: string;
   onUpdate?: (result: AttemptResult) => void;
   onChildProcess?: (child: { pid: number; identity: string; sessionPath?: string }) => void | boolean | Promise<void | boolean>;
   spawn?: typeof nodeSpawn;
@@ -927,10 +929,11 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
         cwd: options.cwd,
         shell: false,
         stdio: options.sideEffectFence ? ["pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
-        env: options.sideEffectFence ? { ...(options.env ?? createChildEnvironment({ agent: options.agent, firstLogicalChildSpawn: options.firstLogicalChildSpawn, parentSessionRequestedFast: options.parentFastRequested })), ...sideEffectFenceEnvironment(options.sideEffectFence) } : options.env ?? createChildEnvironment({
+        env: options.sideEffectFence ? { ...(options.env ?? createChildEnvironment({ agent: options.agent, firstLogicalChildSpawn: options.firstLogicalChildSpawn, parentSessionRequestedFast: options.parentFastRequested, machineSettingsFile: options.machineSettingsFile ?? path.join(getAgentDir(), 'settings.json') })), ...sideEffectFenceEnvironment(options.sideEffectFence) } : options.env ?? createChildEnvironment({
           agent: options.agent,
           firstLogicalChildSpawn: options.firstLogicalChildSpawn,
           parentSessionRequestedFast: options.parentFastRequested,
+          machineSettingsFile: options.machineSettingsFile ?? path.join(getAgentDir(), 'settings.json'),
         }),
       }) as unknown as JsonProcess;
     } catch {

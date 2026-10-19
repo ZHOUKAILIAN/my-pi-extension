@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import type { ActiveWorkerHandle, ActiveWorkerRegistry, WorkflowInteractionPort, WorkerModel, WorkerSessionLike } from './interaction.ts';
 import type { RunControlWal } from './run-control-wal.ts';
+import { loadMachineExtensionsBundle, ManagedSessionRuntime, ManagedOwnershipTracker } from './machine-extensions.ts';
+import type { MachineExtensionsBundleV1, ManagedExtensionAgentType, ResourceLoaderFactoryContext } from './machine-extensions.ts';
 
 type WorkerMessage = { role?: string; stopReason?: string; errorMessage?: string; content?: unknown };
 type WorkerEvent = {
@@ -31,7 +33,8 @@ export type WorkerProgress =
    *  最小宽松 schema（只声明 kind），结构校验完全交给 execute 内权威层兜底；发本事件
    *  保证该降级在进度流中可见，不会被静默吞掉。 */
   | { type: 'schema_fallback'; nodeId: string }
-  | { type: 'model_applied'; model: { provider: string; id: string }; modelCallRef: string };
+  | { type: 'model_applied'; model: { provider: string; id: string }; modelCallRef: string }
+  | { type: 'capability'; capability: 'fast' | 'async_compaction'; status: 'active' | 'inactive'; reason: 'available' | 'no_bundle' | 'missing_package' | 'import_failed' | 'peer_incompatible' | 'legacy_loader' | 'unbound_factory' | 'conflict' | 'unsupported_host' };
 
 export class WorkerArtifactSubmissionError extends Error {
   readonly code: string;
@@ -133,6 +136,10 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     cwd?: string;
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
+    resourceLoaderFactory?: (context: ResourceLoaderFactoryContext) => ResourceLoader;
+    machineExtensionsBundle?: MachineExtensionsBundleV1;
+    settingsFile?: string;
+    agentType?: ManagedExtensionAgentType;
     onProgress?: (progress: WorkerProgress) => void;
     live?: {
       registry: ActiveWorkerRegistry;
@@ -152,6 +159,10 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     cwd?: string;
     createSession?: typeof createAgentSession;
     resourceLoader?: ResourceLoader;
+    resourceLoaderFactory?: (context: ResourceLoaderFactoryContext) => ResourceLoader;
+    machineExtensionsBundle?: MachineExtensionsBundleV1;
+    settingsFile?: string;
+    agentType?: ManagedExtensionAgentType;
     onProgress?: (progress: WorkerProgress) => void;
     live?: {
       registry: ActiveWorkerRegistry;
@@ -198,19 +209,64 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
     };
 
     const requestedSkills = this.options.skills ?? node.profile?.skills ?? [];
-    const loader = this.options.resourceLoader ?? new DefaultResourceLoader({
+    const loaderOptions = {
       cwd: this.options.cwd ?? process.cwd(),
       agentDir: getAgentDir(),
+      extensionFactories: [] as unknown[],
       // Worker 只能看到当前 Node 明确允许的 skill，不能继承主 Session 的全部 skill。
-      skillsOverride: (base) => {
+      skillsOverride: (base: { skills: Array<{ name: string }> }) => {
         const available = new Map(base.skills.map((skill) => [skill.name, skill]));
         const missing = requestedSkills.filter((name) => !available.has(name));
         if (missing.length) throw Error(`unknown node skill: ${missing.join(', ')}`);
         return { ...base, skills: requestedSkills.map((name) => available.get(name)!) };
       },
       agentsFilesOverride: () => ({ agentsFiles: [] }),
-    });
-    await loader.reload();
+    };
+    let managedExtensions: Awaited<ReturnType<typeof loadMachineExtensionsBundle>> | undefined;
+    if (this.options.machineExtensionsBundle && !this.options.resourceLoader) {
+      managedExtensions = await loadMachineExtensionsBundle({ settingsFile: this.options.settingsFile ?? join(getAgentDir(), 'settings.json'), agentType: this.options.agentType ?? 'subagent' }, {
+        report: capability => this.options.onProgress?.({ type: 'capability', ...capability }),
+        bundle: this.options.machineExtensionsBundle,
+      });
+      loaderOptions.extensionFactories.push(...managedExtensions.extensions);
+    } else {
+      const reason = this.options.resourceLoader ? 'legacy_loader' as const : 'no_bundle' as const;
+      for (const capability of [{ capability: 'fast' as const }, { capability: 'async_compaction' as const }]) this.options.onProgress?.({ type: 'capability', ...capability, status: 'inactive', reason });
+    }
+    let loader: ResourceLoader;
+    const ownedLoaders = new ManagedOwnershipTracker<object>();
+    let sessionRuntime: ManagedSessionRuntime | undefined;
+    let workerSession: WorkerSessionRuntime | undefined;
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanupManaged = async (): Promise<void> => {
+      if (cleanupPromise) return cleanupPromise;
+      cleanupPromise = (async () => {
+        const deadline = performance.now() + 1000;
+        try { if (workerSession && sessionRuntime) await sessionRuntime.emitShutdown(workerSession as unknown as { extensionRunner?: { emit: (event: unknown) => Promise<unknown> } }, deadline); }
+        finally {
+          try { await managedExtensions?.shutdown(deadline); }
+          finally {
+            sessionRuntime?.invalidateOwned();
+            try { workerSession?.dispose?.(); } catch { /* dispose is final best effort */ }
+          }
+        }
+      })();
+      try { await cleanupPromise; }
+      catch { try { process.stderr.write('[pi] managed extension cleanup incomplete\n'); } catch { /* fixed diagnostic only */ } }
+    };
+    try {
+      const createDefault = (options: Record<string, unknown> = {}): ResourceLoader => {
+        const created = new DefaultResourceLoader({ ...loaderOptions, ...options, extensionFactories: [...loaderOptions.extensionFactories, ...((options as { extensionFactories?: unknown[] }).extensionFactories ?? [])] } as never);
+        ownedLoaders.own(created as object);
+        return created;
+      };
+      loader = this.options.resourceLoader
+        ?? (this.options.resourceLoaderFactory
+          ? this.options.resourceLoaderFactory({ createDefault, adoptResource: <T extends object>(expected: T, incoming: T) => ownedLoaders.adopt(expected as object, incoming as object) as T })
+          : createDefault());
+      if (!this.options.resourceLoader && !ownedLoaders.isOwned(loader as object)) throw new Error('foreign_managed_resource');
+      await loader.reload();
+    } catch (error) { await cleanupManaged(); throw error; }
 
     const scopedSkills = () => {
       const availableSkills = typeof loader.getSkills === 'function'
@@ -224,7 +280,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         skills: requestedSkills.map((name) => availableByName.get(name)!),
       };
     };
-    scopedSkills();
+    try { scopedSkills(); } catch (error) { await cleanupManaged(); throw error; }
     // 即使 reload 后 catalogue 变化，session 也只看到当前 Node allowlist 中仍可解析的 skill。
     const scopedLoader = new Proxy(loader, {
       get(target, property) {
@@ -262,7 +318,9 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         sessionManager = SessionManager.create(this.options.cwd ?? process.cwd(), sessionDir);
       }
     }
-    const { session } = await create({
+    let sessionResult: Awaited<ReturnType<typeof create>>;
+    try {
+      sessionResult = await create({
       tools: node.profile?.tools ?? [],
       customTools: [submit],
       resourceLoader: scopedLoader,
@@ -272,7 +330,22 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       settingsManager: SettingsManager.inMemory(),
       ...(this.options.model ? { model: this.options.model } : {}),
       ...(this.options.thinkingLevel !== undefined ? { thinkingLevel: this.options.thinkingLevel } : {}),
-    } as unknown as Parameters<typeof createAgentSession>[0]);
+      } as unknown as Parameters<typeof createAgentSession>[0]);
+    } catch (error) { await cleanupManaged(); throw error; }
+    const session = sessionResult.session as WorkerSessionRuntime;
+    workerSession = session;
+    if (!this.options.resourceLoader) {
+      sessionRuntime = new ManagedSessionRuntime(() => {
+        try { process.stderr.write('[pi] managed extension lifecycle error\n'); } catch { /* diagnostic only */ }
+      }, cleanupManaged);
+      try {
+        sessionRuntime.wrapSession(session as unknown as { extensionRunner?: { emit: (event: unknown) => Promise<unknown> }; reload?: (options?: { beforeSessionStart?: () => void | Promise<void> }) => Promise<void> });
+        await sessionRuntime.bind(session as unknown as { bindExtensions?: (bindings: { mode: 'print'; onError: () => void }) => Promise<void>; extensionRunner?: { emit: (event: unknown) => Promise<unknown> }; reload?: (options?: { beforeSessionStart?: () => void | Promise<void> }) => Promise<void> });
+      } catch (error) {
+        await cleanupManaged();
+        throw error;
+      }
+    }
 
     let liveHandle: ActiveWorkerHandle | undefined;
     if (live) {
@@ -300,7 +373,7 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         await live.interaction.reconcileWorker(liveHandle);
       } catch (error) {
         live.registry.unregisterWorker(liveHandle.runId, liveHandle.workerSessionId);
-        liveHandle.session.dispose?.();
+        await cleanupManaged();
         throw error;
       }
     }
@@ -323,7 +396,6 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
         if (error instanceof ArtifactContractError) fallbackRejected = error;
       }
     };
-    const workerSession = session as unknown as WorkerSessionRuntime;
     const textFromContent = (content: unknown): string => Array.isArray(content)
       ? content.filter((item): item is { type: string; text: string } => typeof item === 'object' && item !== null && (item as { type?: unknown }).type === 'text' && typeof (item as { text?: unknown }).text === 'string').map((item) => item.text).join('')
       : '';
@@ -441,18 +513,23 @@ export class PiSdkWorkerExecutor implements WorkerExecutor {
       }
       return captured;
     } finally {
-      unsubscribe?.();
-      if (liveHandle) {
-        liveHandle.status = captured ? 'settled' : 'failed';
-        try {
-          live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, attemptId: liveHandle.attemptId, status: liveHandle.status });
-        } finally {
+      try {
+        if (liveHandle) {
+          liveHandle.status = captured ? 'settled' : 'failed';
           try {
-            await live!.interaction.closeWorker(liveHandle.runId, liveHandle.status);
+            live!.wal.recordWorker({ kind: 'session_settled', nodeExecutionId: liveHandle.nodeExecutionId, workerId: liveHandle.workerId, workerSessionId: liveHandle.workerSessionId, attemptId: liveHandle.attemptId, status: liveHandle.status });
           } finally {
-            liveHandle.session.dispose?.();
+            try {
+              await live!.interaction.closeWorker(liveHandle.runId, liveHandle.status);
+            } finally {
+              await cleanupManaged();
+            }
           }
+        } else {
+          await cleanupManaged();
         }
+      } finally {
+        unsubscribe?.();
       }
     }
   }

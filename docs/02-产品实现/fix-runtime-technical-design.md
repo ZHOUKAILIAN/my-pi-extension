@@ -48,6 +48,14 @@ Runtime 的责任边界：
 - `Acceptance Definition` 综合判断整个 Run 是否可以进入 `ACCEPTED`；
 - Controller 保存 checkpoint、执行 Guard、生成迁移记录和最终 Acceptance Result。
 
+### 1.1 Worker 可选本机功能提供与诊断（REVIEWING，未实现）
+
+Fix是MachineExtensionsBundleV1的实际提供者，SDK通用构造与生命周期由[Runtime架构](runtime-实现架构.md#sdk-worker-本机功能接线reviewing未实现)拥有。Fix以optionalDependencies声明两个既有Extension，在实际创建Worker时安全dynamic import其公共managed-factory导出，不以模块顶层静态导入使缺包阻断Fix。每次执行提供独立factory/清理句柄，source固定subagent、机器设置根固定；缺一个可保留另一个，缺失/peer错误/导入失败以有限capability原因反馈，原Workflow继续。
+
+现有progress消费者须处理capability事件：显示固定安全说明并沿原非上下文诊断入口保留；不向Artifact、Guard或Run状态添加控制事实，不泄露路径/原异常。没有消费者或消费异常时Runtime用固定stderr提示兜底，不污染结构化stdout。实际生产Worker构造点统一提供bundle，旧显式resourceLoader注入仅保留兼容并明确托管能力不可证明。
+
+当前Fix仍未提供bundle、progress也无capability分支。验收覆盖隔离打包/可选依赖缺失、真实SDK payload与子阶段标签、消费者显示/诊断、业务原结果保持，不以monorepo hoist或未消费warning证明成功。
+
 ## 2. Stage 与 Node 的落地边界
 
 Stage 是 Run 级别的粗粒度业务位置；Node 是 Stage 内一次独立、可审计的工作。Review 不自动变成新的 Stage，独立性通过 Node Execution、`workerId` 和 Artifact provenance 保证。最终人工验收复用 `WAITING_FOR_USER`，由 Controller 创建待确认请求，不增加 Agent Node。
@@ -1299,7 +1307,7 @@ Node execution、身份、Guard、checkpoint；业务门禁 owner 待拆]
 
 ## 9. 验证入口
 
-`scripts/release-install.test.ts` 验证日常三扩展组合在 Pi 1.0.4 下的生产依赖安装与真实 loader/runner：`/fix` 注册、空参数返回用法、没有活跃 Worker 时允许导航、`session_start/shutdown` 无宿主吞掉的异常。测试只使用临时 agent 目录，不读取个人凭据、不创建真实 Worker。`@pi/fix` 生产安装不再携带自己的 Pi TUI，组件由宿主提供；原有 0.84.4 开发测试继续保留。1.0.4 的真实 provider、Worker 执行、编辑器和恢复全流程仍未验收。
+`scripts/release-install.test.ts` 以当前源码和 lockfile 为安装对象，在临时目录执行生产依赖安装，并通过 Pi 1.0.4、1.1.0 的真实 loader/runner 检查三扩展组合：`/fix` 注册、空参数返回用法、没有活跃 Worker 时允许导航、`session_start/shutdown` 无宿主吞掉的异常。两版 smoke 已执行；未提供对应 `PI_CODING_AGENT_1_0_4_PATH` / `PI_CODING_AGENT_1_1_0_PATH` 时该分支跳过，不能视为通过。测试不读取个人凭据、不创建真实 Worker。Fix 的宿主 AI/SDK/TUI 仍声明为 peer，不携带自己的固定 TUI runtime；Workflow Runtime 的 AI/SDK/TUI 1.1.0 是独立生产依赖，不能断言整个安装目录没有 Pi 包。安装 smoke 验证这些依赖的版本及可导入性，不证明实际 Worker 的解析隔离；真实 provider、Worker 执行、编辑器和恢复全流程仍未验收。固定发布 Tag 的历史验证与当前源码 smoke 不互相替代。
 
 实现变化后至少运行：
 

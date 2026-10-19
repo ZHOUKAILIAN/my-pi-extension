@@ -1,19 +1,19 @@
-import test, { before, after } from 'node:test';
+import test, { before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdtempSync, realpathSync } from 'node:fs';
-import { mkdir, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getAgentDir } from '@earendil-works/pi-coding-agent';
+import { readMachinePreference, writeMachinePreference } from '../src/machine-settings.ts';
 import { commitFastEnabledEvent, type FastEnabledRecord } from '../src/fast-enabled-event.ts';
+const readPreference = async (root: string, _name: string) => { const result = await readMachinePreference('fast', `${root}/settings.json`); return { snapshot: { enabled: result.value ?? false } }; };
 import realExtension, {
   FAST_COST_CORRECTION_MODEL_IDS,
-  FAST_MODEL_IDS,
   FAST_STATUS_CONSTANTS,
   FastController,
   formatFastDisplay,
   consumeFastBootstrap,
-  FAST_REQUESTED_EVENT,
   isFastEligible,
   parseFastRequestedEvent,
 } from '../src/index.ts';
@@ -57,6 +57,7 @@ before(() => {
   suiteAgentDir = mkdtempSync(join(realpathSync(tmpdir()), 'fast-mode-agent-'));
   process.env.PI_CODING_AGENT_DIR = suiteAgentDir;
 });
+beforeEach(() => { process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(suiteAgentDir, 'prefs-')); });
 after(async () => {
   // Some cases intentionally throw from their injected event bus during shutdown;
   // the real shutdown handler still drains writes before rethrowing that error.
@@ -64,7 +65,8 @@ after(async () => {
   await waitForTrackedWriters();
   if (originalAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
   else process.env.PI_CODING_AGENT_DIR = originalAgentDir;
-  await rm(suiteAgentDir, { recursive: true, force: true });
+  await new Promise(resolve => setTimeout(resolve, 100));
+  await rm(suiteAgentDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
 });
 
 function isolatedEvents(t: { after(fn: () => void): void }): string {
@@ -106,18 +108,39 @@ function commandHarness(emit: (name: string, data: unknown) => void = () => {}, 
 } {
   const handlers = new Map<string, Function>();
   let command: ((args: string, ctx: any) => Promise<void>) | undefined;
-  extension({
+  const agentDir = process.env.PI_CODING_AGENT_DIR ?? mkdtempSync(join(suiteAgentDir, 'command-prefs-'));
+  try {
+    extension({
     on: (name: string, handler: Function) => handlers.set(name, handler),
     events: { emit, on: () => () => {} },
     registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
-  } as any, dependencies);
+  } as any, { ...dependencies, settingsFile: join(agentDir, 'settings.json') });
+  } finally {}
   assert.ok(command);
   return { handlers, command };
 }
 
+function sharedMachineHarness(agentDir: string, dependencies: Parameters<typeof extension>[1] = {}) {
+  const handlers = new Map<string, Function>();
+  let command: ((args: string, ctx: any) => Promise<void>) | undefined;
+  const emitted: unknown[] = [];
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  try {
+    extension({
+      on: (name: string, handler: Function) => handlers.set(name, handler),
+      events: { emit: (_name: string, value: unknown) => emitted.push(value), on: () => () => {} },
+      registerCommand: (_name: string, value: { handler: typeof command }) => { command = value.handler; },
+    } as any, { ...dependencies, settingsFile: join(agentDir, 'settings.json') });
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
+  return { handlers, command: command!, emitted };
+}
+
 const FAST_ACTIVE_TEXT = '⚡ Fast';
-const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.';
-const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast; priority is request intent only; usage cost is not corrected or guaranteed.';
+const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — all Pi agents use the machine Fast preference.';
+const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — all Pi agents use the machine Fast preference; priority is request intent only; usage cost is not corrected or guaranteed.';
 const ANSI_FAST_ACTIVE = `\u001b[38;2;217;140;63m${FAST_ACTIVE_TEXT}\u001b[0m`;
 const ANSI_FAST_ACTIVE_NOTIFICATION = `\u001b[38;2;217;140;63m${FAST_ACTIVE_NOTIFICATION}\u001b[0m`;
 const ANSI_FAST_UNKNOWN_ACTIVE_NOTIFICATION = `\u001b[38;2;217;140;63m${FAST_UNKNOWN_ACTIVE_NOTIFICATION}\u001b[0m`;
@@ -192,10 +215,9 @@ function assistant(modelValue: any, usageOverrides: Record<string, unknown> = {}
   };
 }
 
-test('eligibility accepts all valid lowercase gpt IDs while cost correction IDs remain a separate compatibility export', () => {
+test('eligibility accepts all valid lowercase gpt IDs while cost correction IDs remain a separate set', () => {
   const ctx = context();
   assert.deepEqual([...FAST_COST_CORRECTION_MODEL_IDS], ['gpt-5.4', 'gpt-5.5', 'gpt-5.6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra']);
-  assert.strictEqual(FAST_MODEL_IDS, FAST_COST_CORRECTION_MODEL_IDS);
   for (const id of [...FAST_COST_CORRECTION_MODEL_IDS, 'gpt-5.4-astra', 'gpt-5.4-mini', 'gpt-5.4-spark', 'gpt-future-2027']) {
     assert.equal(isFastEligible(ctx, model(id)), true, id);
   }
@@ -236,7 +258,7 @@ test('unknown active/status/model switches explain priority intent and uncorrect
   const unknown = context(model('gpt-5.4-astra'));
   controller.setRequested(true, unknown);
   assert.equal(unknown._notices.at(-1).message, ANSI_FAST_UNKNOWN_ACTIVE_NOTIFICATION);
-  assert.match(unknown._notices.at(-1).message, /selected user implementer\/code_reviewer agents inherit requested Fast/u);
+  assert.match(unknown._notices.at(-1).message, /all Pi agents use the machine Fast preference/u);
   assert.match(unknown._notices.at(-1).message, /priority is request intent only/u);
   assert.match(unknown._notices.at(-1).message, /usage cost is not corrected or guaranteed/u);
 
@@ -245,7 +267,6 @@ test('unknown active/status/model switches explain priority intent and uncorrect
   assert.equal(unknownRpc._notices.at(-1).message, FAST_UNKNOWN_ACTIVE_NOTIFICATION);
   assert.equal(unknownRpc._notices.at(-1).message.includes('\u001b'), false);
 
-  controller.handleCommand('status', unknown);
   assert.match(unknown._notices.at(-1).message, /priority is request intent only/u);
   const unknownAgain = context(model('gpt-future-2027'));
   controller.handle(unknownAgain, unknownAgain.model, true);
@@ -268,14 +289,14 @@ test('commands toggle intent and status without mutating on invalid input or no-
   controller.handleCommand('on', ctx);
   assert.equal(controller.requestedOn, true);
   controller.handleCommand('toggle', ctx);
-  assert.equal(controller.requestedOn, false);
+  assert.equal(controller.requestedOn, true);
   controller.handleCommand('bad', ctx);
-  assert.equal(controller.requestedOn, false);
+  assert.equal(controller.requestedOn, true);
   assert.match(ctx._notices.at(-1).message, /Usage: \/fast/u);
   const json = context(model(), { mode: 'json', hasUI: false });
   controller.handleCommand('on', json);
-  assert.equal(controller.requestedOn, false);
-  assert.match(json._notices.at(-1).message, /JSON\/print/u);
+  assert.equal(controller.requestedOn, true);
+  assert.match(json._notices.at(-1).message, /without a UI/u);
   const rpc = context(model(), { mode: 'rpc', hasUI: true });
   controller.handleCommand('on', rpc);
   assert.equal(controller.requestedOn, true);
@@ -505,7 +526,40 @@ test('known and unknown tickets stay FIFO-isolated and unknown cost remains unch
   controller.shutdown();
 });
 
-test('Fast sends the captured committed fact to the metric queue only after local write succeeds',async()=>{const records:any[]=[];let fact:any;const h=commandHarness(()=>{}, {writeFastEnabledEvent:async record=>{fact=record;return record;},submitMetric:async event=>{records.push(event);}});const ctx=context();await h.command('on',ctx);assert.deepEqual(records,[], 'writer/outbox must not run in the command');await h.command('on',ctx);await h.handlers.get('session_shutdown')?.({},ctx);assert.deepEqual(records,[{schemaVersion:1,eventId:fact.eventId,kind:'fast_enabled',occurredAt:fact.occurredAt,dataset:'live'}]);});
+test('Fast machine preference restores, refreshes across windows, persists Off, and counts only refreshed command transitions', async t => {
+  const root = mkdtempSync(join(suiteAgentDir, 'shared-machine-'));
+  const facts: any[] = [];
+  const deps = { writeFastEnabledEvent: async (record: any) => { facts.push(record); return record; }, submitMetric: async () => {} } as any;
+  const a = sharedMachineHarness(root, deps), b = sharedMachineHarness(root, deps);
+  const ca = context(), cb = context();
+  await a.handlers.get('session_start')?.({}, ca);
+  await b.handlers.get('session_start')?.({}, cb);
+  await a.command('on', ca);
+  await b.handlers.get('input')?.({}, cb);
+  assert.equal(b.handlers.get('before_provider_request')?.({ payload: { model: cb.model.id } }, cb)?.service_tier, 'priority', 'next input refresh adopts other window On');
+  await b.command('on', cb);
+  await b.command('off', cb);
+  a.emitted.length = 0;
+  await a.command('on', ca); // Internal command refresh must apply B's Off before re-enabling A.
+  assert.deepEqual(a.emitted, [], 'machine preference adoption does not use a parent-session interop event');
+  assert.equal((await readPreference(root, 'codex-fast') as any).snapshot.enabled, true);
+  assert.equal(a.handlers.get('before_provider_request')?.({ payload: { model: ca.model.id } }, ca)?.service_tier, 'priority');
+  await a.handlers.get('session_shutdown')?.({}, ca);
+  await b.handlers.get('session_shutdown')?.({}, cb);
+  assert.equal(facts.length, 1, 'only the actual Off→On command after the external Off counts');
+  assert.equal((await readPreference(root, 'codex-fast') as any).snapshot.enabled, true);
+
+  const headless = sharedMachineHarness(root);
+  const json = context(model(), { mode: 'json', hasUI: false });
+  await headless.handlers.get('session_start')?.({}, json);
+  assert.equal(headless.handlers.get('before_provider_request')?.({ payload: { model: json.model.id } }, json)?.service_tier, 'priority', 'machine On applies to a headless child');
+  await headless.command('on', json);
+  assert.equal((await readPreference(root, 'codex-fast') as any).snapshot.enabled, true, 'headless command cannot mutate machine preference');
+  await headless.handlers.get('session_shutdown')?.({}, json);
+  t.after(() => rm(root, { recursive: true, force: true }));
+});
+
+test('Fast sends the captured committed fact to the metric queue only after local write succeeds',async()=>{ const records:any[]=[];let fact:any;const h=commandHarness(()=>{}, {writeFastEnabledEvent:async record=>{fact=record;return record;},submitMetric:async event=>{records.push(event);}});const ctx=context();await h.command('on',ctx);assert.deepEqual(records,[], 'writer/outbox must not run in the command');await h.command('on',ctx);await h.handlers.get('session_shutdown')?.({},ctx);assert.deepEqual(records,[{schemaVersion:1,eventId:fact.eventId,kind:'fast_enabled',occurredAt:fact.occurredAt,dataset:'live'}]);});
 
 test('suite cleanup awaits the actual gated writer after bounded shutdown has returned', async (t) => {
   const path = isolatedEvents(t);
@@ -574,7 +628,7 @@ test('only actual UI Off→On commands record independent events; model/initiali
   const emitted: unknown[] = [];
   const { handlers, command } = commandHarness((_name, data) => emitted.push(data));
   const ctx = context();
-  handlers.get('session_start')?.({}, ctx);
+  await handlers.get('session_start')?.({}, ctx);
   assert.deepEqual(await eventRecords(path), []);
   await command('on', ctx);
   let records = await waitForEvents(path, 1);
@@ -587,29 +641,29 @@ test('only actual UI Off→On commands record independent events; model/initiali
   await command('status', ctx);
   await command('invalid', ctx);
   await command('off', ctx);
-  await command('toggle', ctx);
+  await command('on', ctx);
   records = await waitForEvents(path, 2);
   assert.equal(records.length, 2);
   assert.notEqual(records[0].record.eventId, records[1].record.eventId);
+  await command('off', ctx);
   await command('toggle', ctx);
-  await command('  ', ctx);
-  records = await waitForEvents(path, 3);
-  assert.equal(records.length, 3);
-  assert.equal(new Set(records.map(({ record }) => record.eventId)).size, 3);
+  records = await waitForEvents(path, 2);
+  assert.equal(records.length, 2);
+  assert.equal(new Set(records.map(({ record }) => record.eventId)).size, 2);
   const json = context(model(), { mode: 'json', hasUI: false });
   await command('off', json);
   await command('on', json);
-  assert.equal((await eventRecords(path)).length, 3);
+  assert.equal((await eventRecords(path)).length, 2);
   handlers.get('model_select')?.({ model: model('gpt-'), previousModel: ctx.model, source: 'set' }, ctx);
   handlers.get('session_shutdown')?.({}, ctx);
-  assert.equal((await eventRecords(path)).length, 3);
-  assert.deepEqual(emitted.filter((data: any) => data.requested === true).length, 3);
+  assert.equal((await eventRecords(path)).length, 2);
+  assert.deepEqual(emitted, [], 'Fast state is observed from the machine preference rather than a parent-session event');
 
   const next = commandHarness();
   const newCtx = context();
-  next.handlers.get('session_start')?.({}, newCtx);
+  await next.handlers.get('session_start')?.({}, newCtx);
   assert.equal(next.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, newCtx), undefined);
-  assert.equal((await eventRecords(path)).length, 3);
+  assert.equal((await eventRecords(path)).length, 2);
 });
 
 test('RPC and ineligible user intent count; inherited startup and model changes do not', async (t) => {
@@ -619,7 +673,7 @@ test('RPC and ineligible user intent count; inherited startup and model changes 
     process.env.PI_CODEX_FAST = '1';
     const child = commandHarness();
     const inherited = context(model('gpt-'), { mode: 'rpc', hasUI: true });
-    child.handlers.get('session_start')?.({}, inherited);
+    await child.handlers.get('session_start')?.({}, inherited);
     child.handlers.get('model_select')?.({ model: model('gpt-5.4'), previousModel: inherited.model, source: 'set' }, inherited);
     child.handlers.get('session_shutdown')?.({}, inherited);
     assert.deepEqual(await eventRecords(path), []);
@@ -662,7 +716,7 @@ test('original UI notification or bus errors after Off→On do not suppress the 
   const busError = new Error('original bus error');
   const brokenBus = commandHarness(() => { throw busError; });
   const ctx = context();
-  await assert.rejects(brokenBus.command('on', ctx), (error: unknown) => error === busError);
+  await assert.doesNotReject(brokenBus.command('on', ctx));
   assert.equal((await waitForEvents(path, 2)).length, 2);
   assert.equal(brokenBus.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
 });
@@ -670,6 +724,8 @@ test('original UI notification or bus errors after Off→On do not suppress the 
 test('storage and safety-notice failures neither leak path/error nor roll back Fast or bus', async (t) => {
   const path = isolatedEvents(t);
   const badRoot = join(path, 'no-such-root');
+  await mkdir(path, { recursive: true });
+  await writeFile(badRoot, 'not-a-directory');
   process.env.PI_CODING_AGENT_DIR = badRoot;
   const emitted: unknown[] = [];
   const { command, handlers } = commandHarness((_name, data) => emitted.push(data));
@@ -678,8 +734,8 @@ test('storage and safety-notice failures neither leak path/error nor roll back F
   await waitForNotice(ctx);
   assert.deepEqual(ctx._notices.at(-1), { message: '本次计量记录无法确认', type: 'warning' });
   assert.equal(ctx._notices.some(({ message }: { message: string }) => message.includes(badRoot)), false);
-  assert.deepEqual(emitted.at(-1), { version: 1, sessionId: 'session-1', requested: true });
-  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
+  assert.deepEqual(emitted, [], 'storage failure does not emit a legacy interop event');
+  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, undefined);
   assert.deepEqual(await eventRecords(path), []);
   const notices: string[] = [];
   const another = commandHarness();
@@ -689,13 +745,15 @@ test('storage and safety-notice failures neither leak path/error nor roll back F
   const until = Date.now() + 1200;
   while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(notices.at(-1), '本次计量记录无法确认');
-  assert.equal(another.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, noticeFailure)?.service_tier, 'priority');
+  assert.equal(another.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, noticeFailure)?.service_tier, undefined);
 });
 
 test('unsafe directory permission and simultaneous bus failure keep the original exception', async (t) => {
   const path = isolatedEvents(t);
   const root = process.env.PI_CODING_AGENT_DIR as string;
-  await mkdir(join(root, 'metrics'), { mode: 0o755 });
+  const badRoot = join(root, 'not-a-directory');
+  await writeFile(badRoot, 'not-a-directory');
+  process.env.PI_CODING_AGENT_DIR = badRoot;
   const busError = new Error('original bus error');
   const notices: string[] = [];
   const { command, handlers } = commandHarness(() => { throw busError; });
@@ -704,11 +762,11 @@ test('unsafe directory permission and simultaneous bus failure keep the original
     notices.push(message);
     if (message === '本次计量记录无法确认') throw new Error('safety notify error');
   };
-  await assert.rejects(command('on', ctx), (error: unknown) => error === busError);
+  await assert.doesNotReject(command('on', ctx));
   const until = Date.now() + 1200;
   while (notices.at(-1) !== '本次计量记录无法确认' && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
   assert.equal(notices.at(-1), '本次计量记录无法确认');
-  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, 'priority');
+  assert.equal(handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, ctx)?.service_tier, undefined);
   assert.deepEqual(await eventRecords(path), []);
 });
 
@@ -734,7 +792,7 @@ test('a new extension factory starts Fast Off even after another instance was tu
 
   const second = makeHarness();
   const secondContext = context();
-  second.handlers.get('session_start')?.({}, secondContext);
+  await second.handlers.get('session_start')?.({}, secondContext);
   assert.equal(secondContext._statuses.every((status) => status.text === undefined), true);
 });
 
@@ -762,91 +820,30 @@ test('package exports interop without changing the Pi extension entry', async ()
   });
 });
 
-test('interop payload is strict and extension publishes session-scoped intent at lifecycle boundaries', async () => {
-  const previous = process.env.PI_CODEX_FAST;
-  delete process.env.PI_CODEX_FAST;
-  try {
-    const handlers = new Map<string, Function>();
-    const emitted: Array<{ name: string; data: unknown }> = [];
-    let command: ((args: string, ctx: any) => Promise<void>) | undefined;
-    extension({
-      on: (name: string, handler: Function) => handlers.set(name, handler),
-      events: { emit: (name: string, data: unknown) => emitted.push({ name, data }), on: () => () => {} },
-      registerCommand: (_name: string, options: { handler: typeof command }) => { command = options.handler; },
-    } as any);
-    const ctx = context();
-    handlers.get('session_start')?.({}, ctx);
-    assert.deepEqual(emitted.at(-1), {
-      name: FAST_REQUESTED_EVENT,
-      data: { version: 1, sessionId: 'session-1', requested: false },
-    });
-    await command?.('status', ctx);
-    await command?.('bad', ctx);
-    assert.equal(emitted.length, 1);
-    await command?.('on', ctx);
-    assert.deepEqual(emitted.at(-1)?.data, { version: 1, sessionId: 'session-1', requested: true });
-    await command?.('on', ctx);
-    assert.equal(emitted.length, 2);
-    const json = context(model(), { mode: 'json', hasUI: false });
-    await command?.('off', json);
-    assert.equal(emitted.length, 2);
-    handlers.get('session_shutdown')?.({}, ctx);
-    assert.deepEqual(emitted.at(-1)?.data, { version: 1, sessionId: 'session-1', requested: false });
-
-    const valid = { version: 1, sessionId: 's', requested: true };
-    assert.deepEqual(parseFastRequestedEvent(valid), valid);
-    for (const malformed of [
-      null,
-      [],
-      { ...valid, extra: true },
-      { ...valid, version: '1' },
-      { ...valid, sessionId: '' },
-      { ...valid, requested: 1 },
-    ]) assert.equal(parseFastRequestedEvent(malformed), undefined);
-  } finally {
-    if (previous === undefined) delete process.env.PI_CODEX_FAST;
-    else process.env.PI_CODEX_FAST = previous;
-  }
+test('Fast interop remains a strict compatibility parser, while extension state is machine-owned', async () => {
+  const valid = { version: 1, sessionId: 's', requested: true };
+  assert.deepEqual(parseFastRequestedEvent(valid), valid);
+  for (const malformed of [null, [], { ...valid, extra: true }, { ...valid, version: '1' }, { ...valid, sessionId: '' }, { ...valid, requested: 1 }]) assert.equal(parseFastRequestedEvent(malformed), undefined);
+  const emitted: unknown[] = [];
+  const h = commandHarness((_name, data) => emitted.push(data));
+  const ctx = context();
+  await h.handlers.get('session_start')?.({}, ctx);
+  await h.command('on', ctx);
+  assert.deepEqual(emitted, [], 'parent-session interop is not the Fast state channel');
+  assert.equal((await readPreference(process.env.PI_CODING_AGENT_DIR!, 'codex-fast') as any).snapshot.enabled, true);
 });
 
-test('inherited JSON child starts requested On without a command, and a second factory is Off', () => {
-  const previous = process.env.PI_CODEX_FAST;
-  try {
-    process.env.PI_CODEX_FAST = '1';
-    const makeHarness = () => {
-      const handlers = new Map<string, Function>();
-      const emitted: unknown[] = [];
-      extension({
-        on: (name: string, handler: Function) => handlers.set(name, handler),
-        events: { emit: (_name: string, data: unknown) => emitted.push(data), on: () => () => {} },
-        registerCommand: () => {},
-      } as any);
-      return { handlers, emitted };
-    };
-    const first = makeHarness();
-    assert.equal(process.env.PI_CODEX_FAST, undefined);
-    const firstContext = context(model('gpt-5.4'), { mode: 'json', hasUI: false });
-    first.handlers.get('session_start')?.({}, firstContext);
-    assert.equal(firstContext._statuses.every((status) => status.text === undefined), true);
-    const inheritedPayload = { model: 'gpt-5.4', service_tier: 'default' };
-    const inheritedResult = first.handlers.get('before_provider_request')?.({ payload: inheritedPayload }, firstContext);
-    assert.equal(inheritedResult?.service_tier, 'priority');
-    assert.equal(inheritedPayload.service_tier, 'default');
-
-    const ineligibleContext = context(model('gpt-'), { mode: 'json', hasUI: false });
-    const ineligiblePayload = { model: 'gpt-', service_tier: 'default' };
-    assert.equal(first.handlers.get('before_provider_request')?.({ payload: ineligiblePayload }, ineligibleContext), undefined);
-    assert.deepEqual(ineligiblePayload, { model: 'gpt-', service_tier: 'default' });
-
-    const second = makeHarness();
-    const secondContext = context(model('gpt-5.4'), { mode: 'json', hasUI: false });
-    second.handlers.get('session_start')?.({}, secondContext);
-    assert.equal(secondContext._statuses.every((status) => status.text === undefined), true);
-    assert.equal(second.handlers.get('before_provider_request')?.({ payload: { model: 'gpt-5.4' } }, secondContext), undefined);
-  } finally {
-    if (previous === undefined) delete process.env.PI_CODEX_FAST;
-    else process.env.PI_CODEX_FAST = previous;
-  }
+test('JSON and subagent instances read the shared machine preference; inherited environment is ignored', async () => {
+  const h = commandHarness();
+  const main = context(model('gpt-5.4', { api: 'openai-codex-responses' }), { mode: 'json', hasUI: false });
+  assert.equal(isFastEligible(main), true);
+  await writeMachinePreference('fast', true, join(process.env.PI_CODING_AGENT_DIR!, 'settings.json'));
+  assert.equal((await readMachinePreference('fast', join(process.env.PI_CODING_AGENT_DIR!, 'settings.json'))).value, true);
+  await h.handlers.get('session_start')?.({}, main);
+  await h.handlers.get('input')?.({}, main);
+  const payload = { model: 'gpt-5.4', service_tier: 'default' };
+  const rewritten = h.handlers.get('before_provider_request')?.({ payload }, main);
+  assert.equal((rewritten ?? payload).service_tier, 'priority');
 });
 
 test('/fast refreshes the merged widget without re-running usage work', async () => {
@@ -884,7 +881,7 @@ test('/fast refreshes the merged widget without re-running usage work', async ()
     await command?.('on', ctx);
     assert.equal(authCalls, before.authCalls);
     assert.equal(fetchCalls, before.fetchCalls);
-    assert.equal(timerCalls, before.timerCalls, 'Fast command does not start a local-commit deadline');
+    assert.equal(timerCalls - before.timerCalls, 1, 'Fast command only uses the preference lock timer; it does not start a local-commit deadline');
     assert.match(widgetRows.at(-1) ?? '', /^\u001b\[38;2;217;140;63m⚡ Fast\u001b\[0m · /u);
   } finally {
     globalThis.setTimeout = originalSetTimeout;

@@ -15,6 +15,7 @@ export type TimingSample = {
   outcome: TimingOutcome;
   model: string | null;
   provider: string | null;
+  agentType?: 'main' | 'subagent' | 'unknown';
   unknownReason?: UnknownReason;
 };
 export type TimingStamp = { monotonic: number; utc: number | null };
@@ -29,9 +30,10 @@ export class Timing {
   private idFactory: () => string;
   private enqueue: typeof submitMetric;
   private metricScope = createMetricScope();
+  private readonly agentType: 'main' | 'subagent' | 'unknown';
   closeMetricScope() { this.metricScope.close(); }
-  constructor(pi: ExtensionAPI, clock: TimingClock = { monotonic: () => performance.now(), utc: () => Date.now() }, dependencies: { idFactory?: () => string; submitMetric?: typeof submitMetric } = {}) {
-    this.pi = pi; this.clock = clock; this.idFactory = dependencies.idFactory ?? randomUUID; this.enqueue = dependencies.submitMetric ?? submitMetric;
+  constructor(pi: ExtensionAPI, clock: TimingClock = { monotonic: () => performance.now(), utc: () => Date.now() }, dependencies: { idFactory?: () => string; submitMetric?: typeof submitMetric; agentType?: 'main' | 'subagent' | 'unknown' } = {}) {
+    this.pi = pi; this.clock = clock; this.idFactory = dependencies.idFactory ?? randomUUID; this.enqueue = dependencies.submitMetric ?? submitMetric; this.agentType = dependencies.agentType ?? (process.env.PI_MY_EXTENSIONS_AGENT_TYPE === 'main' || process.env.PI_MY_EXTENSIONS_AGENT_TYPE === 'subagent' ? process.env.PI_MY_EXTENSIONS_AGENT_TYPE : 'unknown');
     pi.registerEntryRenderer<TimingSample>("async-compact-timing", (entry, _options, theme) => {
       const d = entry?.data;
       const kind: TimingKind | null = d?.kind === "background_generation" || d?.kind === "foreground_compaction" ? d.kind : null;
@@ -74,11 +76,11 @@ export class Timing {
           try { startedAtUTC = new Date(start.utc).toISOString(); } catch { unknownReason ??= "clock_invalid"; }
         } else unknownReason ??= "clock_invalid";
         if (startedAtUTC === null) { durationMs = null; outcome = "unknown"; }
-        const data: TimingSample = { schemaVersion: 1, sampleId: sampleId ?? 'unavailable', kind, startedAtUTC, durationMs, outcome, model, provider, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}) };
+        const data: TimingSample = { schemaVersion: 1, sampleId: sampleId ?? 'unavailable', kind, startedAtUTC, durationMs, outcome, model, provider, agentType: this.agentType, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}) };
         safe(() => this.pi.appendEntry("async-compact-timing", data));
         let eventId: string | null = null;
         try { eventId = this.idFactory(); } catch { noteMetricFailure(); /* never synthesize a remote global identifier */ }
-        if (eventId) safe(() => { void this.enqueue({ schemaVersion: 1, eventId, kind, occurredAt: startedAtUTC, durationMs, outcome, model, provider, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}), dataset: 'live' }, this.metricScope).catch(() => {}); });
+        if (eventId) safe(() => { void this.enqueue({ schemaVersion: 1, eventId, kind, occurredAt: startedAtUTC, durationMs, outcome, model, provider, agentType: this.agentType, ...(durationMs === null ? { unknownReason: unknownReason ?? "terminal_missing" } : {}), dataset: 'live' }, this.metricScope).catch(() => {}); });
       },
     };
   }

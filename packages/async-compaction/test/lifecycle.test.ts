@@ -164,6 +164,22 @@ test("ready survives generation deadline, uses new branch record even when event
   assert.equal(f.sm.getBranch().filter(e => e.type === "compaction").length, 2);
 });
 
+test("successful tree rotation retains a pending physical slot and never appends old work into the sibling branch", async () => {
+  const f = fixture(); let calls = 0;
+  f.ctx.modelRegistry.streamSimple = () => { calls++; return { result: () => new Promise(resolve => { f.response = (value = 'late') => resolve({ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: value }], usage, api: 'fake-api', provider: 'fake', model: 'm', timestamp: Date.now() }); }) }; };
+  const c = new Controller(f.pi); c.set(true, f.ctx); c.schedule(f.ctx); assert.equal(calls, 1);
+  const originalLeaf = f.sm.getLeafId()!;
+  const earlierUser = f.sm.getBranch().find(entry => entry.type === 'message' && entry.message.role === 'user')!;
+  f.sm.branch(earlierUser.id);
+  c.resetTree(f.ctx); c.set(true, f.ctx);
+  assert.equal(f.entries.filter(entry => entry.kind === 'async-compact-usage').length, 0);
+  c.schedule(f.ctx); assert.equal(calls, 1, 'old physical request still occupies the single-request slot');
+  f.response('late response'); await tick();
+  assert.equal(f.sm.getBranch().some(entry => entry.id === originalLeaf), false);
+  assert.equal(f.entries.filter(entry => entry.kind === 'async-compact-usage').length, 0, 'branch mismatch must not write old accounting to the new leaf');
+  assert.equal(f.entries.filter(entry => entry.kind === 'async-compact-timing').length, 0, 'invalidated timing cannot write to the new branch');
+});
+
 test("cancel, late response, off/on, switch, failure and model ownership are independently accounted", async () => {
   const f = fixture(), c = new Controller(f.pi);
   c.set(true, f.ctx); c.schedule(f.ctx);

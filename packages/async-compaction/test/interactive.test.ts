@@ -26,7 +26,7 @@ const strip = (value: string) => value.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
 for (const action of ["complete", "cancel", "cancel-kitty", "cancel-csiu", "no-candidate", "preflight"] as const) test(`real InteractiveMode + Terminal redraws progress on ${action}`, async () => {
   const cwd = mkdtempSync(join(tmpdir(), "async-compact-ui-"));
   const agentDir = join(cwd, "agent"), dir = join(cwd, "sessions"); mkdirSync(agentDir); mkdirSync(dir);
-  const argv = process.argv;
+  const argv = process.argv, previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
   process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
   const runtime = await ModelRuntime.create({ authPath: join(cwd, "missing-auth.json"), modelsPath: null, refreshOnCreate: false });
   let release!: () => void;
@@ -123,6 +123,6 @@ for (const action of ["complete", "cancel", "cancel-kitty", "cancel-csiu", "no-c
     assert.equal(records.length, 1, "late provider usage is recorded once after stopping");
     assert.equal(sm.getBranch().filter(e => e.type === "compaction" && e.fromHook).length, 0, "stopped candidate is never adopted");
   } finally {
-    release(); releaseNative(); session.dispose(); mode.ui.stop(); process.argv = argv; rmSync(cwd, { recursive: true, force: true });
+    release(); releaseNative(); session.dispose(); mode.ui.stop(); process.argv = argv; if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; rmSync(cwd, { recursive: true, force: true });
   }
 });

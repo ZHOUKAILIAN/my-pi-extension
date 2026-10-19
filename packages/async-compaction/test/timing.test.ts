@@ -1,4 +1,7 @@
-import { test } from "node:test";
+import { test, after } from "node:test";
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from "node:assert/strict";
 import { Timing } from "../src/timing.ts";
 import { Controller } from "../src/controller.ts";
@@ -10,6 +13,8 @@ const cli = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")
 const usage = { input: 18, output: 9, cacheRead: 0, cacheWrite: 0, totalTokens: 27, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const response = (stopReason = "stop", text = "summary") => ({ role: "assistant", stopReason, content: text ? [{ type: "text", text }] : [], usage, errorMessage: "private provider body", headers: { authorization: "secret" } });
 const tick = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+const preferenceDirs: string[] = [];
+after(() => { for (const path of preferenceDirs) rmSync(path, { recursive: true, force: true }); });
 function timingFixture() {
   let mono = 10, utc = 1_000; const records: any[] = [], renderers = new Map<string, Function>();
   const pi = { registerEntryRenderer: (n: string, r: Function) => renderers.set(n, r), appendEntry: (type: string, data: unknown) => records.push({ type, data }) } as any;
@@ -74,7 +79,7 @@ test("renderer validates full persisted schema, known values, unknown and malfor
   assert.doesNotThrow(() => render({ ...base, kind: "background_generation", durationMs: 300, outcome: "completed" }, { fg: () => { throw Error("theme private"); } }));
 });
 
-test("timing submits one terminal DTO independently of local append; stale scope and UUID failure never invent a remote ID",async()=>{const submitted:any[]=[],entries:any[]=[];let remoteIdCalls=0;const pi={registerEntryRenderer(){},appendEntry:(type:string,data:any)=>{entries.push({type,data});if(type==='async-compact-timing')throw Error('local append failed');}} as any;const t=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{remoteIdCalls++;return '4a19dc3b-8397-4d74-834f-a19ec67e891c';},submitMetric:async e=>{submitted.push(e);}});const sample=t.begin('background_generation','m','p');assert.equal(remoteIdCalls,0,'remote ID is not allocated before the terminal hook');sample.finish('completed');assert.equal(remoteIdCalls,1);sample.finish('failed');await tick();assert.equal(submitted.length,1);assert.notEqual(submitted[0].eventId,sample.sampleId,'remote ID is separately generated at the terminal boundary');assert.deepEqual(submitted[0],{schemaVersion:1,eventId:'4a19dc3b-8397-4d74-834f-a19ec67e891c',kind:'background_generation',occurredAt:new Date(1000).toISOString(),durationMs:0,outcome:'completed',model:'m',provider:'p',dataset:'live'});const old=t.begin('foreground_compaction',null,null);t.invalidate();old.finish('unknown','scope_left');assert.equal(submitted.length,1);const noId=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{throw Error('uuid failure');},submitMetric:async e=>{submitted.push(e);}});noId.begin('background_generation',null,null).finish('completed');await tick();assert.equal(submitted.length,1);assert.match(entries.at(-1).data.sampleId,/^[0-9a-f-]{36}$/u,'local diagnostic ID remains distinct from the missing remote ID');});
+test("timing submits one terminal DTO independently of local append; stale scope and UUID failure never invent a remote ID",async()=>{const submitted:any[]=[],entries:any[]=[];let remoteIdCalls=0;const pi={registerEntryRenderer(){},appendEntry:(type:string,data:any)=>{entries.push({type,data});if(type==='async-compact-timing')throw Error('local append failed');}} as any;const t=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{remoteIdCalls++;return '4a19dc3b-8397-4d74-834f-a19ec67e891c';},submitMetric:async e=>{submitted.push(e);}});const sample=t.begin('background_generation','m','p');assert.equal(remoteIdCalls,0,'remote ID is not allocated before the terminal hook');sample.finish('completed');assert.equal(remoteIdCalls,1);sample.finish('failed');await tick();assert.equal(submitted.length,1);assert.notEqual(submitted[0].eventId,sample.sampleId,'remote ID is separately generated at the terminal boundary');assert.deepEqual(submitted[0],{schemaVersion:1,eventId:'4a19dc3b-8397-4d74-834f-a19ec67e891c',kind:'background_generation',occurredAt:new Date(1000).toISOString(),durationMs:0,outcome:'completed',model:'m',provider:'p',agentType:'unknown',dataset:'live'});const old=t.begin('foreground_compaction',null,null);t.invalidate();old.finish('unknown','scope_left');assert.equal(submitted.length,1);const noId=new Timing(pi,{monotonic:()=>10,utc:()=>1000},{idFactory:()=>{throw Error('uuid failure');},submitMetric:async e=>{submitted.push(e);}});noId.begin('background_generation',null,null).finish('completed');await tick();assert.equal(submitted.length,1);assert.match(entries.at(-1).data.sampleId,/^[0-9a-f-]{36}$/u,'local diagnostic ID remains distinct from the missing remote ID');});
 
 test('Async metric submit is not awaited by the terminal hook; sync throw and unresolved promise leave diagnostics intact', async () => {
   for (const submitMetric of [() => { throw new Error('sync metric failure'); }, () => new Promise<void>(() => {})]) {
@@ -147,16 +152,32 @@ test("sync stream/result observation failures keep physical slot after native su
   }
 });
 
-function hookHarness(options: { failAppend?: (type: string, data: any) => boolean; failNotify?: boolean } = {}) {
-  let now = 100, bumpTerminalGuard = false; const clockReads: number[] = [];
-  const events = new Map<string, Function>(), entries: any[] = [], notices: string[] = [];
+function hookHarness(options: { failAppend?: (type: string, data: any) => boolean; failNotify?: boolean; submitMetric?: (event: unknown) => Promise<void> } = {}) {
+  let now = 100, bumpTerminalGuard = false; const clockReads: number[] = [], branch: any[] = [];
+  const events = new Map<string, Function[]>(), entries: any[] = [], notices: string[] = [];
   let command!: (args: string, ctx: any) => Promise<void>, session = "same-session";
-  const pi = { registerCommand: (_n: string, c: any) => command = c.handler, registerEntryRenderer() {}, appendEntry: (type: string, data: any) => { entries.push({ type, data }); if (type === "async-compact-timing") now += 700; if (options.failAppend?.(type, data)) throw Error("private hook append"); }, on: (n: string, cb: Function) => events.set(n, cb), getSettings: () => ({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } }), getAllTools: () => [], getActiveTools: () => [] };
-  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 } });
-  const ctx: any = { mode: "tui", model: null, ui: { notify: (m: string) => { notices.push(m); if (options.failNotify) throw Error("private hook notify"); }, onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => { if (bumpTerminalGuard) { now += 900; bumpTerminalGuard = false; } return session; }, getBranch: () => { now += 37; return []; } } };
-  const before = (reason: string) => events.get("session_before_compact")!({ reason, signal: new AbortController().signal, preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
-  const terminal = (failed = false, aborted = false) => { bumpTerminalGuard = true; const endAt = now; events.get(failed ? "session_compact_failed" : "session_compact")!(failed ? { aborted } : { compactionEntry: {} }, ctx); bumpTerminalGuard = false; return endAt; };
-  return { events, entries, notices, command, ctx, before, terminal, setSession: (v: string) => session = v, advance: (n: number) => now += n, now: () => now, clockReads };
+  const emit = (name: string, ...args: any[]) => {
+    let result: any, chain: Promise<void> | undefined;
+    for (const handler of events.get(name) ?? []) {
+      if (chain) chain = chain.then(async () => { const value = await handler(...args); if (value !== undefined) result = value; });
+      else {
+        const value = handler(...args);
+        if (value && typeof value.then === 'function') chain = Promise.resolve(value).then((resolved: unknown) => { if (resolved !== undefined) result = resolved; });
+        else if (value !== undefined) result = value;
+      }
+    }
+    return chain ? chain.then(() => result) : result;
+  };
+  const pi = { registerCommand: (_n: string, c: any) => command = c.handler, registerEntryRenderer() {}, appendEntry: (type: string, data: any) => { entries.push({ type, data }); if (type === "async-compact-timing") now += 700; if (options.failAppend?.(type, data)) throw Error("private hook append"); }, on: (n: string, cb: Function) => { const registered = events.get(n) ?? []; registered.push(cb); events.set(n, registered); }, getSettings: () => ({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } }), getAllTools: () => [], getActiveTools: () => [] };
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const agentDir = mkdtempSync(join(tmpdir(), 'async-duration-agent-')); preferenceDirs.push(agentDir);
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 }, submitMetric: options.submitMetric as any });
+  if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+  const ctx: any = { mode: "tui", model: null, ui: { notify: (m: string) => { notices.push(m); if (options.failNotify) throw Error("private hook notify"); }, onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => { if (bumpTerminalGuard) { now += 900; bumpTerminalGuard = false; } return session; }, getBranch: () => { now += 37; return branch; } } };
+  const before = (reason: string) => emit("session_before_compact", { reason, signal: new AbortController().signal, preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
+  const terminal = (failed = false, aborted = false, reason = 'threshold') => { bumpTerminalGuard = true; const endAt = now; if (!failed) branch.push({ id: `compact-${branch.length}`, type: 'compaction' }); emit(failed ? "session_compact_failed" : "session_compact", failed ? { aborted, reason } : { compactionEntry: { id: 'stale-host-pointer' }, reason }, ctx); bumpTerminalGuard = false; return endAt; };
+  return { events, emit, entries, notices, command, ctx, before, terminal, setSession: (v: string) => session = v, advance: (n: number) => now += n, now: () => now, clockReads };
 }
 
 test("index owns a controllable hook clock: preflight, native miss, Off interval, guard/append boundary, same-SID reset and leave", async () => {
@@ -166,31 +187,32 @@ test("index owns a controllable hook clock: preflight, native miss, Off interval
   const supportedArgv = process.argv;
   Object.defineProperty(process, "argv", { configurable: true, enumerable: argvDescriptor.enumerable, get() { if (advanceProfileIo) { profileReads++; h.advance(50); } return supportedArgv; } });
   try {
-    h.events.get("session_start")!({}, h.ctx); await h.command("on", h.ctx);
+    await h.emit("session_start", {}, h.ctx); await h.command("on", h.ctx);
     await h.before("manual"); await h.before("overflow"); assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0);
     advanceProfileIo = true;
     await h.before("threshold"); advanceProfileIo = false;
     const start = h.clockReads.at(-1)!;
-    assert.equal(profileReads, 4, "both profile/host checks occur after the handler-entry stamp");
-    assert.equal(h.now(), start + 237, "hook stamp precedes profile host IO (+200ms) and post-filter preparation (+37ms)");
+    assert.equal(profileReads, 2, "the normal entry checks the supported host twice after the handler-entry stamp");
+    assert.equal(h.now(), start + 137, "hook stamp precedes host IO (+100ms) and post-filter preparation (+37ms)");
     assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0, "start remains open, with no premature record");
     await h.command("off", h.ctx); h.advance(200); assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0, "Off cannot finish an open foreground sample");
     const end = h.terminal(); h.terminal();
     let samples = h.entries.filter(e => e.type === "async-compact-timing");
     assert.equal(samples.length, 1); assert.equal(samples[0].data.outcome, "completed"); assert.equal(samples[0].data.durationMs, end - start, "terminal stamp precedes session guard (+900ms), duplicate checks, and append (+700ms)");
 
-    await h.command("on", h.ctx); h.events.get("input")!({}, h.ctx); await h.before("threshold");
+    await h.command("on", h.ctx); await h.emit("input", {}, h.ctx); await h.before("threshold");
     const preStart = h.clockReads.at(-1)!, preEnd = h.terminal(true, true);
     samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 2); assert.equal(samples[1].data.outcome, "cancelled"); assert.equal(samples[1].data.durationMs, preEnd - preStart, "native input preflight is timed without a background attempt");
 
-    await h.before("threshold"); h.events.get("session_start")!({}, h.ctx); await h.command("on", h.ctx); await h.before("threshold");
+    await h.before("threshold"); await h.emit("session_start", {}, h.ctx); await h.command("on", h.ctx); await h.before("threshold");
     const resetStart = h.clockReads.at(-1)!, resetEnd = h.terminal();
     samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 3); assert.equal(samples[2].data.outcome, "completed"); assert.equal(samples[2].data.durationMs, resetEnd - resetStart, "same sessionId new epoch receives a fresh sample");
 
-    await h.before("threshold"); h.events.get("session_before_switch")!({}, h.ctx);
-    samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 4); assert.equal(samples[3].data.outcome, "unknown"); assert.equal(samples[3].data.unknownReason, "scope_left");
+    await h.before("threshold"); assert.equal(h.events.has("session_before_switch"), false, "cancellable navigation preserves the active instance");
+    await h.emit("session_tree", {}, h.ctx);
+    samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 3, 'successful tree navigation discards the old-scope stage instead of appending into the new branch');
     h.setSession("replacement"); await h.command("on", h.ctx); await h.before("threshold"); h.terminal();
-    samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 5); assert.equal(samples[4].data.outcome, "completed", "new session sample is distinct from old-scope leave");
+    samples = h.entries.filter(e => e.type === "async-compact-timing"); assert.equal(samples.length, 4); assert.equal(samples[3].data.outcome, "completed", "new session sample is distinct from discarded old-branch work");
   } finally { Object.defineProperty(process, "argv", argvDescriptor); process.argv = oldArgv; }
 });
 
@@ -198,9 +220,9 @@ test("fallback phase append and command notification failures preserve native ho
   const h = hookHarness({ failAppend: type => type === "async-compact-progress", failNotify: true }), oldArgv = process.argv;
   process.argv = ["node", cli, "-ne", "-e", "/tmp/repo/packages/async-compaction/src/index.ts"];
   try {
-    h.events.get("session_start")!({}, h.ctx);
+    await h.emit("session_start", {}, h.ctx);
     await assert.doesNotReject(h.command("on", h.ctx));
-    h.events.get("input")!({}, h.ctx);
+    await h.emit("input", {}, h.ctx);
     assert.equal(await h.before("threshold"), undefined, "failed fallback phase write does not replace native ownership/result");
     assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0);
     h.terminal();
@@ -210,8 +232,28 @@ test("fallback phase append and command notification failures preserve native ho
   } finally { process.argv = oldArgv; }
 });
 
+test("generic manual, threshold, overflow, disabled, success and failure diagnostics submit zero metrics while supported enabled threshold retains its original event", async () => {
+  let submissions = 0;
+  const h = hookHarness({ submitMetric: async () => { submissions++; throw new Error('fail-loud metrics sink'); } });
+  const oldArgv = process.argv; process.argv = ["node", cli, "-ne", "-e", "/tmp/repo/packages/async-compaction/src/index.ts"];
+  try {
+    await h.emit('session_start', {}, h.ctx);
+    for (const reason of ['manual', 'threshold', 'overflow'] as const) {
+      await h.before(reason); h.terminal(false, false, reason);
+    }
+    await h.command('on', h.ctx);
+    await h.before('manual'); h.terminal(false, false, 'manual');
+    await h.before('overflow'); h.terminal(false, false, 'overflow');
+    assert.equal(submissions, 0, 'generic compaction-duration records never reach the remote sink');
+    await h.before('threshold'); h.terminal(false, false, 'threshold');
+    assert.equal(submissions, 1, 'enabled supported threshold retains exactly its original foreground_compaction event');
+    assert.equal(h.entries.filter(entry => entry.type === 'compaction-duration').length, 6);
+    assert.equal(h.entries.filter(entry => entry.type === 'async-compact-timing').length, 1);
+  } finally { process.argv = oldArgv; }
+});
+
 test("unsupported CLI/profile and Off threshold do not create samples", async () => {
   const h = hookHarness(), oldArgv = process.argv; process.argv = ["node", "unsupported-cli", "-ne", "-e", "/tmp/repo/packages/async-compaction/src/index.ts"];
-  try { h.events.get("session_start")!({}, h.ctx); await h.command("on", h.ctx); await h.before("threshold"); h.terminal(); assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0); }
+  try { await h.emit("session_start", {}, h.ctx); await h.command("on", h.ctx); await h.before("threshold"); h.terminal(); assert.equal(h.entries.filter(e => e.type === "async-compact-timing").length, 0); }
   finally { process.argv = oldArgv; }
 });

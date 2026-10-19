@@ -1,5 +1,7 @@
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { runCli } from 'node-test-brief/cli';
 import { buildNodeTestCommand, repoRoot } from './test-suite.mjs';
 
@@ -18,7 +20,15 @@ function helpArgumentPrefix(argv) {
 
 export async function runAgentTests({ argv = process.argv.slice(2), root = repoRoot } = {}) {
   const metricsConfig = process.env.PI_METRICS_CONFIG;
-  delete process.env.PI_METRICS_CONFIG;
+  const isolatedRoot = mkdtempSync(join(tmpdir(), 'pi-agent-test-'));
+  const environmentKeys = ['HOME', 'PI_CODING_AGENT', 'PI_MODEL', 'PI_PROVIDER', 'PI_REASONING_LEVEL', 'PI_SESSION_FILE', 'PI_SESSION_ID', 'PI_CODING_AGENT_DIR', 'PI_MY_EXTENSIONS_SETTINGS_FILE', 'PI_METRICS_CONFIG'];
+  const environmentSnapshot = new Map(environmentKeys.map(key => [key, process.env[key]]));
+  process.env.HOME = isolatedRoot;
+  process.env.PI_CODING_AGENT_DIR = join(isolatedRoot, 'agent');
+  // Clear the internal override so every fixture that changes PI_CODING_AGENT_DIR
+  // remains authoritative; the effective agent root is still synthetic.
+  delete process.env.PI_MY_EXTENSIONS_SETTINGS_FILE;
+  for (const key of environmentKeys.filter(key => !['HOME', 'PI_CODING_AGENT_DIR'].includes(key))) delete process.env[key];
   try {
     let exitCode;
     const helpArgv = helpArgumentPrefix(argv);
@@ -29,19 +39,30 @@ export async function runAgentTests({ argv = process.argv.slice(2), root = repoR
     }
     if (exitCode === undefined) {
       const command = await buildNodeTestCommand({ root, rejectTestHooks: true });
-      exitCode = await runCli({
-        argv,
-        cwd: root,
-        files: command.files,
-        nodeArgs: command.nodeArgs,
-        snapshot: 'git',
-      });
+      if (argv.length > 0) {
+        // Preserve the adapter contract for explicit CLI arguments and extra
+        // files: installed consumers receive the complete discovered scope in
+        // one invocation.
+        exitCode = await runCli({ argv, cwd: root, files: command.files, nodeArgs: command.nodeArgs, snapshot: 'git' });
+      } else {
+        exitCode = 0;
+        // The extension suite exercises process.env-backed SDK configuration;
+        // each normal suite file therefore runs in a fresh Node process.
+        for (const file of command.files) {
+          const result = await runCli({ argv, cwd: root, files: [file], nodeArgs: command.nodeArgs, snapshot: 'git' });
+          if (result !== 0) { exitCode = result; break; }
+        }
+      }
     }
     if (exitCode !== 0) process.exitCode = exitCode;
     return exitCode;
   } finally {
-    if (metricsConfig === undefined) delete process.env.PI_METRICS_CONFIG;
-    else process.env.PI_METRICS_CONFIG = metricsConfig;
+    for (const key of environmentKeys) {
+      const value = environmentSnapshot.get(key);
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(isolatedRoot, { recursive: true, force: true });
   }
 }
 

@@ -13,12 +13,13 @@
 
 ### Extensions
 
-- [Async Compaction Extension 产品规范](扩展/async-compaction-扩展.md)：`DECIDED`（方案 A 已采纳）；当前实现与未验收范围见对应 L2
+- [Async Compaction Extension 产品规范](扩展/async-compaction-扩展.md)：`DECIDED`；本机统一开关、全部 Pi Agent、压缩耗时和子来源阶段采集；实现状态见 L2
 - [Feature Extension 产品规范](扩展/feature-扩展.md)：`DECIDED`
 - [Fix Extension 产品规范](扩展/fix-扩展.md)：`DECIDED`
 - [Workflow UI Extension](扩展/workflow-ui-扩展.md)：`DECIDED`
-- [Codex Usage Status + Fast Extension](扩展/codex-usage-status-扩展.md)：`IMPLEMENTING`（`fast-gpt-v1` 已采纳并实现；真实 Pi TUI/provider E2E pending）
-- [Subagent Dispatcher Extension](扩展/subagent-扩展.md)：`DECIDED`（[2026-09-14 Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md) 已采纳 L1 产品契约与 L2 目标设计；S1–S43 连续，v2 待实现，未实现不得声称完成）
+- [Codex Usage Status + Fast Extension](扩展/codex-usage-status-扩展.md)：`DECIDED`；本机统一 Fast 开关与全部 Pi Agent 范围；实现状态见 L2
+- [Subagent Dispatcher Extension](扩展/subagent-扩展.md)：委派契约与全部子 Agent 本机开关关联条款均为 `DECIDED`；实现与工程验收范围见 L2
+- [个人 CF 项目指标](项目指标.md)：`DECIDED`；主/子阶段来源区分与独立采集许可；接线/部署差距见 L2
 
 ## L1 与 L2 的边界
 

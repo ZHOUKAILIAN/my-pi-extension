@@ -401,12 +401,14 @@ flowchart TD
   SS[session_start] --> GC[后台 30d v1 Child GC]
 ```
 
-当前已有：Child Session registry/identity lock、JSONL integrity/quarantine/tombstone、provider retry/fallback、explicit handle resume、旧 `persistent:false` 临时 child、Fast 首 spawn约束与基础 UI/tests。
+当前已有：Child Session registry/identity lock、JSONL integrity/quarantine/tombstone、provider retry/fallback、explicit handle resume、旧 `persistent:false` 临时 child、Fast 首 spawn 约束与基础 UI/tests。Fast 首 spawn 筛选是当前旧实现，不是全部 Agent 的目标；本机 Fast/Async 入口适配与差距见[技术设计 §6.2](subagent-dispatcher-技术设计.md#62-目标接线aligning未实现)。
 
 切片1+2 foundation 当前已有：独立 `v2/` namespace 下的 Call/Delegation/pre-binding WAL、reference-before-admitted admission、private payload/provenance、raw→effective resolver、active lineage、startup no-spawn normalization、revision/WAL replay 与相关 integrity/replay tests；这些能力保持 gated，未接入现行 v1 execute。切片3 当前已有 gated internal execution/recovery seam：initial/cycle reservation、spawn intent/start、child-session binding、provider retry/fallback、recovery cycle 1..3、continuation epoch、running child live/dead/unknown 归一、generation fencing、严格绝对 session JSONL 校验及 `persistent:false` child 清理（cleanup 不可证明时 durable integrity pause）；仍未接入现行 v1 execute，真实 OS/restart/owner transfer 未验证。切片0的 bridge-v1 marker、capability probe 与锁内 GC 保护也已有本地实现及自动化测试，但发布/部署、真实 binary/kill-point 与平台边界仍待验证，adoption 不开启。当前尚未实现或接线的是 cancel、delivery/outbox、side-effect interceptor/IPC、完整 owner transfer、delete/migration、Darwin裁决等；不得把目标图当作现行能力。详见[技术设计 §9.12](subagent-dispatcher-技术设计.md#912-当前源码事实与-drift)。
 
 ## 11. 继续前提
 
-本页所示目标已由[产品语义/指标轴](../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营轴](../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)在同一固定 revision 批准，并由[Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)正式采纳。AR3-1～AR3-5 及此前 required Findings 已为 `resolved_fixed`；L1 Acceptance 保持 S1–S43 连续，完整映射见[技术设计 §9.14](subagent-dispatcher-技术设计.md#914-最终复审逐-finding-关闭映射)。
+全部 Agent 的本机 Fast/Async 开关是独立的待对齐接线范围；下述既有 v2 采纳与切片证据不自动批准该新设计，仍须对应 L1/L2、加载组合和验收。
+
+本页所示既有 v2 目标已由[产品语义/指标轴](../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营轴](../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)在同一固定 revision 批准，并由[Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)正式采纳。AR3-1～AR3-5 及此前 required Findings 已为 `resolved_fixed`；L1 Acceptance 保持 S1–S43 连续，完整映射见[技术设计 §9.14](subagent-dispatcher-技术设计.md#914-最终复审逐-finding-关闭映射)。
 
 状态为`DECIDED / sliced implementation`。切片0已有 bridge-v1 本地实现与 focused tests，但发布/部署、真实 binary/kill-point 与同 UID 路径竞态仍未证明；capability 仍为 `verified=false/adoptionAllowed=false`，因此 adoption 仍为 0。切片1+2 foundation 已实现并有自动化测试；切片3 仅完成 gated internal execution/recovery seam，未接入现行 v1 execute，且真实 child、OS/restart、owner transfer 与 Darwin 证据仍缺失。采用既有 v1 session 前仍必须先完成并验证完整 `bridge-v1` 前置；cancel/delivery/side-effect/delete/migration 等后续切片仍未实现或接线。实现必须保留当前 v1 基线、逐切片代码评审并补齐 S1–S43 证据；目标图不得被表述为当前能力。

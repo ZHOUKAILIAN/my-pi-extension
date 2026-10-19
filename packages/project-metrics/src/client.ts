@@ -4,7 +4,7 @@ import { link, lstat, mkdir, open, readdir, readFile, unlink } from 'node:fs/pro
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import { normalizeEvent, type Dataset } from './contracts.ts';
 import { canonicalTarget } from './node-crypto.ts';
-import { validateStatsResponse } from './stats-response.ts';
+import { validateStatsResponse, validateStatsResponseV2 } from './stats-response.ts';
 
 type Config = { enabled: boolean; endpoint: string; namespace: string; dataset: Dataset; writeTokenFile: string; readTokenFile: string; outboxDir: string };
 type Envelope = { targetId: string; endpoint: string; namespace: string; dataset: Dataset; event: ReturnType<typeof normalizeEvent> };
@@ -12,6 +12,21 @@ type FlushResult = { sent: number; pending: number; failed: number; unknown: boo
 const MAX_EVENTS = 512, MAX_RECORD = 16 * 1024, MAX_MEMORY = 32, MAX_BATCH = 16, MAX_ACK = 2048;
 let inFlight = 0;
 const localPending = new Set<Promise<unknown>>();
+export type ShutdownBudgetSlot = { version: 1; deadlines: WeakMap<object, number> };
+const SHUTDOWN_SYMBOL = Symbol.for('@pi/project-metrics/shutdown-budget/v1');
+export function shutdownDeadline(token: object, requestedMs = 1000): number {
+  const processObject = process as unknown as Record<symbol, unknown>;
+  const existing = processObject[SHUTDOWN_SYMBOL] as ShutdownBudgetSlot | undefined;
+  if (existing && (existing.version !== 1 || !(existing.deadlines instanceof WeakMap))) return performance.now();
+  const slot = existing ?? { version: 1 as const, deadlines: new WeakMap<object, number>() };
+  if (!existing) processObject[SHUTDOWN_SYMBOL] = slot;
+  const deadline = slot.deadlines.get(token);
+  if (deadline !== undefined) return deadline;
+  const value = performance.now() + Math.max(0, requestedMs);
+  slot.deadlines.set(token, value);
+  return value;
+}
+export function remainingShutdownMs(token: object, requestedMs = 1000): number { return Math.max(0, shutdownDeadline(token, requestedMs) - performance.now()); }
 type FlushTask = Promise<FlushResult> & { rerun?: boolean };
 const backgroundFlushes = new Map<string, FlushTask>();
 /** Per-producer lifecycle. Explicit CLI flushes have no producer scope. */
@@ -540,9 +555,13 @@ export async function queryMetricStats(days = 7, datasetOverride?: Dataset): Pro
     token = (await readPrivate(config.readTokenFile, 4096)).trim();
     if (!/^[!-~]{32,512}$/u.test(token)) throw statsFailure('stats_configuration');
   } catch { throw statsFailure('stats_configuration'); }
-  const url = new URL(`${config.endpoint.replace(/\/$/u, '')}/api/v1/project-stats`);
-  url.searchParams.set('days', String(days));
-  url.searchParams.set('dataset', config.dataset);
+  const baseUrl = config.endpoint.replace(/\/$/u, '');
+  const v2Url = new URL(`${baseUrl}/api/v2/project-stats`);
+  v2Url.searchParams.set('days', String(days));
+  v2Url.searchParams.set('dataset', config.dataset);
+  const v1Url = new URL(`${baseUrl}/api/v1/project-stats`);
+  v1Url.searchParams.set('days', String(days));
+  v1Url.searchParams.set('dataset', config.dataset);
   const controller = new AbortController();
   let cancelReader: (() => void) | undefined;
   let timedOut = false;
@@ -558,12 +577,19 @@ export async function queryMetricStats(days = 7, datasetOverride?: Dataset): Pro
   });
   const request = (async () => {
     try {
-      const response = await fetch(url, {
+      let response = await fetch(v2Url, {
         redirect: 'error',
         signal: controller.signal,
         headers: { authorization: `Bearer ${token}`, 'x-project-namespace': config.namespace },
       });
-      // Even a fetch that ignores abort may later hand us a live HTTP body.
+      let version: 1 | 2 = 2;
+      // A version negotiation 404 is the only condition that permits v1 fallback;
+      // the same AbortController/deadline covers both requests.
+      if (response.status === 404) {
+        try { void response.body?.cancel().catch(() => {}); } catch {}
+        response = await fetch(v1Url, { redirect: 'error', signal: controller.signal, headers: { authorization: `Bearer ${token}`, 'x-project-namespace': config.namespace } });
+        version = 1;
+      }
       if (controller.signal.aborted) { discardBody(response, controller); throw statsFailure('stats_timeout'); }
       if (!response.ok) {
         discardBody(response, controller);
@@ -571,7 +597,7 @@ export async function queryMetricStats(days = 7, datasetOverride?: Dataset): Pro
       }
       const json = await boundedJson(response, controller, cancel => { cancelReader = cancel; });
       if (controller.signal.aborted) throw statsFailure('stats_timeout');
-      try { return validateStatsResponse(json, config.dataset, days, token); }
+      try { return version === 2 ? validateStatsResponseV2(json, config.dataset, days, token) : { ...validateStatsResponse(json, config.dataset, days, token), agentTypes: 'unavailable' as const }; }
       catch { throw statsFailure('stats_invalid_response'); }
     } catch (error) {
       if (timedOut) throw statsFailure('stats_timeout');
