@@ -35,7 +35,9 @@ test("Fast consumer accepts only exact producer event and exact user agent contr
   events.emit(FAST_REQUESTED_EVENT, { version: 1, sessionId: "parent", requested: true });
   await consumer.ready;
   assert.equal(consumer.requestedFast, true);
-  assert.equal(consumer.environment(eligible, true).PI_CODEX_FAST, "1");
+  const inherited = consumer.environment(eligible, true, undefined, "/tmp/synthetic-agent/settings.json");
+  assert.equal(inherited.PI_CODEX_FAST, undefined);
+  assert.equal(inherited.PI_MY_EXTENSIONS_SETTINGS_FILE, "/tmp/synthetic-agent/settings.json");
   assert.equal(consumer.environment(eligible, false)[FAST_ENV_NAME], undefined);
   assert.equal(consumer.environment({ ...eligible, source: "project" }, true)[FAST_ENV_NAME], undefined);
   assert.equal(consumer.environment({ ...eligible, name: "planner" }, true)[FAST_ENV_NAME], undefined);
@@ -49,7 +51,9 @@ test("same-session Fast rebind preserves the requested state for the first eligi
   await consumer.ready;
 
   consumer.bind("parent");
-  assert.equal(consumer.environment(eligible, true)[FAST_ENV_NAME], "1");
+  const inherited = consumer.environment(eligible, true, undefined, "/tmp/synthetic-agent/settings.json");
+  assert.equal(inherited[FAST_ENV_NAME], undefined);
+  assert.equal(inherited.PI_MY_EXTENSIONS_SETTINGS_FILE, "/tmp/synthetic-agent/settings.json");
 
   consumer.bind("other");
   assert.equal(consumer.requestedFast, false);

@@ -38,21 +38,30 @@ function kind(value: unknown): Kind {
   if (value !== 'fast_enabled' && value !== 'background_generation' && value !== 'foreground_compaction') return fail();
   return value;
 }
+function agentType(value: unknown): string | null {
+  const result = label(value);
+  if (result !== null && result !== 'main' && result !== 'subagent' && result !== 'unknown') return fail();
+  return result;
+}
 function metric(value: unknown): number | null {
   return value === null ? null : boundedNumber(value, 86400000);
 }
 function aggregate(value: unknown) {
-  const x = object(value, ['day', 'kind', 'model', 'provider', 'eventCount', 'knownCount', 'unknownCount', 'meanDurationMs']);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return fail();
+  const record = value as JsonObject;
+  const x = object(value, Object.hasOwn(record, 'agentType') ? ['day', 'kind', 'model', 'provider', 'agentType', 'eventCount', 'knownCount', 'unknownCount', 'meanDurationMs'] : ['day', 'kind', 'model', 'provider', 'eventCount', 'knownCount', 'unknownCount', 'meanDurationMs']);
   const eventKind = kind(x.kind);
-  const result = { day: day(x.day), kind: eventKind, model: label(x.model), provider: label(x.provider), eventCount: count(x.eventCount), knownCount: count(x.knownCount), unknownCount: count(x.unknownCount), meanDurationMs: metric(x.meanDurationMs) };
-  if (eventKind === 'fast_enabled' ? result.model !== null || result.provider !== null || result.knownCount !== 0 || result.unknownCount !== 0 || result.meanDurationMs !== null : result.eventCount !== 0 || (result.knownCount === 0) !== (result.meanDurationMs === null) || (result.meanDurationMs !== null && result.meanDurationMs < 0)) return fail();
+  const result = { day: day(x.day), kind: eventKind, model: label(x.model), provider: label(x.provider), agentType: x.agentType === undefined ? null : agentType(x.agentType), eventCount: count(x.eventCount), knownCount: count(x.knownCount), unknownCount: count(x.unknownCount), meanDurationMs: metric(x.meanDurationMs) };
+  if (eventKind === 'fast_enabled' ? result.model !== null || result.provider !== null || result.agentType !== null || result.knownCount !== 0 || result.unknownCount !== 0 || result.meanDurationMs !== null : result.eventCount !== 0 || (result.knownCount === 0) !== (result.meanDurationMs === null) || (result.meanDurationMs !== null && result.meanDurationMs < 0)) return fail();
   return result;
 }
 function comparison(value: unknown) {
-  const x = object(value, ['day', 'kind', 'model', 'provider', 'currentValue', 'previousDay', 'previousValue', 'percentChange', 'comparable']);
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return fail();
+  const record = value as JsonObject;
+  const x = object(value, Object.hasOwn(record, 'agentType') ? ['day', 'kind', 'model', 'provider', 'agentType', 'currentValue', 'previousDay', 'previousValue', 'percentChange', 'comparable'] : ['day', 'kind', 'model', 'provider', 'currentValue', 'previousDay', 'previousValue', 'percentChange', 'comparable']);
   const eventKind = kind(x.kind);
-  const result = { day: day(x.day), kind: eventKind, model: label(x.model), provider: label(x.provider), currentValue: metric(x.currentValue), previousDay: day(x.previousDay), previousValue: metric(x.previousValue), percentChange: x.percentChange === null ? null : finiteNumber(x.percentChange), comparable: x.comparable };
-  if (typeof result.comparable !== 'boolean' || (result.comparable !== (result.percentChange !== null)) || (result.comparable && (result.currentValue === null || result.previousValue === null || result.previousValue === 0)) || (eventKind === 'fast_enabled' && (result.model !== null || result.provider !== null || result.currentValue === null || result.previousValue === null))) return fail();
+  const result = { day: day(x.day), kind: eventKind, model: label(x.model), provider: label(x.provider), agentType: x.agentType === undefined ? null : agentType(x.agentType), currentValue: metric(x.currentValue), previousDay: day(x.previousDay), previousValue: metric(x.previousValue), percentChange: x.percentChange === null ? null : finiteNumber(x.percentChange), comparable: x.comparable };
+  if (typeof result.comparable !== 'boolean' || (result.comparable !== (result.percentChange !== null)) || (result.comparable && (result.currentValue === null || result.previousValue === null || result.previousValue === 0)) || (eventKind === 'fast_enabled' && (result.model !== null || result.provider !== null || result.agentType !== null || result.currentValue === null || result.previousValue === null))) return fail();
   return result;
 }
 function list<T>(value: unknown, limit: number, parse: (item: unknown) => T): T[] {
@@ -65,6 +74,30 @@ function containsToken(value: unknown, token: string): boolean {
   if (value && typeof value === 'object') return Object.values(value).some(item => containsToken(item, token));
   return false;
 }
+function validateAgentView(value: unknown, days: number) {
+  const view = object(value, ['completeDays', 'unlocatedByReceivedDay', 'todayInProgress', 'truncated']);
+  if (typeof view.truncated !== 'boolean') return fail();
+  const complete = object(view.completeDays, ['aggregates', 'comparisons']);
+  const today = object(view.todayInProgress, ['receivedAggregates']);
+  const aggregates = list(complete.aggregates, 64, aggregate).map(item => {
+    if (item.kind === 'fast_enabled' || item.model !== null || item.provider !== null || item.eventCount !== 0) return fail();
+    return item;
+  });
+  const comparisons = list(complete.comparisons, 2 * days, comparison).map(item => {
+    if (item.kind === 'fast_enabled' || item.model !== null || item.provider !== null) return fail();
+    return item;
+  });
+  const unlocated = list(view.unlocatedByReceivedDay, 64, aggregate).map(item => {
+    if (item.kind === 'fast_enabled' || item.model !== null || item.provider !== null || item.eventCount !== 0) return fail();
+    return item;
+  });
+  const received = list(today.receivedAggregates, 2, aggregate).map(item => {
+    if (item.kind === 'fast_enabled' || item.model !== null || item.provider !== null || item.eventCount !== 0) return fail();
+    return item;
+  });
+  return { completeDays: { aggregates, comparisons }, unlocatedByReceivedDay: unlocated, todayInProgress: { receivedAggregates: received }, truncated: view.truncated };
+}
+
 export function validateStatsResponse(value: unknown, dataset: Dataset, days: number, readToken: string) {
   const x = object(value, ['coverage', 'status', 'watermark', 'asOf', 'dataset', 'days', 'completeDays', 'unlocatedByReceivedDay', 'unlocatedOverallByReceivedDay', 'todayInProgress', 'truncated']);
   if (x.coverage !== 'received_only' || (x.status !== 'no_received_data' && x.status !== 'partial_coverage') || x.dataset !== dataset || x.days !== days || typeof x.truncated !== 'boolean') return fail();
@@ -89,6 +122,17 @@ export function validateStatsResponse(value: unknown, dataset: Dataset, days: nu
   };
   // Model/provider are legitimately user-provided strings. A server echoing a read credential
   // inside an otherwise valid aggregate must still be rejected before anything reaches stdout.
+  if (containsToken(report, readToken)) return fail();
+  return report;
+}
+
+export function validateStatsResponseV2(value: unknown, dataset: Dataset, days: number, readToken: string) {
+  const x = object(value, ['schemaVersion', 'base', 'byAgentType']);
+  if (x.schemaVersion !== 2 || x.byAgentType === null || typeof x.byAgentType !== 'object' || Array.isArray(x.byAgentType)) return fail();
+  const groups = object(x.byAgentType, ['main', 'subagent', 'unknown']);
+  const base = validateStatsResponse(x.base, dataset, days, readToken);
+  const byAgentType = { main: validateAgentView(groups.main, days), subagent: validateAgentView(groups.subagent, days), unknown: validateAgentView(groups.unknown, days) };
+  const report = { schemaVersion: 2 as const, base, byAgentType };
   if (containsToken(report, readToken)) return fail();
   return report;
 }

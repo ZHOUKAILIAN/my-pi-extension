@@ -1,4 +1,7 @@
-import { test } from "node:test";
+import { after, before, test } from "node:test";
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import assert from "node:assert/strict";
 import extension, { isolatedProfile, supportedHost } from "../src/index.ts";
 import { fileURLToPath } from "node:url";
@@ -7,6 +10,10 @@ import { Reporting } from "../src/reporting.ts";
 import { settings } from "../src/compaction.ts";
 
 const entry = "/tmp/repo/packages/async-compaction/src/index.ts";
+let agentDir: string;
+const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+before(() => { agentDir = mkdtempSync(join(tmpdir(), 'async-guards-agent-')); process.env.PI_CODING_AGENT_DIR = agentDir; });
+after(() => { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; rmSync(agentDir, { recursive: true, force: true }); });
 test("only an explicit isolated invocation can offer a candidate", () => {
   assert.equal(isolatedProfile(["node", "pi", "--no-extensions", "-e", entry]), true);
   for (const argv of [
@@ -29,10 +36,10 @@ test("command validation, idempotence, mode rejection and session reset", async 
   process.argv = ["node", cli, "-ne", "-e", entry];
   try {
     assert.equal(supportedHost(), true);
-    events.get("session_start")!({}, ctx("tui"));
+    await events.get("session_start")!({}, ctx("tui"));
     await handler("on", ctx("tui")); await handler("on", ctx("tui"));
     await handler("off", ctx("tui")); await handler("off", ctx("tui"));
-    assert.deepEqual(notices.slice(-4), ["async-compact on", "async-compact on", "async-compact off", "async-compact off"]);
+    assert.deepEqual(notices.slice(-4), ["async-compact preference is On; current model or automatic compaction is unsupported, native compaction remains active", "async-compact preference is On; current model or automatic compaction is unsupported, native compaction remains active", "async-compact off", "async-compact off"]);
     events.get("session_shutdown")!({}, ctx("tui"));
     assert.equal(supportedHost(["node", "pi"]), false);
   } finally { process.argv = argv; }
@@ -52,7 +59,9 @@ test("terminal escape observer leaves ordinary keys and paste unconsumed, and de
     for (const data of ["x", "\u001b[200~paste\u001b[201~", "\u001b", "\u001b[27u", "\u001b[27;1u"]) assert.equal(listener?.(data), undefined);
     await handler("off", ctx); assert.equal(listener, undefined); assert.equal(detaches, 1);
     await handler("on", ctx); assert.ok(listener);
-    events.get("session_before_switch")!({}, ctx);
+    assert.equal(events.has("session_before_switch"), false, 'cancellable before-navigation hooks do not tear down the active preference');
+    assert.ok(listener, 'the active Escape observer remains attached until a committed scope exit or Off');
+    await events.get("session_shutdown")!({}, ctx);
     assert.equal(listener, undefined); assert.equal(detaches, 2);
   } finally { process.argv = argv; }
 });

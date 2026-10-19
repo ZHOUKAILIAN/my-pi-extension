@@ -14,7 +14,7 @@ export function committedFiles(entry: { fromHook?: boolean; details?: unknown } 
       !Array.isArray(d.modifiedFiles) || !d.modifiedFiles.every(p => typeof p === "string" && !!p)) return null;
   return { readFiles: d.readFiles, modifiedFiles: d.modifiedFiles };
 }
-export type Snapshot = { session: string; generation: number; cut: string; ids: string[]; hash: string; previous: string | null; environment: string; messages: SessionProjection["messages"]; files: FileLists; tokens: number };
+export type Snapshot = { session: string; generation: number; leaf: string | null; cut: string; ids: string[]; hash: string; previous: string | null; environment: string; messages: SessionProjection["messages"]; files: FileLists; tokens: number };
 export function environment(pi: ExtensionAPI, ctx: ExtensionContext): string | null {
   if (!ctx.model || !ctx.thinkingLevel) return null;
   const tools = pi.getAllTools().filter(t => pi.getActiveTools().includes(t.name));
@@ -93,7 +93,7 @@ export function plan(pi: ExtensionAPI, ctx: ExtensionContext, generation: number
   }
   if (selected < 0) return null;
   const prefix = entries.slice(0, selected), messages = prefix.flatMap(p => p.messages);
-  const snapshot: Snapshot = { session: ctx.sessionManager.getSessionId(), generation, cut: entries[selected].sourceEntry.id, ids: prefix.map(p => p.sourceEntry.id), hash: digest(prefix.map(p => ({ id: p.sourceEntry.id, messages: content(p.messages) }))), previous: last?.id ?? null, environment: env, messages, files: filesIn(messages, last?.fromHook ? committedFiles(last) : last?.details), tokens: selectedTokens };
+  const snapshot: Snapshot = { session: ctx.sessionManager.getSessionId(), generation, leaf: ctx.sessionManager.getLeafId(), cut: entries[selected].sourceEntry.id, ids: prefix.map(p => p.sourceEntry.id), hash: digest(prefix.map(p => ({ id: p.sourceEntry.id, messages: content(p.messages) }))), previous: last?.id ?? null, environment: env, messages, files: filesIn(messages, last?.fromHook ? committedFiles(last) : last?.details), tokens: selectedTokens };
   // One bounded simulation, not one history copy per cut: catches fixed file
   // labels, context edits and any projection detail missed by the lower bound.
   return fits(pi, ctx, snapshot, withFiles("x", snapshot.files), tokensBefore) ? snapshot : null;

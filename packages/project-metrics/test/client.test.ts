@@ -78,6 +78,7 @@ test('target diagnostics do not follow a changed account or dataset; restart ret
   const root = await sandbox(t);
   const a = await service(t, (_req, res) => { res.writeHead(409); res.end(); });
   const b = await service(t, (req, res) => {
+    if (req.url?.startsWith('/api/v2/project-stats')) { res.writeHead(404); res.end(); return; }
     if (req.url?.startsWith('/api/v1/project-stats')) {
       const today = new Date().toISOString().slice(0, 10);
       const earlier = (days: number) => new Date(Date.parse(`${today}T00:00:00.000Z`) - days * 86400000).toISOString().slice(0, 10);

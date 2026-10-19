@@ -11,17 +11,14 @@ export const FAST_COST_CORRECTION_MODEL_IDS = [
   'gpt-5.6-terra',
 ] as const;
 
-/** @deprecated Use FAST_COST_CORRECTION_MODEL_IDS. */
-export const FAST_MODEL_IDS = FAST_COST_CORRECTION_MODEL_IDS;
-
 const FAST_PROVIDER = 'openai-codex';
 const FAST_API = 'openai-codex-responses';
 const FAST_BASE_URL = 'https://chatgpt.com/backend-api';
 const FAST_ORANGE = '\u001b[38;2;217;140;63m';
 const ANSI_RESET = '\u001b[0m';
 const FAST_ACTIVE_LABEL = orange('⚡ Fast');
-const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast.';
-const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — selected user implementer/code_reviewer agents inherit requested Fast; priority is request intent only; usage cost is not corrected or guaranteed.';
+const FAST_ACTIVE_NOTIFICATION = '⚡ Fast enabled — all Pi agents use the machine Fast preference.';
+const FAST_UNKNOWN_ACTIVE_NOTIFICATION = '⚡ Fast enabled — all Pi agents use the machine Fast preference; priority is request intent only; usage cost is not corrected or guaranteed.';
 const MAX_PENDING_TICKETS = 32;
 const PRIORITY_SERVICE_TIER = 'priority';
 
@@ -265,11 +262,11 @@ export class FastController {
     this.stateListeners.clear();
   }
 
-  setRequested(requested: boolean, context: FastContextLike): void {
+  setRequested(requested: boolean, context: FastContextLike, announce = true): void {
     const previousState = this.context ? this.state : 'off';
     this.requested = requested;
     this.handle(context, undefined, false, previousState);
-    this.notifyState(this.state);
+    if (announce) this.notifyState(this.state);
   }
 
   toggle(context: FastContextLike): void {
@@ -285,28 +282,20 @@ export class FastController {
 
   handleCommand(args: string, context: FastContextLike): boolean {
     if (!context.hasUI) {
-      context.ui.notify('Fast is unavailable in JSON/print mode; use TUI or RPC. Fast intent was not changed.', 'warning');
+      context.ui.notify('Fast cannot be changed without a UI; the machine preference is unchanged.', 'warning');
       return false;
     }
 
     const parts = args.trim() === '' ? [] : args.trim().split(/\s+/u);
-    if (parts.length > 1 || (parts.length === 1 && !['on', 'off', 'toggle', 'status'].includes(parts[0]))) {
-      context.ui.notify('Usage: /fast [on|off|toggle|status]', 'warning');
+    if (parts.length > 1 || (parts.length === 1 && !['on', 'off'].includes(parts[0]))) {
+      context.ui.notify('Usage: /fast [on|off]', 'warning');
       return false;
     }
     const command = parts[0] ?? 'toggle';
     const previousRequested = this.requested;
-    if (command === 'status') {
-      this.notifyCurrent(context);
-      return false;
-    }
-    if (command === 'on') {
-      this.setRequested(true, context);
-    } else if (command === 'off') {
-      this.setRequested(false, context);
-    } else {
-      this.toggle(context);
-    }
+    if (command === 'on') this.setRequested(true, context);
+    else if (command === 'off') this.setRequested(false, context);
+    else this.toggle(context);
     return this.requested !== previousRequested;
   }
 

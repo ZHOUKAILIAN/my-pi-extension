@@ -17,8 +17,12 @@ export class Controller {
   private failedAt = 0;
   private lastCompactId: string | null = null;
   private starts = 0;
+  private sameSnapshotBranch(snapshot: Snapshot, ctx: ExtensionContext): boolean {
+    if (!snapshot.leaf || snapshot.session !== ctx.sessionManager.getSessionId()) return false;
+    try { return ctx.sessionManager.getBranch().some(entry => entry.id === snapshot.leaf); } catch { return false; }
+  }
   private fence(ctx: ExtensionContext) {
-    if (this.session !== ctx.sessionManager.getSessionId()) return;
+    if (this.session !== ctx.sessionManager.getSessionId() || !this.attempt || !this.sameSnapshotBranch(this.attempt.snapshot, ctx)) return;
     this.failedAt = this.lastStart = Date.now();
     this.lastTokens = ctx.getContextUsage()?.tokens ?? Number.NaN;
   }
@@ -38,20 +42,47 @@ export class Controller {
   }
   private pi: ExtensionAPI;
   private notify(ctx: ExtensionContext, message: string, level: "info" | "warning") { try { ctx.ui.notify(message, level); } catch { /* diagnostic notices never affect compaction */ } }
-  constructor(pi: ExtensionAPI, clock?: TimingClock) { this.pi = pi; this.report = new Reporting(pi); this.timing = new Timing(pi, clock); }
+  constructor(pi: ExtensionAPI, clock?: TimingClock, metricDependencies?: { submitMetric?: typeof import('@pi/project-metrics/client').submitMetric; agentType?: 'main' | 'subagent' | 'unknown' }) { this.pi = pi; this.report = new Reporting(pi); this.timing = new Timing(pi, clock, metricDependencies); }
   get isEnabled() { return this.enabled; }
   private record(a: Attempt, outcome: Outcome, ctx: ExtensionContext) {
-    if (a.recorded || a.snapshot.session !== ctx.sessionManager.getSessionId()) return;
+    if (a.recorded || !this.sameSnapshotBranch(a.snapshot, ctx)) return;
     a.recorded = true;
     this.report.finish({ attemptId: a.id, model: a.model, provider: a.provider, outcome, metering: a.metering, usage: a.usage ?? null, includedInNativeTotals: outcome === "adopted" });
   }
   reset(ctx: ExtensionContext) { this.clearNative(ctx); this.cancel(ctx); this.timing.invalidate(); this.enabled = false; this.generation++; this.session = null; this.attempt = null; this.observationNoticeSent = false; this.starts = 0; this.lastStart = 0; this.failedAt = 0; this.lastTokens = 0; this.lastCompactId = null; }
+  shutdown(ctx?: ExtensionContext): void {
+    this.generation++;
+    this.enabled = false;
+    const attempt = this.attempt;
+    if (attempt && !attempt.cancelled) {
+      attempt.cancelled = true;
+      clearTimeout(attempt.deadline);
+      try { attempt.abort.abort(); } catch { /* cancellation is best effort */ }
+      try { if (ctx) this.report.hide(attempt.id, this.session === ctx.sessionManager.getSessionId()); } catch { /* diagnostic only */ }
+    }
+    if (attempt && !attempt.settled) {
+      try { attempt.timing.finish('unknown', 'scope_left'); } catch { /* diagnostic only */ }
+    }
+    this.attempt = null;
+    this.session = null;
+    this.timing.invalidate();
+    this.nativePhase = null;
+  }
+  resetTree(ctx: ExtensionContext) {
+    const a = this.attempt;
+    this.nativePhase = null;
+    this.timing.invalidate();
+    this.enabled = false; this.generation++; this.session = ctx.sessionManager.getSessionId();
+    this.starts = 0; this.lastStart = 0; this.failedAt = 0; this.lastTokens = 0; this.lastCompactId = null;
+    if (a && !a.cancelled) { a.cancelled = true; clearTimeout(a.deadline); a.abort.abort(); }
+    if (a?.settled) { this.record(a, 'cancelled', ctx); this.attempt = null; }
+  }
   set(on: boolean, ctx: ExtensionContext) { const session = ctx.sessionManager.getSessionId(); if (this.session !== session) this.reset(ctx); this.session = session; if (!on && this.enabled) { this.generation++; this.clearNative(ctx); this.cancel(ctx); } this.enabled = on; }
   cancel(ctx: ExtensionContext) {
     const a = this.attempt;
     if (!a || a.cancelled) return;
     a.cancelled = true; clearTimeout(a.deadline); a.abort.abort();
-    this.report.hide(a.id, a.snapshot.session === ctx.sessionManager.getSessionId());
+    this.report.hide(a.id, this.sameSnapshotBranch(a.snapshot, ctx));
     if (a.settled) { this.fence(ctx); this.record(a, "cancelled", ctx); }
   }
   stop(ctx: ExtensionContext) { this.generation++; this.clearNative(ctx); this.cancel(ctx); }
@@ -83,7 +114,7 @@ export class Controller {
     a.deadline = setTimeout(() => {
       a.cancelled = true; abort.abort();
       let live = false;
-      if (this.session === snapshot.session) try { live = snapshot.session === ctx.sessionManager.getSessionId(); } catch { /* disposed without a session event */ }
+      if (this.session === snapshot.session) try { live = this.sameSnapshotBranch(snapshot, ctx); } catch { /* disposed without a session event */ }
       this.report.hide(id, live);
     }, 120_000);
     this.attempt = a; this.starts++; this.lastStart = Date.now(); this.lastTokens = tokens;
@@ -119,7 +150,7 @@ export class Controller {
     }).finally(() => {
       clearTimeout(a.deadline); a.settled = true;
       let live = false;
-      if (this.session === snapshot.session) try { live = snapshot.session === ctx.sessionManager.getSessionId(); } catch { /* stale after disposal */ }
+      if (this.session === snapshot.session) try { live = this.sameSnapshotBranch(snapshot, ctx); } catch { /* stale after disposal */ }
       const same = live && this.generation === snapshot.generation;
       if (live && (a.nativeFallback || !a.summary || a.cancelled)) {
         // Every failed physical attempt is fenced from settlement, not request start.
@@ -161,6 +192,10 @@ export class Controller {
     a.boundary = ctx.sessionManager.getLeafId();
     return { summary: a.summary, firstKeptEntryId: a.snapshot.cut, tokensBefore: preparation.tokensBefore, usage: a.usage, details: { kind: "async-compact", version: 1, attemptId: a.id, ...a.snapshot.files } };
   }
+  canAdopt(ctx: ExtensionContext, preparation: { tokensBefore: number; firstKeptEntryId: string; isSplitTurn: boolean; settings: { enabled: boolean; reserveTokens: number; keepRecentTokens: number } }, compaction: { summary: string; firstKeptEntryId: string }): boolean {
+    const a = this.attempt;
+    try { return !!a && this.enabled && !a.cancelled && a.offered && this.session === ctx.sessionManager.getSessionId() && this.generation === a.snapshot.generation && compaction.firstKeptEntryId === a.snapshot.cut && !!settings(this.pi, ctx) && JSON.stringify(settings(this.pi, ctx)) === JSON.stringify(preparation.settings) && !ctx.hasPendingMessages() && valid(this.pi, ctx, a.snapshot) && fits(this.pi, ctx, a.snapshot, compaction.summary, preparation.tokensBefore); } catch { return false; }
+  }
   compact(ctx: ExtensionContext, _entry: CompactionEntry) {
     // The host event can reference an older entry with identical summary text.
     // Deduplicate by the latest committed entry on the active branch instead.
@@ -174,7 +209,15 @@ export class Controller {
     if (!a || a.nativeFallback) { this.afterNative(ctx, false); return; }
     const boundaryIndex = branch.findIndex(e => e.id === a.boundary);
     const fresh = branch.slice(boundaryIndex + 1).filter(e => e.type === "compaction").at(-1);
-    const adopted = !a.cancelled && boundaryIndex >= 0 && fresh?.details && typeof fresh.details === "object" && "attemptId" in fresh.details && fresh.details.attemptId === a.id && fresh.firstKeptEntryId === a.snapshot.cut && a.snapshot.session === ctx.sessionManager.getSessionId() && a.snapshot.generation === this.generation;
+    const nativeMatches = !a.cancelled && a.offered && committed.summary === a.summary && committed.firstKeptEntryId === a.snapshot.cut;
+    // SDK 1.1 emits a native compaction with fromHook=false and may omit the
+    // extension details object. Preserve the adoption fact on that same entry
+    // after the host has committed it; never turn a manual/native mismatch
+    // into an adoption.
+    if (nativeMatches && (!committed.details || typeof committed.details !== 'object' || !('attemptId' in committed.details))) {
+      (committed as { details?: unknown }).details = { kind: "async-compact", version: 1, attemptId: a.id, ...a.snapshot.files };
+    }
+    const adopted = nativeMatches || (!a.cancelled && boundaryIndex >= 0 && fresh?.details && typeof fresh.details === "object" && "attemptId" in fresh.details && fresh.details.attemptId === a.id && fresh.firstKeptEntryId === a.snapshot.cut && a.snapshot.session === ctx.sessionManager.getSessionId() && a.snapshot.generation === this.generation);
     if (!a.settled) { a.nativeFallback = true; this.cancel(ctx); } // Keep the physical slot and fence retries after settlement.
     else this.record(a, adopted ? "adopted" : "discarded", ctx);
     if (adopted) this.notify(ctx, "async-compact context updated", "info");

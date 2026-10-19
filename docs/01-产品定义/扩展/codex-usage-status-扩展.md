@@ -2,8 +2,8 @@
 
 | 项目 | 定义 |
 | --- | --- |
-| 状态 | `IMPLEMENTING`；本规范是已采纳的产品契约，实现与验证边界见 [L2 技术说明](../../02-产品实现/codex-usage-status-技术设计.md) |
-| 用户目标 | 在 Pi 输入框下方、原有 footer 上方的独立额度行查看当前 ChatGPT Codex 订阅额度窗口的剩余比例、可用性与重置时间，并按请求启用 Codex Fast 优先处理。 |
+| 状态 | `DECIDED`；本机统一开关、全部 Pi Agent、失败降级和日常联用为已采纳契约；当前实现与差距见 [L2 技术说明](../../02-产品实现/codex-usage-status-技术设计.md) |
+| 用户目标 | 查看 Codex 订阅额度，并通过一次本机设置统一控制所有 Pi 主 Agent、子 Agent 的 Fast 请求意图；不必逐会话或逐角色开启。 |
 | 关键保证 | 额度只表示默认 bucket；Fast 表示 priority 请求意图，不保证加速；模型资格与费用修正分别判断；敏感授权不展示、不持久化。 |
 
 ## 1. 产品保证
@@ -25,7 +25,7 @@ flowchart LR
 5. 仅向固定的 `https://chatgpt.com/backend-api/wham/usage` 发起额度请求，且禁止重定向；不得因 provider base URL 覆盖、代理或 Location 跳转向其他 origin 发送授权或账户作用域。
 6. 不展示、记录或持久化 bearer token、账户标识、完整响应体、请求头或响应头。
 7. 额度查询失败、超时、字段不兼容或扩展被禁用时，不得阻塞、取消、重试或改变 Pi 的模型请求和会话状态。
-8. 同 provider 登录、登出或切换账号没有 Pi 认证事件时，扩展按每次输入、模型切换和最多 60 秒的授权校验识别作用域变化。每次成功确认作用域后开始 60 秒 lease；lease 到期即先清除快照并显示 `unavailable`，再后台校验，因此运行中额度行对当前授权的识别最多滞后 60 秒。发现变化时必须立即清除旧快照。
+8. 同 provider 登录、登出或切换账号没有 Pi 认证事件时，扩展按每次输入、模型切换和最多 60 秒的授权校验识别作用域变化。每次成功确认作用域后开始 60 秒 lease；lease 到期即先清除快照并显示 `unavailable`，再后台校验，因此旧作用域快照最多继续展示 60 秒；新身份及额度的确认仍取决于后台校验完成，不保证 60 秒内成功。发现变化时必须立即清除旧快照。
 9. 额度行使用 Pi `setWidget('codex-usage-status', factory, { placement: 'belowEditor' })`；不调用 `setFooter`，不以换行符模拟布局。Codex 会话中同一行由 Fast 在左、额度在右，固定顺序为 `<Fast 状态> · <Codex 额度>`，例如 `⚡ Fast · Codex · 98% ██████████ · Sep 16 10:41`；Fast off/inactive 也显示在左侧。Pi 默认 footer 和其他扩展状态保持共存，Fast 不以独立 `codex-fast` footer status 重复显示。
 10. 每次合并行展示前先以 `setStatus('codex-usage-status', undefined)` 与 `setStatus('codex-fast', undefined)` 清除历史 status；隐藏、模型切换、非 TUI、关闭和 shutdown 清除合并 widget 与两个旧 status，不能留下重复文本或空占位。
 
@@ -33,9 +33,9 @@ flowchart LR
 
 ### 2.1 请求意图、状态与模型 eligibility
 
-1. 每个扩展 factory 默认以短暂内存意图从 Off 开始，不写入配置或 session。唯一例外是 §2.3 定义的一次性 trusted-launcher child：仅被选中的 child 可从 `PI_CODEX_FAST=1` 初始化 requested On；parent 的 reload/new/resume/fork，以及 child 后续 factory（包括 reload/new/resume/fork）仍从 Off 开始。
-2. 注册 `/fast`。无参数切换 requested intent；`on`、`off`、`toggle`、`status` 分别执行对应动作，其他参数显示用法警告。只有 `ctx.hasUI` 为真时允许 TUI/RPC 命令改变意图；JSON/print 不改变意图并安全通知限制。
-3. 区分 requested intent 和 effective state：Off、On 且 eligible 时 Active、On 且不 eligible 时 Inactive。模型切换不清除同一实例的 requested On；切回 eligible 必须更新状态并通知。额度 limited、stale 或 unavailable 不得自动关闭 Fast。
+1. Fast 是本机当前用户的统一开关，状态持久保存在本地，不属于某个会话、Agent、模型登录账号或 CF。首次未配置默认 Off；开启与关闭均跨 new/resume/fork/reload、进程重启沿用。另一台电脑独立配置，不自动同步；Fast 与异步压缩是两个独立开关。
+2. 只提供 `/fast`（无参数切换本机开关）、`/fast on` 和 `/fast off`。显式 `toggle`、`status`、多参数及未知参数只提示 `/fast [on|off]`，不改变开关。状态通过既有额度行和操作反馈展示，不新增查询命令。用户可通过 TUI/RPC 的显式控制入口设置；JSON、print 或无 UI 不妨碍 Agent 读取并采用本机状态，普通 Agent 执行不能自行改写用户开关。一次操作的目标是本机全部 Pi Agent，不是只改变发出命令的会话。
+3. 区分本机 requested intent 和当前请求 effective state：Off、On 且 eligible 时 Active、On 且不 eligible 时 Inactive。模型切换不清除本机 On；切回 eligible 后按同一本机状态生效。额度 limited、stale 或 unavailable 不得自动关闭 Fast；不支持的模型/provider 必须明确为未生效，不能假称已获得 priority。
 4. Fast 的 eligibility 必须同时满足：
    - provider 恰为 `openai-codex`；
    - API 恰为 `openai-codex-responses`；
@@ -45,13 +45,13 @@ flowchart LR
 
    因此 `gpt-5.4`、`gpt-5.4-mini`、`gpt-5.4-spark`、`gpt-5.4-astra` 以及未来满足该形状的型号 eligible；`gpt-`、`GPT-5.4`、含空白 suffix 的型号、非 GPT 型号、第三方 provider 或任何 gate 失配均不 eligible。该判定不读取额度授权、不联网、不启动 timer。
 
-   `FAST_MODEL_IDS` 是兼容性 public export，仅表示五个已知型号的 pricing/cost correction 集合，不是 eligibility allowlist；eligibility 由上述精确 `gpt-` 形状和官方 Codex gate 独立判定。
+   已知计费型号集合仅用于费用修正，不是 Fast eligibility 白名单；资格由上述精确 `gpt-` 形状和官方 Codex gate 独立判定。公共导出名称及当前兼容代码由 L2 说明。
 5. Active 时，仅对 plain-object provider payload 且 `payload.model` 精确匹配当前模型 id 的 `before_provider_request` 请求返回浅复制并设置 `service_tier: "priority"`；其他情况保持不变。Fast 只作用于实际触发该 hook 的逻辑 Agent 请求；该返回值是本扩展的请求输出，不是“请求实际已按 priority 发送”的证明。
 6. 在 Codex 额度行左侧显示 `⚡ Fast`（受限 truecolor soft-orange `#D98C3F`，RGB `(217, 140, 63)`，固定 ANSI 序列 `\u001b[38;2;217;140;63m⚡ Fast\u001b[0m`，文本后立即 reset）、Fast inactive（muted）或 Fast off（muted）；不写独立 `codex-fast` footer status。
-7. Active、status 和模型切换通知必须区分 cost policy：
-   - 已知型号 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra` 使用 Fast enabled 与 selected user child 继承提示，费用规则见下文；
+7. Active 和模型切换通知必须区分 cost policy：
+   - 已知型号 `gpt-5.4`、`gpt-5.5`、`gpt-5.6-luna`、`gpt-5.6-sol`、`gpt-5.6-terra` 使用 Fast enabled 与本机全部 Pi Agent 共用开关的提示，费用规则见下文；
    - 其他符合 eligibility 的未知 `gpt-*` 型号可显示 Active、请求 `priority`，但通知必须明确“priority 仅为请求意图，usage cost 未校正/不保证”；
-   - `/fast` 激活、`/fast status` 和切换到 unknown 型号都必须满足该提示；unknown→unknown 即使 effective state 仍为 Active 也必须能看见适当提示；
+   - `/fast` 激活、重复 `/fast on` 和切换到 unknown 型号都必须满足该提示；unknown→unknown 即使 effective state 仍为 Active 也必须能看见适当提示；
    - Fast Active 不能证明 provider 接受了 `priority` 或实际加速。
 8. 对被本扩展改写的每个请求都保留一个 FIFO 关联 ticket，包括 unknown 型号。ticket 必须保存请求时的 model/session 快照和 cost policy；不得因为 unknown 不做 cost correction 而跳过 ticket，导致后续 known ticket 错位。队列最多 32 项，溢出丢最老项；按 FIFO 消费，模型或 session 失配时不修正，shutdown 清空队列。
 9. 只有五个已知型号修正 `usage.cost`：`gpt-5.5` 为 `2.5x`，其余四个为 `2x`，使用 native pricing tier，分别缩放四个 component 后相加，费用已正确时不重复修正。unknown 型号不改变 `usage.cost`，包括 `error`/`aborted` assistant message；unknown ticket 仍在对应 FIFO 消息位置被消费。
@@ -61,31 +61,40 @@ flowchart LR
 
 - eligibility 与 cost correction 是两个独立控制面：能请求 `priority` 不等于能可靠计算 Fast 费用。
 - Spark 及其他 unknown GPT 型号只读取并展示默认 `rate_limit` bucket；不解析、不展示专属 Spark bucket，不把默认 bucket 的状态解释为 Spark 可用性，也不把 Fast Active 解释为 Spark 可用性。
-- 默认 Off，不自动重试或 fallback，不持久化可恢复的 requested 运行状态。§2.4 的本地开启事实不用于恢复 Fast 开关。
+- 未配置默认 Off，不自动重试或 fallback。本机持久偏好与请求时模型 eligibility 分开；§2.4 的开启事实不是配置，不用于恢复开关。
+- 本机开关由既有 Fast 扩展管理，复用 Pi 的用户级全局设置；不新增偏好目录、状态扩展或额外命令。用户命令和直接编辑全局配置修改同一开关，项目配置不覆盖它。具体字段与接线由 L2/L3 说明。
+- 操作反馈区分“本机设置已保存”和“当前请求是否生效”。保存失败必须明确本机变更未确认，不能把仅当前实例的临时行为说成全机已更新；未保存状态不保证跨重启保留。读写失败不泄露原始配置、凭据或异常。
 
-### 2.3 Parent-Fast 继承例外
+<a id="23-parent-fast-继承例外"></a>
 
-Fast 的 factory 默认 Off，一次性、受信任 launcher 例外如下：
+### 2.3 全部 Pi Agent 的适用范围
 
-- parent 扩展用 Pi 官方 `pi.events` 发布稳定事件名 `@pi/codex-usage-status:fast-requested/v1`，payload 必须是无额外字段的 plain object `{ version: 1, sessionId: string, requested: boolean }`。缺失、版本不符、类型不符或多字段事件一律忽略；parent `session_start` 发布当前 requested，合法 `/fast` 状态改变后刷新，`session_shutdown` 发布该 session 的 `requested: false`。
-- launcher 仅把 parent requested intent 在实际 spawn 的瞬间按 session id 读取，并以全新环境副本删除 `PI_CODEX_FAST`；只有 resolved USER-source、名字严格为 `implementer` 或 `code_reviewer`、且其 agent frontmatter 有精确标量 `codexFast: inherit` 时才传 `PI_CODEX_FAST=1`。Parent Off、其他 user agent、所有 project agent（包括同名 project override）均 Off。
-- `PI_CODEX_FAST=1` 是 child factory 的一次性 advisory trusted-launcher input，不是认证、安全边界或持久化配置。child 启动立即读取并删除它；缺失及任何非精确值均 Off。child reload/new/resume/fork 重新建 factory 后回到 Off。
-- 继承的只是 requested intent；child 自己再次执行 provider、API、base URL、OAuth 和模型 eligibility。Parent requested On 但 Inactive 时，eligible child 仍可 Active。已 spawn child 不受后续 toggle 影响；chain 与排队 parallel item 在各自实际 spawn 时取快照，而不是按整个 tool invocation 取快照。
-- role/source/config policy 属于 Subagent dispatcher integration，不是本 package 单独可验证的产品权限或认证机制；package 只保证协议和 child bootstrap 语义。Fast 激活通知必须明确说明新 spawn 的 selected user `implementer`/`code_reviewer` 会继承 requested Fast，同时对 unknown 型号保留 priority intent/cost 未校正提示。
+- 本机开启 Fast 后，所有 Pi 主 Agent 和子 Agent 都采用同一 requested On；关闭后同样统一采用 Off。Agent 名称、角色、user/project 来源以及是否有 UI 都不是排除条件。
+- 单个、并行、顺序委派，以及新建、继续、重试或切换备用模型的 Agent 均在范围内；不能只给首次启动的选定角色传一次状态。
+- 子 Agent 不需要逐个执行 `/fast on` 或声明继承选项。不同启动入口、工作目录或会话身份不能产生彼此独立的 Fast 开关；Agent 结束和 parent 退出不得关闭本机设置。
+- 所有 Agent 共享开关，不共享凭据、请求、费用关联或模型资格。每个请求仍按 §2.1 的安全边界判断能否携带 priority；parent 当前模型不支持不妨碍其他符合条件的 Agent 生效。
+- 已运行 Agent 在下一模型请求前刷新本机 Fast 设置，不等新对话、重启或再次输入。已发出的请求仍按请求时状态处理费用，不追溯改写；不能以启动快照或旧 parent 意图代替最新全局设置。
 
 ### 2.4 本地用户开启事实
 
 Fast 在包内记录用户手动开启事实，用于核对已记录的开启次数；这不是请求调用数，也不证明 provider 采用了 priority 或实际加速。
 
-- 只有合法用户命令使 requested 从 Off 变为 On 才尝试记录，包括 `hasUI=true` 的 TUI/RPC 和当前模型 Inactive 的情况。重复 `on`、关闭、查询状态、非法参数、非 UI 命令、模型切换、初始化、继承和 shutdown 不产生开启事实。
+- 只有合法用户命令实际使用户 Fast 意图从 Off 变为 On 才尝试记录，包括当前模型 Inactive 的情况；不是每个 Agent 自动开启各计一次。本机恢复、全部 Agent 读取或同步状态、子 Agent 启动/继续/重试、模型切换和 shutdown 不产生开启事实。重复 `on`、关闭、查询状态、非法命令不计；写偏好失败不抹除已经发生的用户命令转换，但计量不能用来宣称本机保存成功。
+- 未保存 `on` 的去重只属于处理命令的当前 Agent 运行作用域，跨输入/请求刷新保留；显式 off、观察到真实全局布尔值变化、成功切换会话/分支、reload 或实例退出结束该意图。无关设置写入不解除它。不同窗口或重启后的显式命令按各自读取的磁盘初值判断，不从计量或 Session 恢复未保存意图。首次事实写入也失败时标采集不完整，不因重复 on 补造事件；已提交 outbox 的重试沿用原 ID。
 - 每次事实在 Off→On 时捕获独立事件 ID、UTC 发生时间、用户命令来源和 schema 版本，后台持久化不得重取开关或把写入完成时间当作发生时间；命令不等待计量 I/O，退出完整性按[项目指标](../项目指标.md#3-投递与失败)的统一预算判定。不包含账号、授权、请求正文、Session 身份、工作目录或任务内容。完整记录按事件 ID 去重计数，不通过渲染、重放或复制制造新开启。
 - 记录保存在扩展自有的 Pi 本地状态目录，与 Session、assistant 回复及模型请求无关；无 assistant 即退出和 `--no-session` 也能保留正常写入完成的事件。自有目录与文件分别限制为 `0700`、`0600`，不得跟随不安全的存储目标或覆盖已有事件。
 - 计量记录不是运行配置，不从它恢复 requested，也不自动纳入 Pi Session export/share；不新增常驻状态栏或默认自动上报。显式远端采集许可见[个人项目指标](../项目指标.md)。
-- 通知或继承广播在状态变化后失败，也不应遮蔽已发生的开启。计量写入失败不回滚 Fast、不替换原业务错误；只作不含原异常的安全提示，无法确认或不完整记录不能宣称计数成功。不承诺崩溃或断电前尚未完成的 I/O 一定保存。
+- 通知或状态传播在用户意图变化后失败，也不应遮蔽已发生的开启。计量写入失败不回滚 Fast、不替换原业务错误；只作不含原异常的安全提示，无法确认或不完整记录不能宣称计数成功。不承诺崩溃或断电前尚未完成的 I/O 一定保存。
 
 本节只定义本地 producer；CF采集许可与通用投递规则见[个人项目指标](../项目指标.md)，具体接线、存储、测试和未部署边界由 L2 维护。
 
-额度状态遵循以下数据语义：
+### 2.5 失败与日常入口
+
+- 全局配置读取失败或字段无效时，当前请求不发送 priority；配置故障不阻断原来的模型工作。缺少配置字段按 Off 处理，不把读取失败伪装成已读取全机 Off，也不改写磁盘值。
+- 保存失败明确提示未确认全机变更，不修改已保存的真值、不阻断正常业务。命令意图及已产生的开启事实与请求 effective 分开处理；后续请求以可重新验证的全局设置为准，不以未保存意图覆盖磁盘设置。重复同一未保存 on 不重复计开启。
+- Fast 与异步压缩在同一个正常 Pi 入口共同使用。模式及 UI 不影响读取本机设置；既有宿主版本与隔离启动限制属于 L2 待解决的实现差距，不是永久产品排除。
+
+压缩耗时的产品 owner 为 [Async Compaction §5.5](async-compaction-扩展.md#55-通用压缩阶段耗时展示)，不把它定义为 Fast 的独立职责。
 
 ## 3. 数据语义
 
@@ -135,18 +144,19 @@ Fast 在包内记录用户手动开启事实，用于核对已记录的开启次
 | A8 | 审计检查 | Git diff、测试输出、额度行、session 和日志均不含 token、账户标识、完整响应或原始 headers。 |
 | A9 | 合并独立行与共存 | 使用 `belowEditor` widget 独占一行，固定 `<Fast 状态> · <Codex 额度>`；窄终端始终至多一行并安全截断；Pi 默认 footer 和其他 status 共存，不显示独立的 `codex-fast` status。 |
 | A10 | 隐藏、切换与关闭 | 非 Codex、非 TUI、额度安全 gate 不满足、模型切换和 shutdown 清除 `codex-usage-status` widget、旧额度 status 与旧 Fast status；不重复展示、不留空占位，晚到结果不得复活。 |
-| F1 | Fast 命令与模式 | `/fast` 的空参数、`on`、`off`、`toggle`、`status` 和非法参数行为符合定义；JSON/print（`hasUI=false`）不改变 intent，RPC（`hasUI=true`）可控制。 |
+| F1 | Fast 命令与模式 | 仅空参数切换、on/off 有效；显式 toggle/status、多参数和未知参数只提示 `/fast [on|off]`，不改变开关、不产生开启事实。显式用户操作设置本机开关，无 UI 的 Agent 也采用该状态，不把自动执行当成修改用户配置的授权 |
 | F2 | Fast eligibility 与状态 | provider/API/base URL/OAuth 保持精确 gate；model id 仅需精确小写 `gpt-` 前缀、非空且无空白 suffix；覆盖 Astra、mini、spark、未来 GPT、`gpt-`、大小写、空白、非 GPT 和第三方；同一实例保留 requested On 并正确显示 Active/Inactive。 |
 | F3 | payload hook 与组合边界 | Active 仅为匹配的 plain-object payload 返回浅复制 `service_tier=priority`，保留原 payload/嵌套引用；支持组合要求没有后续 `before_provider_request` handler 改变或移除该 tier。Pi 0.84.4 没有最终 payload 或最终持久化 message 可观测 hook，因此验收只证明本扩展 hook 输出，不证明 provider 最终 tier。 |
 | F4 | request-time ticket | 每个被改写请求（含 unknown）使用请求时 model/session 快照；中途 Off 按请求时快照处理，session mismatch 不修正，shutdown 清空队列，超过 32 项丢最老 ticket；unknown ticket 不得被跳过。 |
 | F5 | Fast cost | 仅五个已知型号修正 cost：`gpt-5.5` 为 2.5x、其他四个为 2x；unknown（包括 error/aborted）不改变 `usage.cost`；known/unknown 交错响应保持 FIFO；long-context native tier、四个 scaled component 相加及已正确计费幂等语义保留。支持组合要求没有其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或已修正的 `usage.cost`，从而影响本次修正或最终持久化；超出时只保证本扩展自身 hook 输出，不保证最终持久化 session cost。 |
 | F6 | malformed/terminal usage | 负数、非整数、缺失必需字段、非法 reasoning/cacheWrite1h、`reasoning > output` 或 `cacheWrite1h > cacheWrite` 不修正；known 合法 accrued usage 的 `error`/`aborted` 仍修正，unknown 的 `error`/`aborted` cost 不变。若其他 `message_end` handler 改变模型/session 匹配输入、usage token 字段或已修正的 `usage.cost`，只保证本扩展 hook 输出，不保证最终持久化 session cost。 |
-| F7 | extension isolation/reset | Fast 不写独立 status key，只向合并行提供无副作用展示状态；新建第二个 extension factory 后 intent 从 Off 开始，Fast 命令/gate 触发的纯展示刷新不得调用授权、网络或额度 timer。 |
-| F8 | parent requested Off | 任意新 spawn 均不带 Fast；状态按 session id 隔离，false/`session_shutdown` 清除对应 parent intent。 |
-| F9 | selected child inheritance | parent requested On 仅使 resolved USER-source 且 exact name/config 命中的 `implementer`、`code_reviewer` child 获得一次性 `PI_CODEX_FAST=1`；其他 user、project 和同名 project override 不继承。 |
-| F10 | bootstrap and timing | child 只读取并删除精确 `"1"`；child eligibility 独立决定 Active；reload/new/resume/fork Off；chain/queued parallel 按实际 spawn 快照；launcher 继承是 advisory、无持久化且不构成 package-only VERIFIED 证据。 |
-| F11 | 用户开启事实 | 只有用户 requested Off→On 产生一次独立本地事件；重复 on、关闭、status、非法/非 UI 命令、初始化/继承/模型切换/shutdown 不计。RPC 与 Inactive 的有效用户开启遵循同一口径；新 factory 不从记录恢复开关。 |
-| F12 | 记录持久化与隔离 | 无 assistant 和 `--no-session` 的正常写入仍可核对；文件身份、白名单、权限及不覆盖/不跟链接满足约束。写入或安全提示失败不改变 Fast，原通知/广播失败不遮蔽已发生的开启；不访问 CF、认证或用户会话原文。 |
+| F7 | 显示与重载 | Fast 不写独立 status key，只提供无副作用展示；所有新实例读取本机开关，reload 不清偏好；命令的纯展示刷新不触发额度授权、网络或 timer |
+| F8 | 本机统一关闭 | 所有主/子 Agent 均采用本机 Off，退出某个 Agent 不改变本机设置；已发出请求的费用仍按请求时状态关联 |
+| F9 | 全部子 Agent | 角色名称、user/project 来源、TUI/RPC/JSON/print 和有无 UI 均不造成子 Agent 被排除，不要求额外继承声明 |
+| F10 | 新建、继续与重试 | 单个、并行、顺序委派及继续/重试/备用模型均遵循本机开关，不被限定为首次 spawn；每个实际模型仍核验资格 |
+| F11 | 用户开启事实 | 只有用户 requested Off→On 产生一次独立本地事件；重复 on、关闭、非法/非 UI 控制命令、初始化/自动同步/模型切换/shutdown 不计。RPC 与 Inactive 的有效用户开启遵循同一口径；新 factory 不从记录恢复开关。 |
+| F12 | 记录持久化与隔离 | 无 assistant 和 `--no-session` 的正常写入仍可核对；文件身份、白名单、权限及不覆盖/不跟链接满足约束。写入或安全提示失败不改变 Fast，原通知/传播失败不遮蔽已发生的开启；不访问 CF、认证或用户会话原文。 |
+| F13 | 本机持久偏好 | on/off 跨 new/resume/fork/reload 和进程重启恢复，全部 Pi Agent 共用；不存 Session/CF，不按模型账号归属，也不自动同步另一台电脑；保存失败不谎称全机更新 |
 
 ## 7. 实现边界
 

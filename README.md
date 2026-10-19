@@ -63,6 +63,7 @@ flowchart LR
 - `@pi/fix` 依赖 `@pi/workflow-runtime` 与 `@pi/workflow-contracts`。
 - `@pi/subagent` 是独立的通用委派扩展，不属于 Workflow Runtime 层级。
 - `@pi/codex-usage-status` 独立于 Workflow Runtime；subagent 可选消费它提供的 Fast interop。
+- 本机开关的目标是复用 Pi 全局 `settings.json` 的 `myPiExtensions` 字段，读写和运行逻辑归两个既有扩展；当前源码的接线差距见各自 L2。
 - Fast 与 Async package 依赖 `@pi/project-metrics` 的 Node client；启用传输不改变两者的宿主兼容范围或加载限制。
 - `@pi/fix-metrics-cloudflare` 是独立服务端 PoC，不参与 Pi extension 运行时依赖。
 
@@ -89,10 +90,16 @@ Agent 在仓库中工作前必须读取 [AGENTS.md](AGENTS.md)。
 
 ```bash
 pi --no-extensions -e ./packages/async-compaction/src/index.ts
-# 进入 TUI 后执行 /async-compact on；/async-compact off 可关闭
+# 首次执行 /async-compact on 保存本机偏好；/async-compact off 持久关闭
 ```
 
-`--no-extensions` 禁用自动发现，仅保留这一条显式 `-e`；不要叠加其他 hook 扩展。此命令不写入全局 settings。候选在运行时默认 Off，手动压缩继续走原生路径；真实终端与 provider 性能尚未验收；离线 InteractiveMode 的收起、连续压缩和 JSONL 恢复已验证，具体限制见 [L2](docs/02-产品实现/async-compaction-技术设计.md)。
+`--no-extensions` 禁用自动发现，仅保留这一条显式 `-e`；不要叠加其他 hook 扩展。此命令不写入全局 settings。首次未配置默认 Off；已保存 On 会在后续受支持主会话与重启后恢复，手动压缩继续走原生路径；真实终端与 provider 性能尚未验收；离线 InteractiveMode 的收起、连续压缩和 JSONL 恢复已验证，具体限制见 [L2](docs/02-产品实现/async-compaction-技术设计.md)。
+
+## 本机开关与压缩耗时
+
+已确认的本机配置目标是复用 `~/.pi/agent/settings.json`：`myPiExtensions.fast` 和 `myPiExtensions.asyncCompaction` 分别保存两个开关，不新增偏好目录。所有主/子 Agent 采用同一全局设置，在下一请求、后台调度或候选采用前刷新；另一台电脑独立设置。字段、原生配置保留及权限边界见[项目配置](docs/03-项目落地/项目配置.md#本机功能开关)。此目标尚未完成源码适配，实际能力与剩余差距见对应 L2。
+
+正常 Fast 主 TUI 或受支持的隔离 Async 主 TUI 会在实际观察到的原生压缩附近显示“压缩阶段耗时”，包括手动、自动和原生兜底；不依赖功能开关，不改变 token 块。它不是精确用户等待或省时收益，也不会新增 CF 上报。完全无计时诊断的旧历史保留原样，不回填。
 
 ## 本地安装与自动采集
 
@@ -105,7 +112,7 @@ export PI_METRICS_CONFIG="$HOME/.pi/agent/project-metrics/config.json"
 
 本机私有配置中的 `enabled: true` 表示允许远端采集；它还需指定自己的 Worker、namespace、独立读写密钥文件和待投递目录。配置文件与密钥不得进入 Git，JSON 内的文件路径必须是绝对路径。完整模板、私有权限及加载方式见[项目配置](docs/03-项目落地/项目配置.md#项目指标本地安装与采集)。`@pi/project-metrics` 是仓库内 workspace 依赖；本地加载前必须安装整个工作区，不能假设它已发布到 npm。
 
-配置一次并使环境变量对 Pi 进程生效后，加载新版 Fast 或 Async 扩展即可自动上报**实际产生的事件**，不需每次重新打开采集。不额外发送启动事件，不自动开启 Fast/Async 开关，也不回填历史。没有配置或 `enabled: false` 时不进行远端采集。
+配置一次并使环境变量对 Pi 进程生效后，加载新版 Fast 或 Async 扩展即可自动上报**实际产生的事件**，不需每次重新打开采集。不额外发送启动事件；Fast/Async 从独立本机偏好恢复，采集配置不会开启功能，也不回填历史。没有配置或 `enabled: false` 时不进行远端采集。
 
 两种扩展使用各自兼容宿主；Async 必须保持单扩展隔离入口，不能因为共用指标库就把两者加载到同一会话。新增项目指标的本地持久化、待投递与网络在后台调度，不被业务命令或压缩 hook 等待；原有 Session 诊断仍由 Pi 按宿主 API 处理。请求最多五秒，正常退出只给新增本地保存统一一秒预算，不等上传。
 

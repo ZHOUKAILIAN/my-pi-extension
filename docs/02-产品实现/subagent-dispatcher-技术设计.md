@@ -137,13 +137,34 @@ Pi 1.0.4 与 1.1.x 的 stdout 与 on-disk session 双边界定向校验已建模
 
 当前 attempt 的裁决顺序固定为：本地 abort → spawn/流式 JSON/header/身份校验失败、空输出、畸形记录、signal close(code=null) 或缺当前有效最终助手候选的 `unknown_transport`（非本地 signal close 覆盖 `aborted`）→有效 1.1.x `agent_settled.aborted=true`（exit=0 为 `cancelled`，非零为 `unknown_transport`）；1.0.4 的 `{type}` settlement 只有完成标记→最终助手 `aborted` →最终助手 `error`（只读该消息自身的类型化 `status`/`errorMessage`，不读旧工具状态、旧错误或 stderr）→stop/length 但进程非零的 `unknown_transport`→最终 `length` 的 `incomplete`→最终 `stop` 的 `success`。最新候选在后续 assistant `message_start`、assistant `toolUse` 或任一 tool execution 事件后失效；普通 `turn_end`/`agent_end` 不清除。每个 retry/fallback 都在同一 child session 内追加新的 prompt turn；不会重新以空上下文启动。重试次数是每个候选模型独立计数，原有闭集 allowlist 与每模型初始+2预算不扩大。所有候选用尽时，`persistent !== false` 返回 `recoverable_failed` 并保留 session、工作树和已捕获输出；`persistent:false` 仅返回尝试诊断，finally 删除临时 storage，不返回 handle 或继续入口。
 
-## 6. 当前基线：模型切换与 Fast 兼容
+<a id="6-当前基线模型切换与-fast-兼容"></a>
+
+## 6. 模型切换、本机开关与当前兼容
+
+### 6.1 当前源码：旧 Fast 继承
+
+本节记录仍存在的角色/来源/首次启动限制，与 L1 的全部 Agent 目标有差距；不是新功能的安全准入规则。
 
 模型切换发生在 child 的下一次模型请求前。自动 fallback 和明确 continuation `model` override 都必须记录 `requestedModel`、`actualModel`、attempt number、source（initial/retry/fallback/user override）与终止原因。
 
-现有 `@pi/codex-usage-status` 的 Fast 继承协议是外部兼容约束。`@pi/subagent` 将 producer 声明为 optional peer，并在 workspace 开发依赖中提供它用于互操作测试；packed package 不要求安装尚未发布的 producer。`fast-inheritance.ts` 通过安全 dynamic import 加载 `@pi/codex-usage-status/interop` public subpath 的 producer-only adapter，禁止从 monorepo sibling 源码目录相对导入；producer 缺失或 public export 不匹配时 consumer 保持安全 Off，Subagent 仍可加载运行。producer 可用时，consumer 订阅版本化 channel 并按 parent session id 保存 requested intent；创建**新 logical child 的首次 spawn**时才读取该快照，克隆环境、删除 ambient `PI_CODEX_FAST`，且仅在既有 user-source / exact agent / `codexFast: inherit` 条件下传递一次性 `PI_CODEX_FAST=1`。同一 child 的 retry、fallback、resume 一律只清除环境变量、不得读取快照或注入 Fast；project agent 和其他 user agent 同样永不继承。
+当前源码仍实现 `@pi/codex-usage-status` 的旧 Fast 继承协议；其中角色、来源和首次 spawn 限制不适用于 §6.2 的目标。`@pi/subagent` 将 producer 声明为 optional peer，并在 workspace 开发依赖中提供它用于互操作测试；packed package 不要求安装尚未发布的 producer。`fast-inheritance.ts` 通过安全 dynamic import 加载 `@pi/codex-usage-status/interop` public subpath 的 producer-only adapter，禁止从 monorepo sibling 源码目录相对导入；producer 缺失或 public export 不匹配时 consumer 保持安全 Off，Subagent 仍可加载运行。producer 可用时，consumer 订阅版本化 channel 并按 parent session id 保存 requested intent；创建**新 logical child 的首次 spawn**时才读取该快照，克隆环境、删除 ambient `PI_CODEX_FAST`，且仅在既有 user-source / exact agent / `codexFast: inherit` 条件下传递一次性 `PI_CODEX_FAST=1`。同一 child 的 retry、fallback、resume 一律只清除环境变量、不得读取快照或注入 Fast；project agent 和其他 user agent 同样永不继承。
 
-`packages/subagent/src/fast-inheritance.ts` 已存在并通过 public `@pi/codex-usage-status/interop` adapter 消费协议；当前剩余事实缺口是尚无真实 Fast child-process/provider E2E，不能仅以单元互操作测试声称 Fast 运行链路已验证。
+`packages/subagent/src/fast-inheritance.ts` 已存在并通过 public `@pi/codex-usage-status/interop` adapter 消费协议；它目前仍做 exact role/source/first-spawn 筛选。Async 的源码 gate 又排除 JSON/print child，因此当前 dispatcher 没有实现两项功能覆盖全部子 Agent。
+
+### 6.2 目标接线（ALIGNING，未实现）
+
+| 对象 | 目标 | 需保留的边界 |
+| --- | --- | --- |
+| 角色发现与 task 受理 | 不把 Agent 名称、user/project 来源作为 Fast/Async 启用筛选 | discovery、trust、身份、工具和 Skill 权限不放宽；不可信 Agent 不能因本机 On 获得执行资格 |
+| 新建/继续/重试/fallback | 各实际 child 都加载所需现有扩展并读取同一机器级 `settings.json` 的 `myPiExtensions` 字段，不依赖首次 spawn 的 On 快照；临时 agentDir 不改变来源 | 重试次数、fallback allowlist、会话身份和恢复预算不变 |
+| `PI_CODEX_FAST` / parent bus | 旧一次性正向注入不能覆盖本机 Off 或继续排除其他 child | 兼容导出的迁移由 Fast owner 与 L3 明确，不在 dispatcher 另造持久布尔源 |
+| headless 模式 | JSON/print 没有 UI 仍读取开关，Async 业务不依赖终端监听 | stderr/stdout、wire/session schema 和诊断字段保持严格；不能用自由文本混入 JSON 流 |
+| fenced/recovery child | 将 Fast/Async 纳入经证明的显式扩展清单与加载顺序 | 保留 `--no-extensions`、interceptor-last、allowlist digest 及 watchdog；新组合需重新验证，不直接放开 ambient extensions |
+| 缺扩展或不支持模型 | 保留本机意图并明确当前不生效/未接线，不伪称已满足全机目标 | 不替用户安装包、升级宿主、改模型或扩工具权限 |
+
+Fast 的本机读取、priority 与费用逻辑归 [Fast 技术设计 §0](codex-usage-status-技术设计.md#0-本机统一开关的目标设计)；Async 的任务、候选和本地计时归 [Async 技术设计 §0](async-compaction-技术设计.md#0-全部-agent-的目标接线待对齐)。Dispatcher 只负责实际启动/继续路径的加载和根目录接线，不新增状态扩展或统一开关 service。
+
+已运行 Agent 在下一模型请求、后台调度或候选采用前刷新适用字段，不等主会话输入。配置失败时降级不阻断正常工作；日常入口共同加载两个扩展，子 Agent 阶段样本在既有采集许可下标注 subagent。共同项目SDK基线选择1.1.0，CLI验收1.0.4/1.1.0；具体加载及绑定机制待技术复审。Workflow SDK Worker不是CLI dispatcher，其factory bundle、单Runtime、生命周期和legacy loader降级由 [Runtime架构](runtime-实现架构.md#sdk-worker-本机功能接线reviewing未实现)拥有；实际Fix入口的可选依赖及诊断消费由 [Fix技术设计](fix-runtime-technical-design.md#11-worker-可选本机功能提供与诊断reviewing未实现)拥有。可选包在fenced delegation的admission/manifest绑定前解析，缺包或peer不兼容可省略并报告inactive；绑定后的缺失/摘要变化依旧paused_integrity，必需interceptor和完整证明不降级且最后加载。验收要覆盖真实 child 请求、继续/重试、手动编辑和关闭，而不是仅断言 env 是否注入；当前 §8 的旧继承测试不能证明新目标通过。
 
 ## 7. 当前基线：可观测、本地状态与 GC
 
@@ -428,7 +449,7 @@ flowchart TD
   R2 -->|候选耗尽且安全中断| READY[recovery_ready<br/>下一 spawn 新 cycle]
 ```
 
-provider allowlist 与当前基线一致；每个**新** recovery cycle 重新获得完整 candidate budget，continuationEpoch 不刷新 provider budget。Fast 只在 Delegation 第一个 logical child 的首次 spawn 计算一次：provider retry/fallback、reattach、replacement、continuation 与 replay 全部传 `firstLogicalChildSpawn=false` 并清除 `PI_CODEX_FAST`。
+provider allowlist 与当前基线一致；每个**新** recovery cycle 重新获得完整 candidate budget，continuationEpoch 不刷新 provider budget。功能开关按 §6.2 的本机统一目标接线：retry/fallback、replacement、continuation 与 recovery child 不因不是首次 spawn 而被排除；reattach 的已有 Agent 仍属于本机控制范围。当前源码的 `firstLogicalChildSpawn` / 一次性 env 限制是待修正差距，不是新目标的 Fast 关闭规则，也不改变恢复预算。
 
 ### 9.6 Agent alias owner、scope 与 trust
 
@@ -697,7 +718,7 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 | Orchestration/control | 运行中即时durable cancel。parallel item cancel不变；call-wide cancel与return/admission竞态覆盖三类slot：`returned_before_call_cancel`不可改写、admitted非终态最终cancelled、未admit占位。startup/并发kill补齐，三类齐全后Call cancelled，无partial-success aggregate；status按序可见取消前返回项。 |
 | Delivery proof / notification + disposition | slice4c internal seam：normal execute返回后先unobserved；status同lineage host scan唯一toolCallId+Call/proof匹配才写`normal_tool_result_observed`，缺失/重复/跨lineage/错proof返回 paused_integrity，不触发cancel/delete/send；interrupted路径保持stable deliveryId，owner-only outbox先scan再send，sending/append窗口不可证明即uncertain且不重发；abandon只写`no_future_send`。未接host/v1/TUI/RPC/provider adapters。 |
 | Execution result regression | 闭集FailureKind、本文 §5 固定裁决顺序（含整轮取消来源及完整性优先级）、每attempt可选running/finished、running无终局失败图、message_start/toolUse/tool event失效、turn_end/agent_end保留、业务失败仍已返回、tool error不provider retry。新runner两计数均为非负安全整数；历史缺字段逐项“未提供”且不作0；>100工具错误证明详情截断不改计数；敏感/raw payload负向fixture；single/chain/parallel逐项验证唯一固定中性段与传播。 |
-| Budgets/continuation/Fast | 每Delegation initial spawn/execution≤1，pre-spawn cancel允许0；每cycle每candidate initial+2；仅cycle1/2/3，含initial总逻辑spawn≤4且第5次=0；reattach不计；continuationEpoch不刷新budget；Fast replacement/continuation/replay全Off。 |
+| Budgets/continuation/Fast | 每Delegation initial spawn/execution≤1，pre-spawn cancel允许0；每cycle每candidate initial+2；仅cycle1/2/3，含initial总逻辑spawn≤4且第5次=0；reattach不计；continuationEpoch不刷新budget。所有实际 Agent 按本机开关和模型资格决定 Fast；replacement/continuation/retry 不再因来源或阶段被强制 Off，自动读取不新增开启事件。 |
 | Child interceptor/side effect | 真实`--no-extensions`启动；固定allowlist custom-tool extensions依序`-e`，fence interceptor最后。前置args rewrite后interceptor hash必须等于execute输入；后续handler改写反例必须暂停。result ACK基于最终middleware result，覆盖result rewrite、return-isError/throw、ACK kill points、加载顺序/排他性失败、独立watchdog；不可证明工具不自动恢复。 |
 | IPC/privacy | socket/pipe owner/mode/ACL、OS peer identity、challenge、伪造/重放/乱序/旧 generation ACK、frame size/schema/redaction；argv/process-list 无 task/prompt/secret；临时 system prompt 正常/异常/signal/startup cleanup。 |
 | persistent:false / active delete / retention | reference-added先于admission；single preflight仅`reference_release_eligible`，false→0删除，true→先耐久`delegation_delete_planned`冻结，再按`planned→proof→release→delete_requested→prune→tombstone→completed`在同fence幂等续做；whole Call delete/normal retention共享`call_cleanup_requested` lifecycle，覆盖eligible负向矩阵、冻结后claim/send=0、reference-order release/cascade、private/proof/tombstone/completion全部kill points与startup幂等reconcile；固定GC锁序无死锁。single orphan Delegation覆盖live-ref/action负例。 |
@@ -737,7 +758,7 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 | bridge-v1 / v1-v2 namespace/rollback | 切片0已有版本化 bridge-v1 capability probe、独立 owner-only preservation marker、受控 mtime、pin CRUD、目录/文件 identity 校验与原 v1 identity lock 内 GC 保护的本地实现及自动化测试，但发布/部署、真实 binary/kill-point 与同 UID 路径竞态仍未证明；probe 保持 `verified=false/adoptionAllowed=false`，无 adoption、rollback、v2 namespace 或真实 bridge binary 30日 E2E。更老 v1 仍不识别 marker。 | 本地实现与测试已覆盖受支持参与者边界，待发布/部署、真实 binary/kill-point 与平台边界验证；v2 adoption/rollback 与真实 binary E2E 未实现 |
 | argv/temp/IPC privacy | v2 admission 将 task/cwd/tool call 放 owner-only private payload，canonical provenance 放 private binding；fenced runner 不把 task 放 child argv/env，仅传 stdin 与 opaque fence env；IPC frame 只携带受限 JSON、digest/ref、ordinal/checkpoint，allowlist/endpoint 非 owner-only 或 proof 失败即拒绝。system prompt 仍使用 owner-only 临时文件；真实 process-list/OS peer-credential/跨进程隐私 E2E待验证。 | slice5b focused privacy/IPC implementation已落地；v1隐私 drift显式保留 |
 | Provider inner budget | `dispatcher.ts` 基线与 gated execution seam 均按每 candidate initial + 2 闭集瞬态 retry、有序 fallback；provider retry 不增加 recovery cycle。 | slice3 internal seam 已实现；真实 provider E2E 未验证 |
-| Fast | gated execution seam 仅 initial logical child 首次 provider attempt 传递 Fast；retry/fallback/recovery cycle 不传递。 | seam 已实现；真实 Fast child E2E 未完成 |
+| 本机 Fast / Async | Fast gated seam 仍仅 initial logical child 首次 attempt 传递旧 bootstrap；retry/fallback/recovery cycle 不传递。Async 当前准入排除 JSON/print child。 | 与全部 Agent 目标不符；按 §6.2 接线并验证，旧 seam 测试不能关闭此 drift |
 | Pi 0.84.4 tool semantics | 官方 docs/类型已确认 hook/error边界；slice5b interceptor 已按真实 `tool_call`/`tool_result` 链接线，`tool_execution_end` 仅可作交叉核验，不能替代 durable ACK。 | handler-chain focused test已通过；真实 Pi provider/TUI E2E待验证 |
 
 ### 9.13 Implementation Handoff：slice6（独立、不提交）
@@ -795,6 +816,8 @@ rollback目标是已验证bridge-v1 binary，而不是任意更老v1。回滚前
 
 ### 9.14 采纳状态与实现门禁
 
+此处采纳范围是既有 v2 恢复设计；§6.2 及 S25 的全部 Agent 本机开关调整仍为 `ALIGNING`，不继承旧方案批准，也不能据旧切片授权开始实现该新范围。
+
 五份 owning docs 已由同一固定 revision 的[产品语义/指标轴](../归档/评审/2026-09-14-subagent-dispatcher-产品语义指标Review-Artifact.md)与[实现/运营轴](../归档/评审/2026-09-14-subagent-dispatcher-实现运营Review-Artifact.md)批准；[Adoption Decision](../归档/评审/2026-09-14-subagent-dispatcher-Adoption-Decision.md)状态为 `ADOPTED_DESIGN`。AR3-1～AR3-5 及此前 required Findings 已为 `resolved_fixed`，S1–S43 连续，目标设计状态为 `DECIDED / 分片实现中`。
 
 已采纳，可按 Adoption Decision 的切片进入实现。切片0已有 bridge-v1 marker/capability 的本地实现与 focused tests，但发布/部署、真实 binary/kill-point 与同 UID 路径竞态仍未证明；capability 仍为 `verified=false/adoptionAllowed=false`，故 adoption 仍为 0。采用任何既有 v1 session 前仍必须先发布、安装并验证完整 `bridge-v1` 前置。每个 coding 切片必须经过独立代码评审并更新本节 drift。当前 v1 基线事实保持不变；slice4c/5b 的 delivery、side-effect fence 与 slice6 的 shared cleanup/GC 仅为 gated internal foundation，package root/public adapters、capability enable、adoption/migration 及真实 OS power-loss、跨进程/provider/TUI/RPC E2E 仍未完成或验证，不能据此声称生产启用或完整目标已完成。
@@ -816,7 +839,7 @@ slice7 新增 focused tests 覆盖 forged/version/test-proof、prepared crash re
 | 说明 | 边界 |
 | --- | --- |
 | 产品 owner | [L1 产品规范](../01-产品定义/扩展/subagent-扩展.md)拥有用户行为和保证；本表承载对应的协议、故障注入和回归检查，不独立改写产品语义。 |
-| 编号 | S1–S43 保留既有检查要求；章节链接按当前文档位置调整。 |
+| 编号 | S1–S43 保持连续；S25 按 L1 的本机全部 Agent 范围定义目标，不再把旧首次 spawn 限制当作通过条件。其余恢复、权限和预算门禁保持。 |
 | 当前状态 | 验收要求不是通过记录。公开 v2 未启用；当前实现与证据缺口见 §9.12 及后续模块状态。 |
 
 | 编号 | 可执行场景 | 通过条件 |
@@ -845,7 +868,7 @@ slice7 新增 focused tests 覆盖 forged/version/test-proof、prepared crash re
 | S22 | Pi 0.84.4 interceptor E2E | `--no-extensions` + allowlist `-e` + interceptor-last 的实际加载清单/version/digest均可证明；真实 custom tool 覆盖 return-isError/throw、前置args rewrite、后续handler改写反例与最终result rewrite。interceptor持久hash必须等于实际执行输入，result ACK必须等于最终middleware result；排他性失败或ACK失败时watchdog杀child并暂停。 |
 | S23 | IPC 与进程隐私 | argv/process list、IPC endpoint/frame、伪造/旧 generation ACK、临时 prompt 权限与异常/重启清理全部通过负向测试，无敏感原文公开泄漏。 |
 | S24 | 保留与查询 | 30 天到期只触发 eligibility 检查。active/nonterminal、任一 uncertainty、pending/sending/uncertain delivery、outstanding action、active claim/live child/外部 live reference 一律 retention 不 eligible，原文/private/proof不得删除；状态继续可查询。只有满足 S43 的终态对象才可 fenced cleanup。 |
-| S25 | Fast 回归 | 仅第一个 logical child 首次 spawn 可命中；provider retry/fallback、resume、replacement、continuation 和 crash replay 注入次数均为 0。 |
+| S25 | 本机 Fast 开关回归（未实现） | 本机 On 时，全部受信任且正常执行的主/子 Agent 在符合模型资格时请求 priority，Off 时不请求；role/source/mode 不作功能排除。single/parallel/chain、retry/fallback/resume/replacement/continuation 均核验实际请求；自动读取/恢复不新增用户开启事实，身份和预算不回归。 |
 | S26 | 真实进程/生命周期 E2E | headless + PTY/TUI/provider覆盖crash/restart、active/sibling lineage、parallel、chain、owner fencing、side-effect、notification与delete/reference kill points；pre-spawn transfer证明无child事实但不生成child death，post-spawn transfer证明双death/action。Darwin覆盖同PID birth mismatch（判原进程death且signal=0）、birth不可读/缺失/两次观察不稳定（paused）、直属waitpid与两个真实Node进程kill/restart；不以TTL、单次kill0、mock或不可用pidfd措辞替代。 |
 | S27 | 五种 side-effect 人工处置与引用释放 | succeeded不重做；not_started/safe-to-retry增加continuationEpoch；still_unknown保持暂停；cancel走严格状态机；dead child后续spawn仍消耗新cycle。action/cancel未对账时`reference_release_eligible=false`、single delete=0；对账完成仍须满足normal/custom final delivery与全部slot终态，再按S40事务生成proof/release。 |
 | S28 | startup reconciler 全状态矩阵 | active lineage 的 admitted/prebinding/resolving、bound、已有reserved event、spawned-live、spawned-dead分别归一/路由到`resolution_ready`、bound reservation executor、`initial_ready/cycle_ready(reservationId)`、reattach-only、recovery_ready；startup已有reserve时append reserve/count=0。paused/cancel/delete/terminal/delivery complete走专门reconciler/终态；`paused_configuration` cancel按Delegation完整spawn历史分流。pre-spawn owner transfer两次稳定观察WAL/no-ref且只证明supervisor death，post-spawn才要求child death/action。parallel call-wide cancel回放按同fence保留returned-before-cancel、推进admitted非终态cancel、补齐未admit占位，三类全终态后Call cancelled。并发startup重复执行/spawn/count=0。 |

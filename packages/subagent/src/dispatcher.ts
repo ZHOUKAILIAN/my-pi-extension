@@ -7,6 +7,7 @@ import { DEFAULT_RETRY_DELAY_MS, findSessionFile, MAX_RETRIES_PER_MODEL, runPiAt
 import { isMatchingRegistry, isValidSessionRegistry, makeSessionIdentity, newLogicalHandle, type SessionIdentity, type SessionRegistry } from "./session-identity.ts";
 import { withIdentityLock, type LockHandle } from "./session-lock.ts";
 import { continuationTask, executionCandidates, isAbortRequested, isRetryableProviderFailure, MAX_PROVIDER_RETRIES } from "./dispatcher-policy.ts";
+import { getAgentDir } from '@earendil-works/pi-coding-agent';
 
 export interface DispatchRequest {
   parentSessionId: string;
@@ -218,7 +219,7 @@ export async function dispatchAgent(request: DispatchRequest, deps: DispatchDepe
           const source: AttemptSource = retry > 0 ? "retry" : candidate.source;
           const firstAttempt = attemptNumber === 0;
           const task = continuationTask(request.task, retry === 0 && firstAttempt);
-          const env = request.fast?.environment(request.agent, firstLogicalChildSpawn && firstAttempt);
+          const env = request.fast?.environment(request.agent, firstLogicalChildSpawn && firstAttempt, undefined, path.join(getAgentDir(), 'settings.json'));
           await lock?.markChildStarting(childSessionId, sessionFile);
           const rawAttempt = await run({
             cwd: actualIdentity.cwd,

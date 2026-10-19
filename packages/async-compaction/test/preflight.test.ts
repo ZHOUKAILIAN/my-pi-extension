@@ -12,7 +12,7 @@ const tick = () => new Promise(r => setTimeout(r, 10));
 test("SDK threshold fallback commits natively while physical background slot is pending; late usage is accounted", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "async-compact-preflight-")), agentDir = join(cwd, "agent"), dir = join(cwd, "sessions");
   mkdirSync(agentDir); mkdirSync(dir);
-  const argv = process.argv;
+  const argv = process.argv, previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
   process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
   let release!: () => void;
   const gate = new Promise<void>(r => release = r);
@@ -61,5 +61,5 @@ test("SDK threshold fallback commits natively while physical background slot is 
     assert.equal(records[0].data.includedInNativeTotals, false);
     assert.equal(background, 1);
     assert.deepEqual(errors, []);
-  } finally { release(); session.dispose(); process.argv = argv; rmSync(cwd, { recursive: true, force: true }); }
+  } finally { release(); session.dispose(); process.argv = argv; if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; rmSync(cwd, { recursive: true, force: true }); }
 });

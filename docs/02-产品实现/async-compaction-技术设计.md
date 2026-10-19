@@ -4,10 +4,42 @@
 
 | 项目 | 状态 |
 | --- | --- |
-| 方案 | 已采纳 A 的本地预览设计；参数待评估，产品行为见 [L1](../01-产品定义/扩展/async-compaction-扩展.md) |
-| 当前实现 | 独立 package 已接线，默认关闭；已验证范围与剩余验收见 §9 |
-| 目标宿主 | Pi 1.0.4 / 1.1.0 的隔离单扩展主 TUI；CLI 与 SDK 验证范围见 §9 |
-| 评审证据 | [两轴独立评审及宿主 spike](../归档/评审/2026-10-17-异步压缩-A-双轴评审.md) |
+| 产品依据 | [L1](../01-产品定义/扩展/async-compaction-扩展.md)：本机统一开关、全部 Pi Agent 与压缩耗时 |
+| 当前源码 | 偏好读写、候选 fencing、原生 compaction 接入、阶段耗时与诊断渲染均由本包实现；SDK Worker 通过 Runtime 的 managed factory 接入 |
+| 当前准入 | 支持的 CLI host 为 Pi 1.0.4 / 1.1.0；受控 SDK Worker 使用 1.1.0。旧宿主保留原生路径并报告能力缺口 |
+| 验证边界 | 自动化测试、loopback provider/PTY 与双进程设置证据已保留；并发写竞争、真实 provider 和真实 agent 目录未执行 |
+
+## 0. 全部 Agent 的目标接线（评审中）
+
+### 0.1 既有扩展内改造
+
+- 在 `packages/async-compaction/` 内拥有本机偏好读写、每个 Agent 的 Controller、压缩阶段计时和显示。`index.ts` 按入口适配，`controller.ts` 管理任务，`timing.ts` 保留后台/前台阶段计量，通用耗时由本包的 `duration.ts` 承载。
+- 不新增独立状态扩展、共享状态 package 或额外用户控制入口。偏好读写与压缩耗时均留在本包；Fast 包不再装载 Async 的 observer，避免双重职责和重复记录。
+- 持久意图使用本机固定 `<本机 agentDir>/settings.json` 的 `myPiExtensions.asyncCompaction`，缺省 `false`；完整片段由 [L3](../03-项目落地/项目配置.md#本机功能开关)拥有。所有 Agent 取同一全局来源，不接受项目合并值或 child 临时 agentDir 覆盖；与 Fast 共用文件但不共用任务状态。
+- 命令与手动编辑修改同一字段。包内读写须协调 Pi 宿主文件锁、锁内重读，只更新本字段并保留 Fast、其他扩展和全部原生设置；不使用旧内存快照覆盖全文，也不借 child SettingsManager 改写全局模型。原生字段容纳能力已核实，协同写锁、路径传递与实际功能接线仍需验证。
+- 本机开关、每个 Agent 的实际能力条件、任务状态分别处理。模式与 UI 不再是启用资格；模型、有效压缩设置、当前上下文及可证明的安全接入条件仍需检查。全机 On 不等于每个 Agent 立即调用模型。
+
+### 0.2 入口适配矩阵
+
+| 入口 | 目标接线 | 保留的边界 |
+| --- | --- | --- |
+| 主 TUI | 用户命令保存本机设置，按需显示进度与耗时 | 不新增常驻状态，不抢输入或修改原生摘要 |
+| RPC | 自动读取本机设置，按该入口现有协议反馈 | 不依赖终端键盘监听，不把缺 TUI 当 Off |
+| JSON / print 子 Agent | 自动读取本机设置，按同样触发条件准备/采用候选 | 保留结构化协议、取消、有限退出及本地记录，不向 stdout 混入自由文本诊断 |
+| 继续、重试、备用模型 | 同一本机设置；按实际模型重新核验，旧候选不能跨模型/会话复用 | 不重置 retry/fallback 预算，不额外修改宿主模型 |
+| SDK Worker | 通过实际 ResourceLoader/ExtensionRunner 接线，取消和关闭跟随该 Worker | 保留 Node 工具/Skill allowlist、独立历史及 Artifact 控制，不靠只修改 CLI argv 声称已覆盖 |
+| 显式 allowlist / recovery child | 把所需扩展加入经过证明的加载组合 | 不取消 `--no-extensions`、加载顺序、side-effect interceptor 或完整性检查 |
+
+### 0.3 任务、配置与展示边界
+
+- 每个 Agent 独立持有候选、scope/generation、在途物理请求槽、冷却、usage 与阶段记录；共享的只是本机开关，不能共享私有原文、摘要或任务身份。现有单任务/冷却参数按 Agent 适配；本机总并发和总费用没有新增上限承诺。
+- 新建或成功替换 Agent 时读取同一本机偏好；结束只清本实例，不把全机 Off 写回。可取消的导航前置事件不能永久关闭当前能力；成功 tree 才隔离旧 branch。reload 依宿主先 shutdown 再加载的事实处理，失败不声称旧实例仍在运行。
+- 已确认在下一模型请求、后台调度或候选采用前刷新适用设置，不要求再次输入、重启或重开 Agent。接受 Off 后统一取消/fence 旧候选；物理请求只能尽力取消，迟到结果结算已知用量但不接入。不能只依赖启动快照、文件事件或 input 刷新；读失败/值无效则停止新增后台任务和采用、走原生路径；保存失败不改持久真值、不阻断业务。
+- 计时核心不依赖 UI；凡呈现 `[compaction]` 的入口，使用同次本地记录显示阶段耗时。无 UI 的 Agent 保留本地诊断，不要求所有子过程灌入主对话。所有入口需验证不改变原生返回、摘要、费用或取消。
+- 移除主 TUI/隔离 guard 前必须证明真实提交安全。目标用公开返回对象的延迟 `compaction` 访问，在宿主消费结果时再次核验当前分支、模型/工具/设置、preparation、候选身份和最新本机开关；无效时返回 undefined 让宿主原生压缩，而非抛错或提交旧摘要。必须针对真实 1.0.4/1.1.0 Runner 与宿主消费顺序验证晚于本扩展的 handler、微任务/异步分支变动及外部 Off；公共 API 无法证明安全时暂停受影响接入，不删除 guard 冒充完成。
+- 本地通用耗时与 CF producer 分开。显式采集许可下，主/子 Agent 的两类阶段事件由真实终态产生，操作开始时捕获有限 agentType；通用 observer 不调用项目指标投递器。数据字段和兼容由项目指标 L2 拥有。
+
+§1–§7 描述当前源码机制；与以上目标的差距和验收集中见 §8–§9。
 
 ## 1. 原来的流程，方案 A 改动什么
 
@@ -66,7 +98,7 @@ flowchart TD
 
 | 位置 | 新增内容 | 保留的宿主职责 |
 | --- | --- | --- |
-| 命令入口 | `/async-compact on/off`，仅控制当前主对话 | 不覆盖 `/compact` |
+| 当前命令入口 | `/async-compact on/off` 仅在隔离主 TUI 接受设置；这是当前限制，不是目标范围 | 不覆盖 `/compact` |
 | `turn_end` | 判断软阈值、捕获快照、启动单个后台任务 | 原模型/工具循环继续执行 |
 | 内存候选 | 摘要、原保留边界、来源指纹、usage 与任务状态 | 不写入活跃上下文 |
 | `session_before_compact` | 校验候选，合格时返回；否则交还原生生成 | 何时压缩、取消和恢复由 Pi 控制 |
@@ -81,7 +113,7 @@ flowchart TD
 - 公开的 `getBranch()`、`buildSessionProjection()` 用于读取当前历史；`session_before_compact` 接受 summary、保留边界、usage 和 details。
 - `prepareCompaction()` 属于内部实现，未列入核实的 package 根导出。快照准备使用公开投影接口，不直接导入 `dist/core` 私有路径。
 
-依据：[Pi 1.1.0 导出](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/index.ts)、[扩展类型](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/extensions/types.ts)、[AgentSession](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/agent-session.ts)。本机全局包为 1.0.4，仓库根依赖和 Subagent 的版本不同，需在隔离测试环境验证目标版本。
+依据：[Pi 1.1.0 导出](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/index.ts)、[扩展类型](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/extensions/types.ts)、[AgentSession](https://github.com/earendil-works/pi/blob/abe508e1b89912adde45528136c3221eb69acdd7/packages/coding-agent/src/core/agent-session.ts)。Fast、Async 与 SDK Worker 的宿主解析不同，目标兼容矩阵须独立验证，不以某台电脑的全局安装替代。
 
 ## 2. 模块与职责
 
@@ -93,16 +125,20 @@ flowchart TD
 | `controller.ts` | 管理开关、会话代际、后台模型请求与响应结算、内存候选、冷却和取消 |
 | `compaction.ts` | 稳定前缀选择、摘要提示词构造、文件记录、来源及预算校验 |
 | `reporting.ts` | 按需过程提示、用量记录和去重 |
-| `timing.ts` | schemaVersion 1 的本地阶段耗时记录、epoch 隔离及历史 renderer |
+| `timing.ts` | Async 后台生成与符合条件的 threshold 前台阶段计时、epoch 隔离及历史 renderer |
+| `duration.ts` | 当前主 TUI 的通用阶段 observer 与 renderer 候选；目标扩展到全部入口，本地记录不使用 project-metrics |
+| `packages/async-compaction/src/machine-settings.ts`、`duration-schema.ts` | 本包专用偏好 I/O 与耗时合同；不引入共享状态层 |
 
 Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只有宿主负责提交压缩记录。
 
-## 3. 启动与任务管理
+## 3. 当前启动与任务管理
+
+以下 gate 是现有源码的安全限制，不能作为 L1 排除子 Agent 的产品规则；目标适配见 §0，未完成项见 §9。
 
 ### 启停与来源识别
 
-- `/async-compact on`、`off` 只改变当前主对话的开关，各反馈一次；重复执行保持目标状态。
-- 默认 Off，new/resume/fork/reload 后重新 Off，不持久化开关，也不向 child 传递启用参数。宿主自动压缩关闭时不预生成，手动压缩保持原生。
+- `/async-compact on`、`off` 仅在支持版本的隔离主 TUI 读写 `<agentDir>/extension-preferences/async-compaction.json`；重复执行保持目标状态并确认保存。
+- 缺失/损坏文件及新实例读取失败默认 Off。new/resume/fork/reload 后重新读取；正常退出和 scope reset 不写回 Off。其他已打开窗口在下一次输入或开关命令边界刷新。保存失败时当前实例保持本次意图并提示本机保存未确认；headless/错误 profile 不读写偏好。宿主自动压缩关闭或模型暂不支持时可保留 latent On，但不预生成，手动压缩仍走原生。
 - 首个验证范围为 TUI 主对话。Subagent 的 JSON/print child 不开放启用入口；其他宿主模式需先验证主对话身份，无法区分时保持 Off。1.0.4/1.1.0 的单扩展 native emit 在交付候选后，经连续 Promise microtask 执行同步 append；编辑器提交命令由终端 input 回调同步触发，正常用户的 off 无法插入交付和提交之间。程序化输入及多 handler 不在此证明范围。
 - `off` 立即禁止启动和采用，取消本扩展未完成任务；取消后的迟到结果只结算可获得的用量，不进入上下文。
 
@@ -189,12 +225,14 @@ threshold 路径依次执行：
 | 事件 / 情况 | 行为 |
 | --- | --- |
 | 正常追加内容 | 保留候选，采用时重算增量和预算 |
-| tree/fork/new/resume/reload、其他压缩已生效 | 推进代际，取消未完成任务，清除旧候选；新会话默认 Off |
+| 成功 tree | 使旧候选和阶段 observer 失效；保留未结算物理请求槽直至迟到响应结算，按原 branch leaf fence 禁止旧任务计量/提示写入新分支，然后刷新本机偏好 |
+| new/resume/fork | 成功替换时 shutdown 清理旧实例，新 `session_start` 重新读取偏好；取消导航前置事件不执行 leave/reset，不卸载仍有效的输入监听 |
+| reload | 宿主先 shutdown 旧实例，再重载资源；成功的新 `session_start` 读取偏好，失败不保证旧实例可继续，但不得写回本机 Off |
 | 换模型、provider、system/tools 或相关设置 | 候选保守失效；不自动启动跨厂商请求 |
 | 用户停止当前运行 | 终端裸 Esc 或 Pi TUI 识别的 Kitty/CSI-u Esc 触发本扩展的取消，不消费按键或主动中止正常前台推理；停止后的迟到结果只结算用量，不继续留作后续采用 |
 | timeout、限流、失败 | 记录终态，释放本扩展任务槽，按预算冷却；原上下文继续有效 |
 | shutdown | 禁止启动和采用，取消任务并有界结算已知用量；未结算后台计时以 `scope_left` 记 unknown，不阻塞退出，不使用失效 context 写入新会话 |
-| timing scope | Session/Extension 实例生命周期 epoch 独立于候选 generation；Off、Esc 和 native commit 不截断已开始计时，leave/reset 使旧样本不可写入新 scope。threshold 前台样本在匹配成功/失败 hook 入口结算；manual、overflow、Off 和不支持场景不开始样本 |
+| timing scope | Async 后台/threshold 阶段计时与通用 `compaction-duration` observer 分开。前者不随 Off、Esc 或 native commit 截断；后者在主 TUI 对 manual/threshold/overflow 开始独立单调计时，不依赖 Async 开关。shutdown 可在原 scope 记录 unknown；成功 tree 直接丢弃旧 branch 诊断，避免写入新分支。RPC/JSON/headless 不写通用行 |
 
 执行摘要时显示 `async-compact generating` 过程提示，hook 等待期间显示 `waiting for background summary`；启用且受支持的 threshold 路径，包括 input preflight 禁止采用的旁路，在交还原生时显示 `native fallback`，原生完成/失败或离开后收起。manual/overflow 仍走宿主原生提示，不标为候选兜底。非模型上下文 custom progress entry 含 attemptId 与渲染 revision；阶段变化和终态用 entry 触发重绘。不占 footer、不抢输入，也不覆盖宿主工作消息或其他 overlay。
 
@@ -206,11 +244,12 @@ threshold 路径依次执行：
 
 | 范围 | 验证重点 |
 | --- | --- |
-| Controller | on/off 幂等、当前主对话范围、child 不启用、单任务、冷却、超时和迟到结果 |
+| Controller | 全部主/子 Agent 采用本机 on/off；latent On 不绕过实际模型/设置；取消导航与成功 tree、每 Agent 单任务、冷却、超时和跨 branch 迟到结果。旧“child 不启用”断言只证明当前 gate，须替换为目标适配验收 |
 | `compaction.ts` | 追加允许、prefix edit 拒绝、换分支、上一份摘要改变、工具配对、切点衔接及巨大增量 |
 | 原生压缩 hooks | 当前 settings/预算复核、普通及带指令 manual/overflow 原生旁路、其他 handler 覆盖、取消与实际采用确认 |
 | 用量与恢复 | 采用/丢弃/失败/取消去重，unknown，关闭边界，连续压缩与会话恢复 |
-| 真实 Pi 1.0.4 / 1.1.0 | 用实际 SDK/CLI 驱动合成会话验证命令、临时提示、主对话与 child 区分、模型切换和普通摘要调用 |
+| machine preference / generic duration | [`machine-preferences.test.ts`](../../packages/async-compaction/test/machine-preferences.test.ts)、[`duration.test.ts`](../../packages/async-compaction/test/duration.test.ts) 是现有候选测试入口；新目标还需 RPC/JSON/print/SDK、两真实进程、在途状态更新和无 UI 本地恢复，不能只检查 JSON 文件 |
+| 真实宿主与入口组合 | 当前精确 1.0.4/1.1.0 是起点；先对齐共同宿主矩阵，再以真实 SDK/CLI/PTY 验证主/子、继续/重试、Fast 联用和多 handler，不能把原隔离模式通过当作全部 Agent 证明 |
 | 体验基线 | 比较原生与后台模式的全部压缩等待、总任务耗时、额外 tokens 及固定事实保留；包含 miss 与兜底 |
 
 自动化按现有 workspace 接入 `npm test`、`npm run typecheck`。SDK/CLI 合成会话从 `compaction_start` 开始计时，以后续正常任务的 provider 请求开始（排除摘要请求）或明确失败/取消为终点；用 session + 原生压缩序号关联机会，以 details.attemptId 关联实际采用，按 reason 分层，缺少后续请求的样本单列。后台 attempt 的已知 usage、unknown 和原生 totals 分开记录，统计总体见 L1 §7。
@@ -219,18 +258,36 @@ threshold 路径依次执行：
 
 ## 9. 实现差距与采纳项
 
+### 9.1 全部 Agent 目标的差距
+
+| L1 目标 | 当前事实 | 关闭条件 |
+| --- | --- | --- |
+| 全部主/子 Agent 共用本机开关 | `preferenceGate`、调度和采用仍检查主 TUI、CLI 版本与单扩展 profile | 扩展全部入口的状态读取与真实任务链，UI 缺失不得默认为 Off |
+| 两个既有扩展内改造 | 两包分别拥有 machine-settings；Async 拥有 duration observer/schema，Fast 不重复装载 | 共享同一 settings.json 字段，但不共享任务状态或计时实例 |
+| 本地计时覆盖全部 Agent | 通用 observer 当前只在主 TUI 写入/渲染 | 无 UI 同样产生可恢复本地记录，实际呈现 compaction 的入口展示对应耗时；坏关联与缺失历史不造数 |
+| 子 Agent 生命周期正确 | 目前缺子 Agent 开启后台压缩的完整验证 | 短进程退出、继续、重试、取消、模型变化、scope/branch 和物理槽均不泄漏、不误用旧候选 |
+| Fast 联用及多 handler 安全 | 当前仅有隔离路径的一致性依据，缺最终 expected-context/CAS | 对齐支持宿主和加载组合并证明采用安全；不以放开 guard 或 ambient discovery 替代 |
+| 原生全局配置 | 读写 `settings.json.myPiExtensions.asyncCompaction`，锁内重读并原子更新 | 项目值不覆盖；宿主和两个扩展更新不丢无关字段 |
+| 运行中开关更新 | 当前只在若干生命周期/输入/命令边界刷新 | 以模型请求、调度与采用前为边界验证命令和手动编辑；双进程/持续执行均生效，读失败/无效值走原生、保存失败不伪称成功且不阻断业务 |
+| 不扩大远端采集 | 新范围尚未接线；现有 `Timing.finish` 会投递其阶段终态 | 子 Agent 的远端来源决定完成前，不把新本地计时直接接入原 producer；通用 observer 的 submit 恒为零 |
+
+### 9.2 既有机制与验证边界
+
+下表保留前置能力事实；候选自检和旧隔离运行证据不构成 §9.1 全部目标的独立验收。
+
 | 目标 / 问题 | 当前事实 | 处理 |
 | --- | --- | --- |
-| 本地阶段耗时 | `timing.ts` 记录后台生成与前台压缩 hook 阶段；单调时钟计算、wall-clock 仅作 UTC 定位、终态去重、未知值及历史本地展示已实现。streamSimple 或 result 同步抛错时计时为 observation_failed，并保留未确认物理终态的请求槽；两个 SDK 同步故障类型有包内单测 | 两个支持版本的实际 CLI 前台 hook 耗时与 JSONL 恢复仍需独立 verifier 验证；日/周环比看板尚未实现，不替代 A12 效果验收 |
+| 本地阶段耗时 | `timing.ts` 有后台生成和受支持 threshold 阶段计量；`duration.ts` 候选有本地单调计时、branch delta 与 renderer，以及相应单测/隔离运行报告 | 全部 Agent 和无 UI 恢复尚未实现；候选未完成新目标的独立评审/验收；真实 provider 与 A12 效果未验证 |
 | 后台生成、验证、原生接入 | `packages/async-compaction/src/` 已实现完整用户切点、有效投影 hash、原生 threshold hook；离线 fake provider 连续两次相同摘要的实际提交已验证 | 失败/overflow 组合与其他 handler 条件提交仍需验证；仅隔离 CLI profile 允许采用 |
 | 原生压缩入口复用 | 已注册 threshold hook 并交还 Pi 提交；单次隔离 SDK 命中已验证 | 以候选复用率、全量压缩等待及原生行为兼容为验收输入 |
-| 主对话识别与提示 | 命令仅接受 TUI、指定版本的实际 CLI 路径、`--no-extensions -e packages/async-compaction/src/index.ts` 且单一显式 extension；Pi 1.0.4 实际 CLI + PTY、本地合成 SSE 验证启停、阶段重绘与编辑草稿保留；1.0.4/1.1.0 SDK 验证裸 Esc 和 Kitty/CSI-u Esc | 其他启动组合未开放；人工物理终端体验见效果验收项 |
+| 当前主对话识别与提示 | 源码仅接受 TUI、指定 CLI 版本、`--no-extensions` 及唯一显式入口；有 fake provider、InteractiveMode、Esc 与过程显示的前置验证 | headless、SDK Worker 和多扩展尚未开放；持久化候选的部分隔离自检不能证明全机状态、真实并发写或全部入口已验收 |
 | 宿主有效设置、待发送输入预算 | 使用内存 SettingsManager 解析有效设置；pending 和 input preflight 屏障、post-run 窗口限制候选，模拟独立内存会话追加候选。`getContextUsage()` 无法给出当前压力时保守跳过后台任务；未启用投影估算触发 | 未验证其它入口与持续队列下预算安全性 |
 | 投影准备与文件记录 | 公开 canonical projection 选择完整用户段；本扩展的版本化 details 及有效工具调用用于累计。原生跳过 fromHook details 时，在公开 preparation.fileOps 补前一份已提交且校验通过的列表，原生负责写回结构化 details/标签；离线 SDK manual 接续验证不依赖模型输出路径 | split-turn 与工具调用/结果边界全集尚未验证；其他 hook 的 details 不猜测 |
 | 多扩展最终提交一致性 | 缺 expected-context 条件；仅接受 1.0.4 或 1.1.0、`--no-extensions` 且单个显式 `-e` 指向本入口；不能运行时证明 SDK 注入的其它 handler 不存在 | 多扩展模式禁用候选；扩大到任意组合需宿主最终 CAS |
 | 额外 usage 进入会话总账 | 同 session 物理请求结算后追加非上下文 custom entry，含 reported/partial/unknown 计量状态；原生 fallback 期间仍 pending 时保留物理槽，晚到计量按原 provider/model 单次记录并从结算时重新起算冷却和压缩后增长；离开前未结算请求写 unknown，采用 usage 随原生 compaction 记录 | 退出后迟到用量无法安全写回原会话；真实退出时序仍需验证 |
-| 真实宿主命中 | 两版本公开 SDK 验证连续 threshold 提交、文件接续及恢复；Pi 1.0.4 实际 CLI 验证候选旧切点、同一 SessionId、JSONL 原文保留、期间用户及工具增量，以及重开后默认 Off 和旧进度隐藏 | fork/reload 等其余真实 CLI 恢复组合未单独验收 |
+| 真实宿主命中 | 既有两版本 SDK 验证连续 threshold 提交、文件接续及恢复；隔离 CLI/PTY 与本地合成 provider 的前置证据仍按原范围使用 | 不证明新目标的全部入口、fork/reload、Fast 联用、真实 provider 性能或多进程并发写 |
 | 阶段提示与开销 | 过程 entry 按 generating/waiting/native fallback 渲染；实际 CLI 验证等待/兜底期间可见、终态无需新输入收起，后台结算不清除前台阶段；已知数值及 native/extra/unknown 归属可见 | 真实 provider 的异常和用量形态仍需验收 |
-| 参数与效果门槛 | 默认 Off；1.0.4/1.1.0 类型与合成 SDK 验证、Pi 1.0.4 定向 CLI/PTY 协议验收已完成 | L1 A12 的完整任务效果基线（完整 threshold 总体、总耗时/tokens、事实与约束保留）尚未验收；真实厂商摘要质量、费用、网络性能及人工物理终端体验未测；多 handler 最终 CAS 未实现，非隔离加载不开放 |
+| 本机偏好 | 候选共享包提供严格布尔文件、私有原子 I/O 和串行刷新/命令，入口仍受主 TUI/profile gate；部分取消、分支、保存与计量断言已有测试 | 共享包不是目标结构；全部 Agent 读取、同一本机根、更新时点与失败语义尚未对齐/实现；未完成独立验收或日常安装 |
+| 参数与效果门槛 | 默认 Off；1.0.4/1.1.0 SDK harness 与离线 fake provider 测试 | L1 A12 的完整任务效果基线（完整 threshold 总体、总耗时/tokens、事实与约束保留）尚未验收；真实厂商摘要质量、费用、网络性能及人工物理终端体验未测；多 handler 最终 CAS 未实现，非隔离加载不开放 |
 
 外部实现和图示见 [调研报告](../归档/研究/2026-10-17-异步上下文压缩调研.md)。研究阶段的 [路线比较](../归档/评审/2026-10-17-异步压缩-需求与方案对齐.md)保留为证据；产品规则由 L1 拥有，运行事实以后续源码和测试为准。

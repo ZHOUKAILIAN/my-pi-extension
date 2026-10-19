@@ -82,6 +82,7 @@ type StoredEvent = {
   outcome: string | null;
   model: string | null;
   provider: string | null;
+  agent_type: string | null;
   received_at: string;
 };
 type DailyAggregate = {
@@ -89,34 +90,36 @@ type DailyAggregate = {
   kind: Kind;
   model: string | null;
   provider: string | null;
+  agentType?: string | null;
   eventCount: number;
   knownCount: number;
   unknownCount: number;
   meanDurationMs: number | null;
 };
-type Bucket = { day: string; kind: Kind; model: string | null; provider: string | null; count: number; sum: number; known: number; unknown: number };
-function aggregate(rows: StoredEvent[], dayFor: (event: StoredEvent) => string | null, byModel = true) {
+type Bucket = { day: string; kind: Kind; model: string | null; provider: string | null; agentType: string | null; count: number; sum: number; known: number; unknown: number };
+function aggregate(rows: StoredEvent[], dayFor: (event: StoredEvent) => string | null, byModel = true, includeAgentType = false) {
   const buckets = new Map<string, Bucket>();
   for (const event of rows) {
     const day = dayFor(event);
     if (!day) continue;
-    const key = JSON.stringify(byModel ? [day, event.kind, event.provider, event.model] : [day, event.kind]);
+    const key = JSON.stringify(byModel ? [day, event.kind, event.provider, event.model, includeAgentType ? event.agent_type : null] : [day, event.kind, includeAgentType ? event.agent_type : null]);
     let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { day, kind: event.kind, model: byModel ? event.model : null, provider: byModel ? event.provider : null, count: 0, sum: 0, known: 0, unknown: 0 };
+      bucket = { day, kind: event.kind, model: byModel ? event.model : null, provider: byModel ? event.provider : null, agentType: includeAgentType ? event.agent_type : null, count: 0, sum: 0, known: 0, unknown: 0 };
       buckets.set(key, bucket);
     }
     if (event.kind === 'fast_enabled') bucket.count++;
     else if (event.duration_ms === null) bucket.unknown++;
     else { bucket.sum += event.duration_ms; bucket.known++; }
   }
-  const ordered = [...buckets.values()].sort((a, b) => a.day.localeCompare(b.day) || a.kind.localeCompare(b.kind) || String(a.provider).localeCompare(String(b.provider)) || String(a.model).localeCompare(String(b.model)));
+  const ordered = [...buckets.values()].sort((a, b) => a.day.localeCompare(b.day) || a.kind.localeCompare(b.kind) || String(a.agentType).localeCompare(String(b.agentType)) || String(a.provider).localeCompare(String(b.provider)) || String(a.model).localeCompare(String(b.model)));
   return {
     aggregates: ordered.slice(0, MAX_AGGREGATE_GROUPS).map((bucket): DailyAggregate => ({
       day: bucket.day,
       kind: bucket.kind,
       model: bucket.model,
       provider: bucket.provider,
+      agentType: includeAgentType ? bucket.agentType : undefined,
       eventCount: bucket.count,
       knownCount: bucket.known,
       unknownCount: bucket.unknown,
@@ -149,8 +152,8 @@ export default {
       const quotaEnd = new Date(`${receivedAt.slice(0, 10)}T00:00:00.000Z`);
       quotaEnd.setUTCDate(quotaEnd.getUTCDate() + 1);
       const insertion = await env.DB.prepare(`
-        INSERT INTO project_metric_events(event_id,dataset,kind,occurred_at,duration_ms,outcome,model,provider,unknown_reason,canonical_hash,received_at)
-        SELECT ?,?,?,?,?,?,?,?,?,?,?
+        INSERT INTO project_metric_events(event_id,dataset,kind,occurred_at,duration_ms,outcome,model,provider,unknown_reason,agent_type,canonical_hash,received_at)
+        SELECT ?,?,?,?,?,?,?,?,?,?,?,?
         WHERE (SELECT COUNT(*) FROM project_metric_events WHERE received_at>=? AND received_at<?)<5000
           OR EXISTS(SELECT 1 FROM project_metric_events WHERE event_id=?)
         ON CONFLICT(event_id) DO NOTHING
@@ -161,6 +164,7 @@ export default {
         event.kind === 'fast_enabled' ? null : event.model,
         event.kind === 'fast_enabled' ? null : event.provider,
         event.kind !== 'fast_enabled' && event.durationMs === null ? event.unknownReason ?? null : null,
+        event.kind === 'fast_enabled' ? null : event.agentType ?? null,
         hash, receivedAt, quotaStart, quotaEnd.toISOString(), event.eventId,
       ).run();
       const stored = await env.DB.prepare('SELECT canonical_hash FROM project_metric_events WHERE event_id=?').bind(event.eventId).first<{ canonical_hash: string }>();
@@ -169,7 +173,8 @@ export default {
       return json({ eventId: event.eventId, status: insertion.meta.changes ? 'accepted' : 'duplicate' }, 202);
     }
 
-    if (request.method === 'GET' && url.pathname === '/api/v1/project-stats') {
+    if (request.method === 'GET' && (url.pathname === '/api/v1/project-stats' || url.pathname === '/api/v2/project-stats')) {
+      const isV2 = url.pathname === '/api/v2/project-stats';
       if (!secretsValid(env) || !tokenMatches(request, env.METRICS_READ_TOKEN)) return json({ error: 'unauthorized' }, 401);
       if (request.headers.get('x-project-namespace') !== env.TARGET_NAMESPACE || !await namespaceMatches(env)) return json({ error: 'unauthorized' }, 401);
       const daysText = url.searchParams.get('days') ?? '7';
@@ -188,7 +193,7 @@ export default {
       const baselineStart = new Date(`${capture.today}T00:00:00.000Z`);
       baselineStart.setUTCDate(baselineStart.getUTCDate() - days - 1);
       const query = await env.DB.prepare(`
-        SELECT kind,occurred_at,duration_ms,outcome,model,provider,received_at
+        SELECT kind,occurred_at,duration_ms,outcome,model,provider,agent_type,received_at
         FROM project_metric_events
         WHERE dataset=? AND ingest_seq<=? AND received_at<=? AND received_at>=?
         ORDER BY ingest_seq LIMIT ?
@@ -217,14 +222,14 @@ export default {
         day.setUTCDate(day.getUTCDate() - days + offset);
         return utcDay(day);
       });
-      const groupKey = (value: DailyAggregate) => JSON.stringify([value.kind, value.provider, value.model]);
-      const makeComparisons = (aggregates: DailyAggregate[]) => {
-        const byDay = new Map(aggregates.map((value) => [JSON.stringify([value.kind, value.provider, value.model, value.day]), value]));
+      const groupKey = (value: DailyAggregate) => JSON.stringify([value.kind, value.provider, value.model, value.agentType]);
+      const makeComparisons = (aggregates: DailyAggregate[], includeAgentType = false) => {
+        const byDay = new Map(aggregates.map((value) => [JSON.stringify([value.kind, value.provider, value.model, value.agentType, value.day]), value]));
         const metricGroups = new Map(aggregates.map((value) => [groupKey(value), value]));
         return [...metricGroups.values()].flatMap((group) => displayedDays.map((day, index) => {
-        const current = byDay.get(JSON.stringify([group.kind, group.provider, group.model, day]));
+        const current = byDay.get(JSON.stringify([group.kind, group.provider, group.model, group.agentType, day]));
         const previousDay = index === 0 ? baseline : displayedDays[index - 1];
-        const previous = byDay.get(JSON.stringify([group.kind, group.provider, group.model, previousDay]));
+        const previous = byDay.get(JSON.stringify([group.kind, group.provider, group.model, group.agentType, previousDay]));
         const metricValue = (value: DailyAggregate | undefined) => value ? (value.kind === 'fast_enabled' ? value.eventCount : value.meanDurationMs) : group.kind === 'fast_enabled' ? 0 : null;
         const currentValue = metricValue(current);
         const previousValue = metricValue(previous);
@@ -232,7 +237,7 @@ export default {
           ? (currentValue - previousValue) / previousValue : null;
         const comparable = change !== null && Number.isFinite(change);
         return {
-          day, kind: group.kind, model: group.model, provider: group.provider,
+          day, kind: group.kind, model: group.model, provider: group.provider, ...(includeAgentType ? { agentType: group.agentType } : {}),
           currentValue, previousDay, previousValue,
           percentChange: comparable ? change : null,
           comparable,
@@ -241,7 +246,7 @@ export default {
       };
       const comparisons = makeComparisons(daily.aggregates);
       const overallComparisons = makeComparisons(dailyOverall.aggregates);
-      return json({
+      const base = {
         coverage: 'received_only',
         status: rows.length ? 'partial_coverage' : 'no_received_data',
         watermark: capture.watermark,
@@ -261,7 +266,25 @@ export default {
         unlocatedOverallByReceivedDay: unlocatedOverall.aggregates,
         todayInProgress: { day: today, comparison: false, overallReceivedAggregates: todayOverall.aggregates, receivedAggregates: todayReceived.aggregates },
         truncated: truncatedRows || daily.truncated || dailyOverall.truncated || unlocated.truncated || unlocatedOverall.truncated || todayReceived.truncated || todayOverall.truncated,
-      });
+      };
+      if (!isV2) return json(base);
+      const byAgentType = Object.fromEntries((['main', 'subagent', 'unknown'] as const).map((agentType) => {
+        const belongs = (event: StoredEvent) => event.kind !== 'fast_enabled' && (event.agent_type === agentType || (agentType === 'unknown' && (event.agent_type === null || event.agent_type === 'unknown')));
+        const typedOccurred = occurredRows.filter(belongs);
+        const typedUnlocatedRows = unlocatedRows.filter(belongs);
+        const typedTodayRows = todayRows.filter(belongs);
+        const typed = aggregate(typedOccurred, occurredDay, false);
+        const typedUnlocated = aggregate(typedUnlocatedRows, receivedDay, false);
+        const typedToday = aggregate(typedTodayRows, () => today, false);
+        const typedComparisons = makeComparisons(typed.aggregates);
+        return [agentType, {
+          completeDays: { aggregates: typed.aggregates.slice(0, 64), comparisons: typedComparisons.slice(0, 2 * days) },
+          unlocatedByReceivedDay: typedUnlocated.aggregates.slice(0, 64),
+          todayInProgress: { receivedAggregates: typedToday.aggregates.slice(0, 2) },
+          truncated: truncatedRows || typed.truncated || typedUnlocated.truncated || typedToday.truncated || typed.aggregates.length > 64 || typedComparisons.length > 2 * days,
+        }];
+      }));
+      return json({ schemaVersion: 2, base, byAgentType });
     }
     return json({ error: 'not_found' }, 404);
   },

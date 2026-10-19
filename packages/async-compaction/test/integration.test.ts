@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { ModelRuntime, SessionManager, SettingsManager, DefaultResourceLoader, createAgentSession } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
+import { writeMachinePreference } from "../src/machine-settings.ts";
 
 const usage = (input: number) => ({ input, output: 30, cacheRead: 0, cacheWrite: 0, totalTokens: input + 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } });
 const text = (m: { content: unknown }) => typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter(c => c.type === "text").map(c => c.text).join("") : "";
@@ -16,7 +17,7 @@ const tick = () => new Promise(r => setTimeout(r, 5));
 test("actual SDK threshold reuses an earlier user cut without waiting for background work", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "async-compact-sdk-")), agentDir = join(cwd, "agent"), dir = join(cwd, "sessions");
   mkdirSync(agentDir); mkdirSync(dir);
-  const argv = process.argv; process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
+  const argv = process.argv, previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir; process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
   let release!: () => void;
   const gate = new Promise<void>(r => release = r);
   let background = 0, completed = 0, calls = 0;
@@ -36,11 +37,11 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     })(); return s;
   }, models: [{ id: "m", name: "M", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 4096, maxTokens: 512 }] });
   const sm = SessionManager.create(cwd, dir);
-  const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, extensionFactories: [extension] }); await loader.reload();
+  await writeMachinePreference('asyncCompaction', true, join(agentDir, 'settings.json'));
+  const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, extensionFactories: [(pi) => extension(pi, { settingsFile: join(agentDir, 'settings.json'), agentType: 'main' })] }); await loader.reload();
   const { session } = await createAgentSession({ cwd, agentDir, model: runtime.getModel("fake", "m"), thinkingLevel: "off", modelRuntime: runtime, resourceLoader: loader, sessionManager: sm, settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, retry: { enabled: false } }), noTools: true });
   await session.bindExtensions({ mode: "tui", uiContext: { notify() {}, onTerminalInput: () => () => {} } as never, onError: e => errors.push(e) });
   try {
-    await session.prompt("/async-compact on");
     const id = sm.getSessionId();
     await session.prompt(user(1));
     sm.appendMessage({ role: "assistant", content: [{ type: "toolCall", id: "read-1", name: "read", arguments: { path: "history.ts" } }, { type: "toolCall", id: "edit-1", name: "edit", arguments: { path: "changed.ts" } }], api: "fake-api", provider: "fake", model: "m", usage: usage(1), stopReason: "toolUse", timestamp: Date.now() });
@@ -77,7 +78,7 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     const timings = sm.getBranch().filter(e => e.type === "custom" && e.customType === "async-compact-timing").map(e => e.data);
     assert.ok(timings.some(d => d.kind === "background_generation" && d.durationMs >= 0 && d.outcome === "completed"), "physical background completion gets its own timing sample");
     assert.ok(timings.some(d => d.kind === "foreground_compaction" && d.durationMs >= 0 && d.outcome === "completed"), "native threshold completion gets a separate foreground stage sample");
-    for (const sample of timings) assert.deepEqual(Object.keys(sample).sort(), ["durationMs", "kind", "model", "outcome", "provider", "sampleId", "schemaVersion", "startedAtUTC"].sort());
+    for (const sample of timings) assert.deepEqual(Object.keys(sample).sort(), ["agentType", "durationMs", "kind", "model", "outcome", "provider", "sampleId", "schemaVersion", "startedAtUTC"].sort());
     const jsonlWithTiming = readFileSync(sm.getSessionFile()!, "utf8");
     assert.match(jsonlWithTiming, /async-compact-timing/);
     const restored = SessionManager.open(sm.getSessionFile()!, dir, cwd);
@@ -93,5 +94,5 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     assert.match(manual.summary, /<read-files>[\s\S]*history\.ts/);
     assert.match(manual.summary, /<modified-files>[\s\S]*changed\.ts/);
     assert.equal(sm.getSessionId(), id, "two compactions remain in the same session");
-  } finally { release(); session.dispose(); process.argv = argv; rmSync(cwd, { recursive: true, force: true }); }
+  } finally { release(); session.dispose(); process.argv = argv; if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; rmSync(cwd, { recursive: true, force: true }); }
 });

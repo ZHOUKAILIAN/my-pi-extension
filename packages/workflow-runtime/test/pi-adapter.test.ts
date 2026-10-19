@@ -136,3 +136,68 @@ test('PiSdk adapter rejects a session that does not submit an artifact after ret
   await assert.rejects(() => executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {}), /did not produce a valid artifact/);
   assert.equal(prompts, 2);
 });
+
+test('PiSdk adapter binds the public runner before prompt and emits one final quit', async () => {
+  const events: string[] = [];
+  const runner = { emit: async (event: any) => { events.push(event.type); } };
+  let disposed = 0;
+  const executor = new PiSdkWorkerExecutor({
+    createSession: async (request: any) => ({
+      session: {
+        extensionRunner: runner,
+        async bindExtensions() { await runner.emit({ type: 'session_start', reason: 'startup' }); },
+        async prompt() {
+          const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
+          await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
+        },
+        dispose() { disposed++; },
+      },
+    }) as any,
+  });
+  await executor.execute({ id: 'investigate', profile: { tools: [] } }, 'task', {});
+  assert.deepEqual(events, ['session_start', 'session_shutdown']);
+  assert.equal(disposed, 1);
+});
+
+test('PiSdk adapter rejects a foreign loader returned by the controlled factory seam', async () => {
+  const foreign = { reload: async () => {}, getSkills: () => ({ skills: [], diagnostics: [] }) } as any;
+  let created = false;
+  const executor = new PiSdkWorkerExecutor({
+    resourceLoaderFactory: ({ createDefault }) => { createDefault(); return foreign; },
+    model: { provider: 'p', id: 'm' },
+    createSession: async () => { created = true; return { session: {} }; },
+  });
+  await assert.rejects(() => executor.execute({ id: 'investigate', profile: { tools: [] } }, '', {}), /foreign_managed_resource/);
+  assert.equal(created, false);
+});
+
+test('PiSdk adapter executes and cleans a managed bundle through the real loader path', async () => {
+  let factoryCalls = 0;
+  let shutdownCalls = 0;
+  const runner = { emit: async () => {} };
+  const bundle = {
+    version: 1 as const,
+    create: () => ({
+      extensions: [{ name: 'managed-test', factory: async () => { factoryCalls++; } }],
+      capabilities: [{ capability: 'fast' as const, status: 'active' as const, reason: 'available' as const }],
+      shutdown: async () => { shutdownCalls++; },
+    }),
+  };
+  const executor = new PiSdkWorkerExecutor({
+    model: { provider: 'p', id: 'm' },
+    machineExtensionsBundle: bundle,
+    createSession: async (request: any) => ({
+      session: {
+        extensionRunner: runner,
+        async bindExtensions() { await runner.emit(); },
+        async prompt() {
+          const tool = request.customTools.find((item: any) => item.name === 'submit_artifact');
+          await tool.execute('call-1', { kind: 'investigation', route: 'local_fix', rootCause: 'cause', evidence: ['trace'] });
+        },
+      },
+    }) as any,
+  });
+  await executor.execute({ id: 'investigate', profile: { tools: [] } }, 'task', {});
+  assert.equal(factoryCalls, 1);
+  assert.equal(shutdownCalls, 1);
+});

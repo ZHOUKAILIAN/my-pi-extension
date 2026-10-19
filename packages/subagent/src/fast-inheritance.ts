@@ -47,15 +47,14 @@ export interface SpawnEnvironmentOptions {
   firstLogicalChildSpawn: boolean;
   parentSessionRequestedFast: boolean;
   baseEnv?: NodeJS.ProcessEnv;
+  machineSettingsFile?: string;
 }
 
-/** Always removes ambient Fast. The only positive path is the exact first-spawn contract. */
+/** Child processes inherit the machine settings path, never a Fast boolean snapshot. */
 export function createChildEnvironment(options: SpawnEnvironmentOptions): NodeJS.ProcessEnv {
   const env = { ...(options.baseEnv ?? process.env) };
   delete env[FAST_ENV_NAME];
-  if (options.firstLogicalChildSpawn && options.parentSessionRequestedFast && isFastInheritanceEligible(options.agent)) {
-    env[FAST_ENV_NAME] = "1";
-  }
+  if (options.machineSettingsFile) env.PI_MY_EXTENSIONS_SETTINGS_FILE = options.machineSettingsFile;
   return env;
 }
 
@@ -112,8 +111,8 @@ export class FastInheritanceConsumer {
 
   get requestedFast(): boolean { return this.requested; }
 
-  environment(agent: FastAgentLike, firstLogicalChildSpawn: boolean, baseEnv?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-    return createChildEnvironment({ agent, firstLogicalChildSpawn, parentSessionRequestedFast: this.requested, baseEnv });
+  environment(agent: FastAgentLike, firstLogicalChildSpawn: boolean, baseEnv?: NodeJS.ProcessEnv, machineSettingsFile?: string): NodeJS.ProcessEnv {
+    return createChildEnvironment({ agent, firstLogicalChildSpawn, parentSessionRequestedFast: this.requested, baseEnv, machineSettingsFile });
   }
 
   dispose(): void {

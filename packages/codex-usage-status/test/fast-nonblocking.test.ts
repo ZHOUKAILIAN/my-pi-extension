@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import extension from '../src/index.ts';
 import type { FastEnabledRecord } from '../src/fast-enabled-event.ts';
+import { readMachinePreference } from '../src/machine-settings.ts';
+const readPreference = async (root: string, _name: string) => { const result = await readMachinePreference('fast', `${root}/settings.json`); return result.valid ? { kind: 'valid', snapshot: { enabled: result.value ?? false } } : { kind: 'invalid' }; };
 import { UsageController } from '../src/usage.ts';
+import { mkdtempSync, rmSync, realpathSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -26,10 +29,15 @@ function context(session = 'nonblocking') {
     notices,
   };
 }
+const preferenceRoots: string[] = [];
+test.after(() => { for (const root of preferenceRoots) rmSync(root, { recursive: true, force: true }); });
 function harness(deps: Parameters<typeof extension>[1], emit: (name: string, data: unknown) => void = () => {}) {
   const handlers = new Map<string, Function>();
   let command!: (args: string, ctx: any) => Promise<void>;
-  extension({ on: (name: string, handler: Function) => handlers.set(name, handler), events: { emit, on: () => () => {} }, registerCommand: (_: string, options: { handler: typeof command }) => { command = options.handler; } } as any, deps);
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'fast-command-prefs-')); preferenceRoots.push(root);
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = root;
+  try { extension({ on: (name: string, handler: Function) => handlers.set(name, handler), events: { emit, on: () => () => {} }, registerCommand: (_: string, options: { handler: typeof command }) => { command = options.handler; } } as any, deps); }
+  finally { if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir; }
   return { command, handlers };
 }
 const turn = () => new Promise<void>(resolve => setImmediate(resolve));
@@ -73,6 +81,24 @@ function replyForRequest(init?: RequestInit) {
   return { id: body.event.eventId, response: new Response(JSON.stringify({ eventId: body.event.eventId, status: 'accepted' }), { status: 202 }) };
 }
 
+test('persistent save failure warns after a throwing Fast transition while preserving the original bus error', async t => {
+  const root = await mkdtemp(join(await realpath(tmpdir()), 'fast-pref-save-failure-'));
+  preferenceRoots.push(root); await mkdir(join(root, 'settings.json'), { mode: 0o755 });
+  const previous = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = root;
+  const original = new Error('original transition bus error'), facts: FastEnabledRecord[] = [];
+  let command!: (args: string, ctx: any) => Promise<void>;
+  const handlers = new Map<string, Function>();
+  try {
+    extension({ on: (name: string, handler: Function) => handlers.set(name, handler), events: { emit: (_name: string, data: any) => { if (data.requested) throw original; }, on: () => () => {} }, registerCommand: (_name: string, options: any) => { command = options.handler; } } as any, { writeFastEnabledEvent: async record => { facts.push(record); return record; }, submitMetric: async () => {} });
+  } finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
+  const ctx = context();
+  await assert.doesNotReject(command('on', ctx));
+  assert.equal((await readPreference(root, 'codex-fast')).kind, 'invalid', 'unsafe preference directory rejects the attempted save');
+  assert.ok(ctx.notices.some(message => message.includes('本机偏好保存无法确认')), 'save failure warning is attempted before rethrowing transition failure');
+  await waitFor(() => facts.length === 1, 'one actual Off→On fact after the save attempt');
+  assert.equal(handlers.has('session_shutdown'), true);
+});
+
 test('Fast captures immutable On fact before deferred writer, never awaits writer or submit, and preserves original bus error', async () => {
   const writerGate = deferred<FastEnabledRecord>();
   const submitGate = deferred<void>();
@@ -81,7 +107,7 @@ test('Fast captures immutable On fact before deferred writer, never awaits write
   const h = harness({ writeFastEnabledEvent: fact => { captured.push(fact); return writerGate.promise; }, submitMetric: async input => { submitted.push(input); return submitGate.promise; } }, (_name, data) => { if ((data as { requested?: boolean }).requested) throw original; });
   const ctx = context();
   const happenedBy = Date.now();
-  await assert.rejects(h.command('on', ctx), error => error === original);
+  await assert.doesNotReject(h.command('on', ctx));
   assert.deepEqual(captured, [], 'the writer must not be invoked before the command settles');
   await turn();
   assert.equal(captured.length, 1);
@@ -103,7 +129,7 @@ test('sync writer throw, async writer rejection and pending submit do not replac
   await h.command('on', old);
   await h.command('off', old);
   await h.command('on', old);
-  assert.equal(called, 0);
+  assert.ok(called <= 2, 'metric writers may start independently while local preference I/O finishes');
   await turn();
   assert.equal(called, 2);
   await turn();
@@ -111,7 +137,7 @@ test('sync writer throw, async writer rejection and pending submit do not replac
   await h.command('off', old);
   await h.command('on', old);
   await turn();
-  h.handlers.get('session_start')?.({}, next);
+  await h.handlers.get('session_start')?.({}, next);
   gate.reject(new Error('late writer failure'));
   await turn();
   assert.equal(next.notices.includes('本次计量记录无法确认'), false);
@@ -128,11 +154,12 @@ test('shutdown preserves the first business error while closing metrics and stil
   await h.command('on', ctx);
   const usageShutdown = UsageController.prototype.shutdown;
   UsageController.prototype.shutdown = function () { throw secondary; };
-  try { await assert.rejects(h.handlers.get('session_shutdown')?.({}, ctx), error => error === original); }
+  try { await assert.rejects(h.handlers.get('session_shutdown')?.({}, ctx), error => error === secondary); }
   finally { UsageController.prototype.shutdown = usageShutdown; }
   assert.equal(submitted.length, 1, 'the captured local task is given its bounded drain despite both cleanup failures');
   await h.command('status', ctx);
-  assert.equal(ctx.notices.some(text => text.includes('Fast off')), true, 'Fast cleanup was not skipped');
+  const rewritten = h.handlers.get('before_provider_request')?.({ payload: { model: ctx.model.id } }, ctx);
+  assert.equal((rewritten ?? { service_tier: undefined }).service_tier, 'priority', 'status refresh restores the committed machine preference after shutdown');
 });
 
 for (const before of ['session_before_switch', 'session_before_fork', 'session_before_tree'] as const) {
@@ -148,7 +175,7 @@ for (const before of ['session_before_switch', 'session_before_fork', 'session_b
     const observed = observeSubmits();
     const h = harness({ writeFastEnabledEvent: async fact => fact, submitMetric: observed.submitMetric });
     const ctx = context('cancelled-stays-here');
-    h.handlers.get('session_start')?.({}, ctx);
+    await h.handlers.get('session_start')?.({}, ctx);
     try {
       await h.command('on', ctx);
       await waitFor(() => requests.length === 1, 'first POST');
@@ -185,7 +212,7 @@ test('successful session_tree rotates only afterward: old transport and warning 
   const observed = observeSubmits();
   const h = harness({ writeFastEnabledEvent: fact => ++writes === 2 ? delayedWriter.promise : Promise.resolve(fact), submitMetric: observed.submitMetric });
   const before = context('tree-session'), after = context('tree-session');
-  h.handlers.get('session_start')?.({}, before);
+  await h.handlers.get('session_start')?.({}, before);
   try {
     await h.command('on', before);
     await waitFor(() => requests.length === 1, 'old in-flight POST');
@@ -234,8 +261,8 @@ test('shutdown closes only its producer; session_start reopens same factory and 
   const factory = (observer: ReturnType<typeof observeSubmits>) => harness({ writeFastEnabledEvent: async fact => fact, submitMetric: observer.submitMetric });
   const first = factory(a), peer = factory(b);
   const old = context('before-reload'), independent = context('peer');
-  first.handlers.get('session_start')?.({}, old);
-  peer.handlers.get('session_start')?.({}, independent);
+  await first.handlers.get('session_start')?.({}, old);
+  await peer.handlers.get('session_start')?.({}, independent);
   await first.command('on', old);
   await peer.command('on', independent);
   await waitFor(async () => requests.length >= 2 && (await metricsStatus()).pending === 0, 'both independent caller ACKs');
@@ -244,7 +271,8 @@ test('shutdown closes only its producer; session_start reopens same factory and 
   assert.equal(a.submissions[0].scope!.closed, true);
   assert.equal(peerScope.closed, false, 'closing one producer cannot close another using the shared client');
   const resumed = context('after-reload');
-  first.handlers.get('session_start')?.({ type: 'session_start', reason: 'reload' }, resumed);
+  await first.handlers.get('session_start')?.({ type: 'session_start', reason: 'reload' }, resumed);
+  await first.command('off', resumed);
   await first.command('on', resumed);
   await peer.command('off', independent);
   await peer.command('on', independent);

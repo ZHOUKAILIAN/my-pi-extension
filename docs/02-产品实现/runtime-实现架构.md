@@ -99,6 +99,18 @@ flowchart TD
 | 有限重试 | 留在同一个 Node Execution 中并记录 attempt |
 | 并行提案、独立 Review 或复核 | 创建独立 Node Execution，以保持身份和 Artifact 来源清晰 |
 
+### SDK Worker 本机功能接线（REVIEWING，未实现）
+
+`PiSdkWorkerExecutor` 接受调用方提供的 `MachineExtensionsBundleV1`：版本1，按本次执行的固定settingsFile和subagent类型创建factory列表与幂等shutdown(deadline)句柄。Runtime只依赖结构合同和公共Pi SDK，不反向导入Fast/Async入口。未提供、缺包或不兼容时明确capability inactive，继续原有工作；实际入口负责安装/构造bundle。
+
+每次execute使用独立DefaultResourceLoader；`resourceLoaderFactory(context.createDefault)`允许调用方资源与两项绑定factory在同一个runtime/event bus中构造，reload沿用闭包绑定。不拼接不同loader的Runtime、不用未声明SessionStartEvent字段、不修改全局env。旧resourceLoader实例保留原合同，但不声称新能力已托管；Node工具/Skill/Artifact约束不变。
+
+真实生命周期是 `createAgentSession → await bindExtensions({mode:'print', onError:安全诊断}) → prompt/Artifact尝试 → live close fence → owned cleanup + 全Runtime shutdown → dispose`。外层finally覆盖ordinary/live成功、错误、取消和部分create/bind失败。受控createDefault在extensionsOverride及reload的resolveProjectTrust回调前记录本loader创建的incoming Runtime为owned；用户返回不同Runtime立即拒绝，不取得foreign所有权、不instrument/不invalidate，未采用对象由用户callback负责。override只筛选/重排本次描述，自定义代码用同Runtime的factory构造。所有reload（含Session内部）Proxy在finally观察getExtensions，但只有来源明确的owned Runtime才可回收；失败的新未移交R即时失效，最终shutdown/dispose后对全部owned R幂等invalidate，覆盖skill/override/内部reload失败；不把借用/观察当所有权。legacy隐藏或借用R保留原caller合同，不冒称已清理。可选bundle构造失败须事务化释放已创建组件。真实公共onError绑定既投影固定无路径诊断，也确保Pi1.1.0 reload的hasBindings条件成立，使新generation确实收到session_start；只绑定mode不足。live必须先保持订阅有效，在原串行队列完成closeWorker的supplement/Artifact校验、durable fence和Registry注销，再进入扩展drain；close/WAL一致性失败保留原失败恢复语义，不按可选cleanup吞掉，并停止该失效实例volatile admission而不伪造durable fence。
+
+Runner生命周期独立于Runtime所有权：首次bind前包装公共session.extensionRunner.emit，记录真实start/shutdown进入与完成；包装公共session.reload，通过其公开beforeSessionStart hook在新Runner建成后、start前安装同一观察，再执行用户hook。旧Runner reload已shutdown或已失效时不额外quit；构造后未观察start的新Runner也不额外quit，只清理owned资源。公开方法仅委托/观察，其他事件/结果及compaction getter保持原语义，不改handlers、不新增Extension/私有字段或metadata。SDK dispose不会发session_shutdown；bundle句柄先同步fence/abort/结束计时/关闭producer，再由Executor作为host经公开session.extensionRunner.emit发起真实有界顺序shutdown广播（该getter/方法为公共类型，与官方Runtime相同）；仅全部handler在截止前响应时核验成对收齐。两项drain及广播共享绝对至多1秒预算，owned事件重入幂等，不等网络；finally dispose全部session、解绑剩余订阅。前置handler挂起时，后续handler可能未收到事件，统一标清理不完整/未知；对未结算emit挂完成/错误观察防止unhandled rejection，超时不等于取消派发。无响应第三方只作有界等待后失效，不能承诺杀死任意外部任务；可选清理故障不替换原业务/强制控制错误。reload与最终清理按generation幂等，晚SDK写被失效runtime拒绝。
+
+WorkerProgress分别以capability=fast|async_compaction、status=active|inactive和有限reason（no_bundle/missing_package/import_failed/peer_incompatible/legacy_loader/unbound_factory/conflict/unsupported_host/available）报告每项装配状态；active只表示绑定可用而非开关On，不改变Run/Guard/Artifact；调用方必须消费，缺消费者或消费者异常时一次固定stderr提示兜底。源码当前还未bind启动/统一清理及bundle接线，不能用旧候选测试声称已支持。
+
 ## 隔离实现
 
 | 控制面 | L2 实现责任 | 不得声称 |

@@ -11,7 +11,7 @@
     "metrics": "node --experimental-strip-types packages/project-metrics/src/cli.ts"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-coding-agent": "1.1.0",
     "node-test-brief": "https://github.com/ZHOUKAILIAN/node-test-brief/archive/b37e566573743243458bba033fca2b127df1cee6.tar.gz",
     "typescript": "^5.7.0"
   }

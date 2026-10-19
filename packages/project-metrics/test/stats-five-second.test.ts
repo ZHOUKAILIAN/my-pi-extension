@@ -8,9 +8,11 @@ import { queryMetricStats, statsFailureCode } from '../src/client.ts';
 function stats() {
   const today = new Date().toISOString().slice(0, 10);
   const day = (n: number) => new Date(Date.parse(`${today}T00:00:00.000Z`) - n * 86400000).toISOString().slice(0, 10);
-  return { coverage: 'received_only', status: 'no_received_data', watermark: 0, asOf: new Date().toISOString(), dataset: 'validation', days: 1,
+  const base = { coverage: 'received_only', status: 'no_received_data', watermark: 0, asOf: new Date().toISOString(), dataset: 'validation', days: 1,
     completeDays: { from: day(1), to: day(1), baselineDay: day(2), overallAggregates: [], overallComparisons: [], aggregates: [], comparisons: [] },
     unlocatedByReceivedDay: [], unlocatedOverallByReceivedDay: [], todayInProgress: { day: today, comparison: false, overallReceivedAggregates: [], receivedAggregates: [] }, truncated: false };
+  const view = { completeDays: { aggregates: [], comparisons: [] }, unlocatedByReceivedDay: [], todayInProgress: { receivedAggregates: [] }, truncated: false };
+  return { schemaVersion: 2, base, byAgentType: { main: view, subagent: view, unknown: view } };
 }
 async function fixture(t: { after(fn: () => Promise<void>): void }) {
   const root = await mkdtemp(join(await realpath(tmpdir()), 'metrics-stats-clock-'));
@@ -44,7 +46,7 @@ async function until(check: () => boolean) {
     t.mock.timers.tick(2100);
     assert.equal(aborts, 0, 'the previous two-second abort would reject the request here');
     reply(new Response(JSON.stringify(stats()), { status: 200 }));
-    assert.equal((await result as { coverage: string }).coverage, 'received_only');
+    assert.equal((await result as { base: { coverage: string } }).base.coverage, 'received_only');
   } finally { t.mock.timers.reset(); }
 });
 
