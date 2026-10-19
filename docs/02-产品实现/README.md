@@ -13,7 +13,7 @@
 | Fix 的可执行 Node/状态图与业务 Guard | 状态图/边/约束在 `packages/fix/src/definition.ts`（`fixDefinitionV2`）；执行门禁（review kind 映射、`root_cause_alignment` 等 check satisfier、`DISPOSITION→IMPLEMENTING` 的 change_plan_review gate）仍在 `packages/workflow-runtime`，owner 待拆（见 drift 表） |
 | Artifact 合同与运行行为证据 | 对应 `packages/*/test/` |
 | 全部 Agent 的本机 Fast 开关 | [Fast 目标接线与当前差距](codex-usage-status-技术设计.md#0-本机统一开关的目标设计)；现有扩展内改造，目标尚未实现 |
-| 异步压缩与耗时 | [Async 目标接线与当前机制](async-compaction-技术设计.md#0-全部-agent-的目标接线待对齐)；已有隔离预览，全部 Agent 目标尚未实现 |
+| 异步压缩与耗时 | [Async 目标接线与当前机制](async-compaction-技术设计.md#0-全部-agent-的目标接线评审中)；已有隔离预览，全部 Agent 目标尚未实现 |
 | 当前 Fix 实现机制说明 | [Fix Runtime 技术设计](fix-runtime-technical-design.md) |
 | Subagent Dispatcher 当前实现 | [Subagent Dispatcher 技术设计](subagent-dispatcher-技术设计.md)；`@pi/subagent` 是通用 child dispatcher，不属于 Workflow Run；既有Child Session与完整attempt diagnostics执行结果基线、切片0 bridge-v1 本地安全实现保持；切片1+2已增加 gated v2 Call/Delegation WAL、完整 request-digest 幂等交叉校验、required reference-before-admitted admission、private payload/provenance、parent-bound resolver、FD-bound snapshot、持久 branch identity、全局协调 orphan cleanup、final-only 可幂等 proof、paused-first config revision/WAL convergence 与 no-spawn startup normalization，但写 API 仍只从 `delegation-internal.ts` 暴露，未接 v1 execution，capability 全 false；slice4a 已增加 gated internal strict-cancel control foundation；slice4b 已增加 gated call-wide/chain cancellation orchestration（同 Call lock/CAS、稳定 receipt、三类 required-slot settlement、return/cancel fence、cancelled Call proof、startup/replay convergence）；slice4c 已增加 gated internal original-call interruption、normal host-result observation、owner-only custom outbox/receipt scan 与 delivery abandon foundation，仍只承诺 at-most-once；slice5a 已增加 gated durable action ledger/replay/projection、intent-before-handler/result-ACK/unknown watchdog seam、显式 uncertainty disposition、post-spawn cancel terminate/death/action reconciliation 与 returned/outstanding-action guard；slice5b 新增 gated real Pi side-effect fence adapter、allowlist/privacy proof、IPC ACK、watchdog 与 runner/supervisor wiring，仍不接运行中 v1 adapter；slice6 新增 gated internal delete/retention cleanup foundation，覆盖 strict preflight、durable plan/freeze、CallAggregateProof/reference release、stable cursor/cascade、known-only private/action/result prune、orphan cleanup、exact tombstone/30-day GC 与 startup resume。公开/root adapters 与 capability enable 仍 disabled；真实 OS power-loss、跨进程/provider/TUI/RPC E2E、adoption/migration 仍未实现或验证。 |
 
@@ -62,7 +62,7 @@ L1 Extension 规范描述 Stage、Artifact、Guard 和 Acceptance 的产品语�
 | Fast 的全部 Agent、本机配置与旧继承 | [Fast §6](codex-usage-status-技术设计.md#6-l1-对应差距与未决项) | 目标方案 `ALIGNING`；不是现有全机能力 |
 | Async 的 headless、SDK、计时和采用安全 | [Async §9.1](async-compaction-技术设计.md#91-全部-agent-目标的差距) | 当前仅隔离预览；全部范围未实现 |
 | Dispatcher 的启动、继续与恢复加载 | [Subagent §6.2](subagent-dispatcher-技术设计.md#62-目标接线aligning未实现) | 旧 role/source/首次 spawn 条件仍在，SDK Worker 也须单独验证 |
-| 本地功能与远端来源许可 | [项目指标接线设计](项目指标-技术设计.md#本机开关与-agent-范围的接线设计aligning) | 不因统一开关或计时展示自动扩大 CF 来源 |
+| 本地功能与远端来源许可 | [项目指标接线设计](项目指标-技术设计.md#本机开关与-agent-来源接线设计reviewing) | 不因统一开关或计时展示自动扩大 CF 来源 |
 
 ### Subagent Dispatcher
 

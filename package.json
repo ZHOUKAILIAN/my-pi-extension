@@ -1,6 +1,15 @@
 {
   "name": "pi-native-workflow-runtime",
+  "version": "0.1.0",
   "private": true,
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "packages/fix/src/extension.ts",
+      "packages/codex-usage-status/src/index.ts",
+      "packages/subagent/src/index.ts"
+    ]
+  },
   "workspaces": [
     "packages/*"
   ],

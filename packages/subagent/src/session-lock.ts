@@ -43,6 +43,8 @@ export interface LockOptions {
   listProcesses?: () => Promise<readonly ProcessInfo[] | undefined>;
   now?: () => Date;
   startingGraceMs?: number;
+  /** Disable stale-owner takeover when unlinking a lock could race publication. Defaults to enabled. */
+  allowStaleOwnerRecovery?: boolean;
 }
 
 const DEFAULT_STARTING_GRACE_MS = 5_000;
@@ -177,6 +179,7 @@ export async function acquireIdentityLock(options: LockOptions): Promise<LockHan
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    if (options.allowStaleOwnerRecovery === false) return undefined;
     const existing = await readLock(lockPath);
     // An unreadable/legacy lock is an unknown owner and therefore fail closed.
     const exists = options.processExists ?? processExists;

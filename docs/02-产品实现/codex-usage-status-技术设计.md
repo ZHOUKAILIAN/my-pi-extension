@@ -82,7 +82,7 @@ flowchart LR
 | [`machine-settings.ts`](../../packages/codex-usage-status/src/machine-settings.ts) | 机器 settings.json 的 Fast 字段读写、锁、路径校验与 shutdown budget |
 | [`fast-enabled-event.ts`](../../packages/codex-usage-status/src/fast-enabled-event.ts) | 每次有效用户开启写一份独立私有的本地事件文件；不处理读取或偏好恢复 |
 
-`session_start` 恢复本机偏好，`input` 和 `/fast` 命令边界刷新跨窗口提交；命令内被接受的磁盘刷新先同步真实 FastController，再基于刷新后的 requested 执行命令转换。只有用户命令导致运行 requested 实际 Off→On 才计一次开启事件，外部刷新本身不计。模型切换与 `agent_settled` 更新运行状态。`before_provider_request` 交给 Fast 改写请求，`message_end` 处理费用。`session_shutdown` 发布 requested=false 并清理运行状态，但不把 Off 写回偏好。Fast 不监听通用 compaction；压缩耗时由 Async 包独立监听原生 compaction 终态。
+`session_start` 恢复本机偏好，`input` 和 `/fast` 命令边界刷新跨窗口提交；命令内被接受的磁盘刷新先同步真实 FastController，再基于刷新后的 requested 执行命令转换。只有用户命令导致运行 requested 实际 Off→On 才计一次开启事件，外部刷新本身不计。模型切换与 `agent_settled` 更新运行状态。`before_provider_request` 交给 Fast 改写请求，`message_end` 处理费用。`session_shutdown` 清理本实例运行状态和 UI，不把 Off 写回本机偏好，也不发布旧的 `fast-requested/v1` 会话事件。Fast 不监听通用 compaction；压缩耗时由 Async 包独立监听原生 compaction 终态。
 
 ## 2. 额度查询与展示
 
@@ -163,7 +163,7 @@ flowchart LR
 
 ### 本地开启事件 producer
 
-`index.ts` 的 `/fast` handler 将本机偏好刷新和命令转换放在同一串行队列；可接受磁盘值先同步 FastController，再捕获真实命令前状态、执行目标转换并尝试保存。机器偏好路径只在实际 Off→On 命令转换时捕获开启事实；外部刷新产生的 Off→On、重复 On、Off 方向、`status`、非法/非 UI 命令均不计。非机器偏好兼容路径仍按运行状态判断。通知或 requested bus 发布在状态改变后抛错时仍尝试保存及事件记录，并保留原业务错误；本机偏好保存失败仍尝试固定警告 `Fast 仅当前实例生效；本机偏好保存无法确认。`，警告异常不替换原错误，Fast 不回滚。事件写入失败另尝试既有固定警告 `本次计量记录无法确认`。启动、child 继承、模型切换和 shutdown 不调用 producer。RPC 的 `hasUI=true` 命令与 TUI 同口径，模型 Inactive 时仍记录用户 requested 意图。
+`index.ts` 的 `/fast` handler 将本机偏好刷新和命令转换放在同一串行队列；可接受磁盘值先同步 FastController，再捕获真实命令前状态、执行目标转换并尝试保存。机器偏好路径只在实际 Off→On 命令转换时捕获开启事实；外部刷新产生的 Off→On、重复 On、Off 方向、`status`、非法/非 UI 命令均不计。非机器偏好兼容路径仍按运行状态判断。通知在状态改变后抛错时仍尝试保存及事件记录，并保留原业务错误；本机偏好保存失败仍尝试固定警告 `Fast 仅当前实例生效；本机偏好保存无法确认。`，警告异常不替换原错误，Fast 不回滚。事件写入失败另尝试既有固定警告 `本次计量记录无法确认`。启动、child 继承、模型切换和 shutdown 不调用 producer。RPC 的 `hasUI=true` 命令与 TUI 同口径，模型 Inactive 时仍记录用户 requested 意图。
 
 producer 用 Pi 0.84.4 公开的 `getAgentDir()`，在 `<agentDir>/metrics/codex-fast-enabled/v1/` 写入每次开启的独立 `<eventId>.json`。JSON 精确字段为 `{ "schemaVersion": 1, "eventId": "UUID", "occurredAt": "UTC ISO 8601", "source": "user_command" }`；文件名中的 UUID 与内容一致。`metrics`、`codex-fast-enabled`、`v1` 创建时均为 `0700`；已存在的自有目录必须是 `0700`，符号链接或非目录拒绝，拒绝不合规权限而不调整 Pi 根或其他目录。事件临时文件 `0600`，先完整写入并同步，再通过排他 hard link 提交到最终文件名，提交后删除临时文件；已存在的文件/链接不覆盖。只有完整合法的 `.json` 文件可按 eventId 去重计数，`.tmp`、损坏或未完成文件不计成功；当前没有读取方。此目录是本地元数据而非 outbox；不会扫描旧文件作远端回填，崩溃/断电前未完成的 I/O 不保证保存。成功提交的记录ID和时间由命令接缝交给[项目指标投递链](项目指标-技术设计.md)，仅在显式配置启用时入独立私有outbox。
 
@@ -189,19 +189,24 @@ producer 用 Pi 0.84.4 公开的 `getAgentDir()`，在 `<agentDir>/metrics/codex
 | --- | --- |
 | Fast、FIFO、费用、通知、hooks 及开启事件命令链 | [`fast-mode.test.ts`](../../packages/codex-usage-status/test/fast-mode.test.ts) |
 | 机器偏好刷新、保存、跨窗口 Off→On 计数与 headless 隔离 | [`fast-mode.test.ts`](../../packages/codex-usage-status/test/fast-mode.test.ts) |
-| 候选通用压缩诊断 | [`compaction-duration.test.ts`](../../packages/codex-usage-status/test/compaction-duration.test.ts)；测试描述当前候选，不代表由 Fast 承担压缩展示的目标方案已采纳 |
+| 通用压缩阶段耗时诊断 | [`timing.test.ts`](../../packages/async-compaction/test/timing.test.ts)；该能力由 Async package 拥有，不代表由 Fast 承担压缩展示 |
 | 本地事件 schema、私有权限、排他写入、链接与非目录拒绝 | [`fast-enabled-event.test.ts`](../../packages/codex-usage-status/test/fast-enabled-event.test.ts) |
-| Fast 0.84.4 真实RPC命令与本地Worker loopback | 已执行离线：Off→On有效命令得到2条本地记录、2条已接收，pending=0；不是Cloudflare验收 |
+| Fast Pi 0.84.4 历史 RPC 命令与本地 Worker loopback | 历史离线验证：Off→On 有效命令得到 2 条本地记录、2 条已接收，pending=0；不是当前新版宿主兼容承诺，也不是 Cloudflare 验收 |
 | 额度 DTO、授权、刷新、过期、UI 与副作用 | [`usage.test.ts`](../../packages/codex-usage-status/test/usage.test.ts) |
 | 仓库内 child 继承接线 | [`fast-inheritance.test.ts`](../../packages/subagent/test/fast-inheritance.test.ts) |
 | 持久化、PTY 与双进程自检 | 候选有测试和部分本地合成 provider 运行记录，但尚未按全部 Agent 目标独立验收；不将只读取共享文件或旧 profile 通过当作请求实际全机生效 |
+| Pi 1.0.4 / 1.1.0 loader、ExtensionRunner、本机偏好、UI widget、请求替换、AI cost helper 与 shutdown | `pi-1.0.4-compat.test.ts` 为两版宿主建立临时安装夹具，安装 `proper-lockfile` 并连接宿主 peer；真实 loader/runner 检查 priority 请求、偏好持久化与外部刷新、退出不关闭本机开关、不发送旧 v1 事件，以及 UI 清理、组件 factory/`belowEditor`/ANSI 截断和 `calculateCost`。两版 smoke 已执行，无模型 HTTP 请求；分别以 `PI_CODING_AGENT_1_0_4_PATH` / `PI_CODING_AGENT_1_1_0_PATH` 指向对应 package 运行该测试，缺少路径时跳过。该证据不沿用旧会话级 Fast 测试结论，也不等于全部 Fast/额度/TUI/provider/child 流程兼容验收；依赖安排见 [项目配置](../03-项目落地/项目配置.md#pi-package-依赖安排) |
+| Pi 1.0.4 tree cancellation | ExtensionRunner 源码确认 before-event 的 `{ cancel: true }` 会提前返回，AgentSession 只在未取消的流程后发 `session_tree`；package 的取消/退出隔离仍由 `fast-nonblocking.test.ts` 模拟接缝验证，未以真实 SessionManager 执行 tree 导航 |
+| 真实交互式终端、真实账户额度请求、provider 对外请求及真实 child spawn | 未验证；兼容 smoke test 不访问凭据、不发模型请求，也不构成 TUI/provider/child E2E |
 | 安装与宿主依赖 | [项目配置](../03-项目落地/项目配置.md#pi-package-依赖安排)，以 manifest/lockfile 为准 |
 
-扩展只保证自身 hook 的输出。Pi 0.84.4 没有最终 payload 或最终持久化 message 的可观测 hook：后续请求 handler 可能改写 priority，其他消息 handler 可能改写 model/session、usage token 或 cost。因此支持费用关联与持久化结果的组合要求这些输入和结果不被其他 handler 改变；不能从 Active 推断 provider 接受 priority、实际加速或最终费用。
+扩展只保证自身 hook 的输出。Pi 0.84.4 与 1.0.4 均没有最终 provider payload 或最终持久化 message 的可观测 hook；1.0.4 增加的 `before_provider_headers` 只允许修改请求头，不能证明最终请求 payload。后续请求 handler 可能改写 priority，其他消息 handler 可能改写 model/session、usage token 或 cost。因此支持费用关联与持久化结果的组合要求这些输入和结果不被其他 handler 改变；不能从 Active 推断 provider 接受 priority、实际加速或最终费用。
 
 额度失败不阻塞、取消或改变模型请求；本扩展不自动重试/fallback 模型请求。授权和 usage 接口是外部依赖，不能可靠读取时显示不可用，不估算额度。
 
 自动化入口为根目录 `npm run test:agent` 与 `npm run typecheck`。已有固定 revision 的[验证记录](../归档/评审/codex-usage-status-fast-gpt-v1-交付记录.md)不替代目标设计的新验收。
+
+<a id="6-l1-对应差距与未决项"></a>
 
 ## 6. 当前差距与未决项
 

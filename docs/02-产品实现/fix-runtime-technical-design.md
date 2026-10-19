@@ -1307,6 +1307,8 @@ Node execution、身份、Guard、checkpoint；业务门禁 owner 待拆]
 
 ## 9. 验证入口
 
+`scripts/release-install.test.ts` 以当前源码和 lockfile 为安装对象，在临时目录执行生产依赖安装，并通过 Pi 1.0.4、1.1.0 的真实 loader/runner 检查三扩展组合：`/fix` 注册、空参数返回用法、没有活跃 Worker 时允许导航、`session_start/shutdown` 无宿主吞掉的异常。两版 smoke 已执行；未提供对应 `PI_CODING_AGENT_1_0_4_PATH` / `PI_CODING_AGENT_1_1_0_PATH` 时该分支跳过，不能视为通过。测试不读取个人凭据、不创建真实 Worker。Fix 的宿主 AI/SDK/TUI 仍声明为 peer，不携带自己的固定 TUI runtime；Workflow Runtime 的 AI/SDK/TUI 1.1.0 是独立生产依赖，不能断言整个安装目录没有 Pi 包。安装 smoke 验证这些依赖的版本及可导入性，不证明实际 Worker 的解析隔离；真实 provider、Worker 执行、编辑器和恢复全流程仍未验收。固定发布 Tag 的历史验证与当前源码 smoke 不互相替代。
+
 实现变化后至少运行：
 
 ```bash

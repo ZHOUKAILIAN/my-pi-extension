@@ -1,0 +1,113 @@
+name: AI review
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number (owner-triggered authorization)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+concurrency:
+  group: ai-review-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    name: ai-review / authorization
+    runs-on: ubuntu-latest
+    outputs:
+      eligible: ${{ steps.gate.outputs.eligible }}
+      pr: ${{ steps.gate.outputs.pr }}
+      head: ${{ steps.gate.outputs.head }}
+      base: ${{ steps.gate.outputs.base }}
+      dispatch: ${{ steps.gate.outputs.dispatch }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_PATH: ${{ github.event_path }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_PR: ${{ inputs.pr_number }}
+          REPOSITORY: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
+        run: node scripts/ci/authorize.mjs
+
+  review:
+    name: AI review orchestration
+    needs: authorize
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+      statuses: write
+    if: needs.authorize.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: ai-review
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24
+      - name: Install isolated, locked Pi runtime
+        id: install
+        run: npm ci --ignore-scripts --prefix .github/ai
+      - name: Create review snapshot and run both independent reviews
+        id: review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_ENVIRONMENT_TOKEN: ${{ secrets.CI_ENVIRONMENT_TOKEN }}
+          PI_CI_AUTH_JSON: ${{ secrets.PI_CI_AUTH_JSON }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          EXPECTED_HEAD: ${{ needs.authorize.outputs.head }}
+          EXPECTED_BASE: ${{ needs.authorize.outputs.base }}
+          DISPATCH: ${{ needs.authorize.outputs.dispatch }}
+          REPOSITORY: ${{ github.repository }}
+        run: node scripts/ci/run-review.mjs
+      - name: Persist refreshed OAuth credential (always)
+        id: save_auth
+        if: always()
+        env:
+          CI_ENVIRONMENT_TOKEN: ${{ secrets.CI_ENVIRONMENT_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_HEAD: ${{ needs.authorize.outputs.head }}
+          REPOSITORY: ${{ github.repository }}
+        run: node scripts/ci/save-auth.mjs
+      - name: Finalize the single review status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ needs.authorize.outputs.pr }}
+          EXPECTED_HEAD: ${{ needs.authorize.outputs.head }}
+          EXPECTED_BASE: ${{ needs.authorize.outputs.base }}
+          AUTH_OUTCOME: ${{ needs.authorize.result }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          RUN_OUTCOME: ${{ steps.review.outcome }}
+          SAVE_OUTCOME: ${{ steps.save_auth.outcome }}
+          REVIEW_RESULT: ${{ steps.review.outputs.result }}
+          SPEC_FINGERPRINT: ${{ steps.review.outputs.spec_fingerprint }}
+        run: node scripts/ci/finalize.mjs

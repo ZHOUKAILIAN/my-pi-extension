@@ -34,12 +34,25 @@ export async function ensureActorScopeSecret(rootDir: string): Promise<Buffer> {
   const d = await ensureStore(rootDir);
   const existing = readActorScopeSecret(rootDir);
   if (existing) return existing;
-  try { nodeFs.lstatSync(d.actorSecret); throw new Error("actor scope secret exists but is not verifiable"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const secret = randomBytes(32);
-  await atomicOwnerJson(d.actorSecret, { version: 1, secret: secret.toString("hex") });
-  const verified = readActorScopeSecret(rootDir);
-  if (!verified) throw new Error("actor scope secret durability cannot be proven");
-  return verified;
+
+  // The fixed .pending path in atomicOwnerJson is safe here only while all
+  // initializers (including other processes) are serialized by this lock.
+  // Re-read after acquisition so every caller returns the one durable winner.
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    const result = await withIdentityLock({ rootDir: d.root, key: "actor-scope-secret-init", allowStaleOwnerRecovery: false }, async () => {
+      const current = readActorScopeSecret(rootDir);
+      if (current) return current;
+      try { nodeFs.lstatSync(d.actorSecret); throw new Error("actor scope secret exists but is not verifiable"); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+      const secret = randomBytes(32);
+      await atomicOwnerJson(d.actorSecret, { version: 1, secret: secret.toString("hex") });
+      const verified = readActorScopeSecret(rootDir);
+      if (!verified || !verified.equals(secret)) throw new Error("actor scope secret durability cannot be proven");
+      return verified;
+    });
+    if (result) return result;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("actor scope secret initialization lock is unavailable");
 }
 export function actorScopeSecretPath(rootDir: string): string { return dirs(rootDir).actorSecret; }
 export function readActorScopeSecret(rootDir: string): Buffer | undefined {
