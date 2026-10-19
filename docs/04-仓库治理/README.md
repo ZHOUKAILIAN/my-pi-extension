@@ -14,6 +14,6 @@
 - 产品行为变化先更新 L1；L2 同步实现，或明确记录尚未实现的 drift。
 - 纯实现修复或重构若不改变产品契约，只更新 L2 和验证证据。
 - package、目录、构建或项目默认变化必须同步第三层。
-- Agent 优先运行 `npm run test:agent` 和 `npm run typecheck`；`test:agent` 执行与 `npm test` 相同的完整测试范围。
-- 文档移动或链接变化必须检查仓库内 Markdown 相对链接。
+- 代码可用、五层一致性和 Code Review 分别给出结论，见 [三项交付检查](GitHub维护流程.md#三项交付检查)。
+- Agent 自检、CI 执行与合并约束分开维护，见 [执行分工](GitHub维护流程.md#agent-与-ci-的职责)；自动/手动 AI 授权及启用条件见 [云端检查](GitHub维护流程.md#github-云端检查与授权)。
 - 第五层临时状态和归档材料不得被当作正式执行规则。
