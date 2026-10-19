@@ -42,6 +42,27 @@ test("stale pre-spawn dispatcher lock is safely reclaimed when no child PID exis
   await fs.rm(root, { recursive: true, force: true });
 });
 
+test("stale-owner recovery can be disabled without changing the default takeover behavior", async () => {
+  const root = await tempRoot();
+  const locks = path.join(root, "locks");
+  await fs.mkdir(locks, { recursive: true });
+  const exitedOwner = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  assert.ok(exitedOwner.pid);
+  await new Promise<void>((resolve) => exitedOwner.once("exit", () => resolve()));
+  const lockPath = path.join(locks, "identity.lock");
+  const stale = JSON.stringify({ host: os.hostname(), pid: exitedOwner.pid, token: "stale-owner", createdAt: new Date(0).toISOString(), child: { state: "idle" } });
+  await fs.writeFile(lockPath, stale, { mode: 0o600 });
+
+  const blocked = await acquireIdentityLock({ rootDir: root, key: "identity", allowStaleOwnerRecovery: false });
+  assert.equal(blocked, undefined);
+  assert.equal(await fs.readFile(lockPath, "utf8"), stale);
+
+  const recovered = await acquireIdentityLock({ rootDir: root, key: "identity" });
+  assert.ok(recovered);
+  await recovered.release();
+  await fs.rm(root, { recursive: true, force: true });
+});
+
 test("starting grace refuses takeover before child PID registration", async () => {
   const root = await tempRoot();
   const locks = path.join(root, "locks");

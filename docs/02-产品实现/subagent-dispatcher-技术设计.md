@@ -622,6 +622,18 @@ single orphan Delegation retention使用独立但同原则的Delegation fence：
 
 `call_delegation_reference_added`必须不晚于Delegation admission。replay拒绝缺reference admission、proof不覆盖required slots、先release后proof、错slot/矛盾重复release、release后outcome回退。重复delete由当前认证actor重算tag并恒定时间比较；匹配则续做或返回completed，不匹配/secret不可验证则fail closed。keyring owner-only且旧key保留到相关30天tombstone全部GC。
 
+当前 actor-scope secret 的初始化由 `delegation-context.ts` 持有；delete/replay 只读取，不补建密钥。
+
+| 初始化状态 | 当前机制 |
+| --- | --- |
+| 已有可验证密钥 | 直接复用，不覆盖或轮换 |
+| 首次并发初始化 | admission 在后续协调锁之前，竞争 v2 store 的 `actor-scope-secret-init` identity lock，并设置 `allowStaleOwnerRecovery: false`；锁内重读，仅在密钥仍不存在时生成并原子写入，验证落盘值与生成值一致后返回 |
+| 锁争用或写入异常 | 锁争用有限重试，耗尽后失败；写入异常释放锁并向调用方报告，不把未验证值当成功 |
+| 初始化锁残留且密钥缺失 | 不自动接管，即使旧 owner 已退出也不删除该锁；有限等待后失败。只有确认无初始化写入者后才可受控清理残留锁并重试，不承诺自动崩溃恢复 |
+| 已有密钥不可验证 | 拒绝初始化，不覆盖损坏文件、符号链接或硬链接；不以重新生成密钥修复完整性问题 |
+
+该初始化锁复用现有跨进程 identity lock，并单独禁用 stale-owner 接管；其他调用方的默认恢复行为不变。自动化覆盖同进程和独立进程的并发初始化、旧锁并发争用时的保守拒绝，不等同于真实 OS power-loss 或完整 adoption 恢复验收。
+
 GC/cleanup固定锁序为：`Call cleanup owner/fence → Call references（stable slot order）→ Delegation owner（同order）→ v2 child identity → v1 adoption source → preservation marker/namespace tombstone → private/proof store → tombstone/keyring`；GC不得逆序取锁，也不得在持有后级锁时回取前级锁。single orphan从`Delegation owner`位置进入。startup delete/cleanup reconciler覆盖single proof后/release前、whole Call request/freeze后、每个reference release/cascade前后、private删除前后、proof删除前后、tombstone前后和completion前等kill points；任何路径只续删不复活。
 
 #### Bridge-v1 先行与独立 v2 child namespace
