@@ -124,7 +124,7 @@ flowchart TD
 | `index.ts` | 注册命令、turn 和原生压缩 hooks；交付候选并确认实际采用 |
 | `controller.ts` | 管理开关、会话代际、后台模型请求与响应结算、内存候选、冷却和取消 |
 | `compaction.ts` | 稳定前缀选择、摘要提示词构造、文件记录、来源及预算校验 |
-| `reporting.ts` | 按需过程提示、用量记录和去重 |
+| `reporting.ts` | 按需过程提示、用量记录和去重；后台失败的安全分类、非上下文记录与展示 |
 | `timing.ts` | Async 后台生成与符合条件的 threshold 前台阶段计时、epoch 隔离及历史 renderer |
 | `duration.ts` | 当前主 TUI 的通用阶段 observer 与 renderer 候选；目标扩展到全部入口，本地记录不使用 project-metrics |
 | `packages/async-compaction/src/machine-settings.ts`、`duration-schema.ts` | 本包专用偏好 I/O 与耗时合同；不引入共享状态层 |
@@ -239,6 +239,24 @@ threshold 路径依次执行：
 每次尝试单独记录已知 usage：SDK 合成的全零用量或没有可证明计量的响应标为 unknown，不解释为免费；error/aborted 响应有正数计量时保存这些值并标为 partial（余量未知）；stop/length/toolUse 的正数计量标为 reported。以物理响应终结状态而非本地取消标志判断完整性，迟到成功响应可为 reported。采用结果的已知 usage 交给原生 CompactionEntry；未采用请求需额外账目，不能假定自动进入原生会话总计。不进入模型上下文的 custom usage entry 记录 attemptId、型号、终态、已知用量及采用关系，详情按需展开，常规行展示已知 input/output/cache/total tokens 与 SDK 估算 cost，展开行显示费用分项及 reasoning/cacheWrite1h 子集；partial 保留已知数和未知余量，unknown 不标为零。已采用计入原生 totals，额外请求单列，避免重复。
 
 候选和原文副本只保存在内存，不新增摘要缓存文件。usage 及阶段耗时诊断只通过 Pi 非模型上下文 custom entry 写入 Session JSONL，不新增独立数据库或传输；阶段记录为 schemaVersion 1，包含 sampleId、kind、startedAtUTC（时钟不可读时为 null）、durationMs、outcome、model/provider 和有限 unknownReason；时钟无效或物理终态不可观察时，durationMs 为 null 且 outcome 为 unknown，不伪造纪元时间或零耗时。不保存会话标识、原始 prompt、headers、provider body 或凭证。后台生成从 streamSimple 调用前开始，在 result resolve/reject 第一时间单调计时结算；前台阶段从符合条件的 threshold handler 入口开始，到宿主 compact/compact_failed 入口结算。阶段结束后以两个独立 renderer 标签显示秒数或“未知”。`reporting.ts` 对 progress/usage append 的公共出口做 best-effort 隔离，Controller 与命令提示异常也不传播到模型/原生 hook；诊断写入失败时不宣称记录成功、不补造样本、不重试，继续既有候选、取消、usage 与原生压缩路径。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复；`--no-session` 记录仅在当前进程可见。
+
+### 后台失败诊断
+
+后台失败通过 `async-compact-failure` 非模型上下文 custom entry 留在当前 Session，`schemaVersion: 1`、`attemptId` 与对应 usage 关联。它说明可观察到的失败阶段和响应形态，不等于已确定 provider 根因；历史记录缺失时不回填，也不从诊断恢复任务。
+
+| 字段 / 路径 | 当前记录边界 |
+| --- | --- |
+| `stage` | `stream_simple` 调用、`result` 观察/拒绝、`response` 校验、`response_processing` 本地处理 |
+| `reason` | 非正常结束、空文本、仅思考、非预期内容、畸形响应、同步抛错、Promise 拒绝、本地处理异常或未知；使用固定枚举 |
+| `stopReason` | `stop`、`length`、`toolUse`、`error`、`aborted`；其它值归为 `other`，不可读取归为 `unknown` |
+| `content` | 白名单块类型计数与文本字符长度，不保存正文；最多检查 256 个块、累计文本长度上限 1,000,000，超限标记 `truncated`，无法完整计算的数量或长度为 `null` |
+| `errorCategory` / `httpStatus` | 仅保留白名单异常类别、网络错误码及有限 HTTP 错误状态；其它值为 `unknown` 或 `null`。不解析或保留任意异常文本 |
+| 展示与存储 | 可见行只显示阶段、原因、结束类型；不记录请求/响应 ID、原文、思考正文、工具参数、stack、headers 或原始 provider 响应；不新增远端指标字段或投递 |
+| 故障隔离 | 提取和写入为 best-effort，与 usage 分别写入且按 attempt 去重；只在原作用域可安全记账时追加，离开后的迟到结果不写入新 Session/分支 |
+
+物理生成计时、attempt 的取消/采用结果和失败诊断是不同事实。正常物理响应后本地处理异常可以同时出现 `completed` 阶段耗时、`processing_error` 诊断和失败的 attempt；取消后的迟到成功也不重新生成候选。响应已明确为 aborted 时可留 `non_stop` 诊断，但仅本地取消并不伪造模型失败。候选必须包含非空文本，且每个文本块均为字符串；畸形文本不接入原生上下文。
+
+这些分类由离线测试验证；真实 provider 请求、历史失败的具体根因与安装后的真实 TUI 展示未由这些测试证明。
 
 ## 8. 验证计划
 
