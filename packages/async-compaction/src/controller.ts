@@ -1,12 +1,12 @@
 import type { ExtensionAPI, ExtensionContext, CompactionEntry } from "@earendil-works/pi-coding-agent";
 import type { Usage } from "@earendil-works/pi-ai";
 import { fits, plan, prompt, settings, valid, withFiles, type Snapshot } from "./compaction.ts";
-import { Reporting, metering, type Metering, type Outcome } from "./reporting.ts";
+import { Reporting, failureDiagnostic, metering, type FailureDiagnostic, type Metering, type Outcome } from "./reporting.ts";
 import { Timing } from "./timing.ts";
 import type { TimingClock } from "./timing.ts";
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-type Attempt = { id: string; snapshot: Snapshot; provider: string; model: string; abort: AbortController; done: Promise<void>; summary?: string; usage?: Usage; metering: Metering; nativeFallback: boolean; settled: boolean; offered: boolean; cancelled: boolean; deadline: ReturnType<typeof setTimeout>; boundary: string | null; recorded: boolean; timing: ReturnType<Timing["begin"]> };
+type Attempt = { id: string; snapshot: Snapshot; provider: string; model: string; abort: AbortController; done: Promise<void>; summary?: string; usage?: Usage; metering: Metering; nativeFallback: boolean; settled: boolean; offered: boolean; cancelled: boolean; deadline: ReturnType<typeof setTimeout>; boundary: string | null; recorded: boolean; timing: ReturnType<Timing["begin"]>; diagnostic?: FailureDiagnostic };
 export class Controller {
   private enabled = false;
   private generation = 0;
@@ -47,7 +47,7 @@ export class Controller {
   private record(a: Attempt, outcome: Outcome, ctx: ExtensionContext) {
     if (a.recorded || !this.sameSnapshotBranch(a.snapshot, ctx)) return;
     a.recorded = true;
-    this.report.finish({ attemptId: a.id, model: a.model, provider: a.provider, outcome, metering: a.metering, usage: a.usage ?? null, includedInNativeTotals: outcome === "adopted" });
+    this.report.finish({ attemptId: a.id, model: a.model, provider: a.provider, outcome, metering: a.metering, usage: a.usage ?? null, includedInNativeTotals: outcome === "adopted" }, a.diagnostic);
   }
   reset(ctx: ExtensionContext) { this.clearNative(ctx); this.cancel(ctx); this.timing.invalidate(); this.enabled = false; this.generation++; this.session = null; this.attempt = null; this.observationNoticeSent = false; this.starts = 0; this.lastStart = 0; this.failedAt = 0; this.lastTokens = 0; this.lastCompactId = null; }
   shutdown(ctx?: ExtensionContext): void {
@@ -127,26 +127,44 @@ export class Controller {
     try {
       const stream = ctx.modelRegistry.streamSimple(model, { messages: [message] }, options);
       try { result = stream.result(); }
-      catch { this.observationFailed(ctx, a); return; }
-    } catch { this.observationFailed(ctx, a); return; }
-    a.done = result.then(response => {
+      catch (error) { a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "result", reason: "sync_throw", error }); this.observationFailed(ctx, a); return; }
+    } catch (error) { a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "stream_simple", reason: "sync_throw", error }); this.observationFailed(ctx, a); return; }
+    try { a.done = result.then(response => {
+      // Capture the physical response terminal before inspecting provider-controlled fields.
       const end = a.timing.captureEnd();
+      let physicalTimingFinished = false;
       try {
-        const outcome = response.stopReason === "stop" && Array.isArray(response.content) && response.content.some(c => c.type === "text" && c.text.trim()) && response.content.every(c => c.type === "text" || c.type === "thinking") ? "completed" : response.stopReason === "aborted" ? "cancelled" : "failed";
-        a.timing.finish(outcome, undefined, end);
+        const stopReason = response?.stopReason;
+        const content = response?.content;
+        const malformedText = Array.isArray(content) && content.some(c => c?.type === "text" && typeof c.text !== "string");
+        const hasText = Array.isArray(content) && content.some(c => c?.type === "text" && typeof c.text === "string" && c.text.trim());
+        const legal = Array.isArray(content) && content.every(c => c?.type === "thinking" || (c?.type === "text" && typeof c.text === "string"));
+        const responseOutcome = stopReason === "aborted" ? "cancelled" : stopReason === "stop" && legal && hasText ? "completed" : "failed";
+        a.timing.finish(responseOutcome, undefined, end);
+        physicalTimingFinished = true;
         const measured = metering(response);
         a.metering = measured.status;
         a.usage = measured.usage ?? undefined;
-        if (!a.cancelled && this.enabled && this.generation === snapshot.generation && response.stopReason === "stop" && response.content.length && response.content.every(c => c.type === "text" || c.type === "thinking") && response.content.some(c => c.type === "text" && c.text.trim())) {
-          const text = response.content.map(c => c.type === "text" ? c.text : "").join("\n").trim();
+        if (responseOutcome === "failed" || stopReason === "aborted") {
+          const reason = stopReason !== "stop" ? "non_stop" : !Array.isArray(content) || malformedText ? "malformed_response" : content.some(c => c?.type !== "text" && c?.type !== "thinking") ? "unexpected_content" : !content.length || !hasText ? (content.some(c => c?.type === "thinking") ? "thinking_only" : "empty_text") : "unexpected_content";
+          a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "response", reason, response });
+        }
+        if (!a.cancelled && this.enabled && this.generation === snapshot.generation && responseOutcome === "completed") {
+          const text = content.map(c => c.type === "text" ? c.text : "").join("\n").trim();
           if (text) a.summary = withFiles(text, snapshot.files);
         }
-      } catch { a.timing.finish("failed", undefined, end); }
-    }, _error => {
+      } catch (error) {
+        // Once completed is recorded, it describes the physical response terminal; a later local
+        // processing failure is diagnostic-only and cannot rewrite that already-finished interval.
+        if (!physicalTimingFinished) a.timing.finish("failed", undefined, end);
+        a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "response_processing", reason: "processing_error", response, error });
+      }
+    }, error => {
       // A rejection handler attached to the original result promise observes the physical
       // terminal before any later Promise reaction can be queued ahead of this callback.
       const end = a.timing.captureEnd();
       a.timing.finish("failed", undefined, end);
+      a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "result", reason: "promise_rejected", error });
     }).finally(() => {
       clearTimeout(a.deadline); a.settled = true;
       let live = false;
@@ -163,7 +181,10 @@ export class Controller {
         if (!a.cancelled && same) this.notify(ctx, "async-compact background summary failed; native compaction remains active", "warning");
       }
       // Only guarded, non-context custom entries are appended; no active session state is changed.
-    });
+    }); } catch (error) {
+      a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "result", reason: "sync_throw", error });
+      this.observationFailed(ctx, a);
+    }
   }
   private observationFailed(ctx: ExtensionContext, a: Attempt) {
     a.timing.finish("unknown", "observation_failed");
