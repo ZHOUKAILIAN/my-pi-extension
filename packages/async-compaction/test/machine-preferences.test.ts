@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -95,6 +95,42 @@ test('command-internal external Off cancels a real pending candidate before On a
     assert.equal(await h.emit('session_before_compact', beforeCompact, ctx), undefined, 'the late cancelled candidate cannot be offered after the physical result settles');
     assert.equal(signals.length, 1, 'refresh plus user On does not launch a replacement task');
     await h.emit('session_shutdown', {}, ctx);
+  } finally { process.argv = oldArgv; }
+});
+
+test('tool-turn scheduling re-reads Off and fails closed on preference errors; soft threshold still gates requests', async t => {
+  const oldArgv = process.argv; process.argv = supportedArgv();
+  try {
+    for (const scenario of ['fresh-off', 'read-failure', 'below-threshold'] as const) {
+      const root = mkdtempSync(join(tmpdir(), `async-tool-turn-${scenario}-`)); prefs.push(root);
+      await writePreference(root, 'async-compaction', true);
+      const sm = SessionManager.inMemory(root);
+      const usage = { input: 10, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 20, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      for (let n = 0; n < 3; n++) {
+        sm.appendMessage({ role: 'user', content: [{ type: 'text', text: `history-${n} ` + 'constraint '.repeat(400) }], timestamp: Date.now() });
+        sm.appendMessage({ role: 'assistant', content: [{ type: 'text', text: `answer-${n} ` + 'fact '.repeat(30) }], api: 'fake-api', provider: 'fake', model: 'm', stopReason: 'stop', timestamp: Date.now(), usage });
+      }
+      const call = { type: 'toolCall' as const, id: 'tool-call', name: 'read', arguments: { path: 'a.ts' } };
+      const assistant = { role: 'assistant' as const, content: [call], api: 'fake-api', provider: 'fake', model: 'm', stopReason: 'toolUse' as const, timestamp: Date.now(), usage };
+      const assistantId = sm.appendMessage(assistant);
+      const result = { role: 'toolResult' as const, toolCallId: call.id, toolName: call.name, content: [{ type: 'text' as const, text: 'done' }], isError: false, timestamp: Date.now() };
+      const resultId = sm.appendMessage(result);
+      let calls = 0;
+      const ctx: any = {
+        mode: 'tui', model: { provider: 'fake', id: 'm', api: 'fake-api', contextWindow: 4096 }, thinkingLevel: 'off', sessionManager: sm,
+        hasPendingMessages: () => false, getSystemPrompt: () => 'system', getContextUsage: () => ({ tokens: scenario === 'below-threshold' ? 1000 : 3000, contextWindow: 4096 }),
+        modelRegistry: { streamSimple: () => { calls++; return { result: () => new Promise(() => {}) }; } },
+        ui: { notify() {}, onTerminalInput: () => () => {} },
+      };
+      const h = harness(root, ctx);
+      await h.emit('session_start', {}, ctx);
+      if (scenario === 'fresh-off') await writePreference(root, 'async-compaction', false);
+      if (scenario === 'read-failure') writeFileSync(join(root, 'settings.json'), '{broken');
+      const event = { message: assistant, outcome: 'completed', toolResults: [result], messageEntryId: assistantId, toolResultEntryIds: [resultId] };
+      await h.emit('turn_end', event, ctx);
+      assert.equal(calls, 0, `${scenario} must not launch an extra provider request`);
+      await h.emit('session_shutdown', {}, ctx);
+    }
   } finally { process.argv = oldArgv; }
 });
 

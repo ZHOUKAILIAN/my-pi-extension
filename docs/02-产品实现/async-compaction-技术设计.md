@@ -122,6 +122,7 @@ flowchart TD
 | 模块 | 职责 |
 | --- | --- |
 | `index.ts` | 注册命令、turn 和原生压缩 hooks；交付候选并确认实际采用 |
+| `tool-turn.ts` | 核验已完成工具回合的调用、结果与活动分支持久化条目，为后台调度提供资格判断 |
 | `controller.ts` | 管理开关、会话代际、后台模型请求与响应结算、内存候选、冷却和取消 |
 | `compaction.ts` | 稳定前缀选择、摘要提示词构造、文件记录、来源及预算校验 |
 | `reporting.ts` | 按需过程提示、用量记录和去重 |
@@ -144,7 +145,9 @@ Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只
 
 ### 后台调度
 
-`turn_end` 只执行有界的快照准备并启动任务，不等待模型结果；只处理已完成的 turn。读取已经持久化的 branch/projection，不把其他 handler 尚未提交的 draft 当作稳定来源。
+`turn_end` 只执行有界的快照准备并启动任务，不等待模型结果。调度入口包括 assistant 正常 `stop`，以及宿主报告 `completed` 且通过 `tool-turn.ts` 检查的 `toolUse` 回合。工具回合须有非空、唯一的调用 ID，调用与结果数量、关联 ID、工具名及活动分支中的持久化消息匹配；缺失、重复或未持久化的结果不启动准备。协议完整的工具错误结果不单独阻止调度，后续仍由 Controller 核验开关、软阈值、快照、单物理请求槽和既有重试预算。
+
+调度读取已经持久化的 branch/projection，不把其他 handler 尚未提交的 draft 当作稳定来源。工具回合触发准备不等待整轮任务结束，也不扩大候选采用窗口；原生压缩在工具链中触发时仍走原生路径。完整用户段切点限制仍适用，没有合格切点时不生成候选。
 
 后台结果回调只把候选置为 ready。即使用户仍在工作，也不从回调直接调用 `ctx.compact()` 或修改会话。`ctx.compact()` 进入手动压缩路径，会先停止当前运行。
 
@@ -202,7 +205,7 @@ H 由当前型号窗口减去有效 reserve 得到；输入包括 system/tools �
 | 生成成功 | 拒绝 error、aborted、输出截断、空文本或包含工具调用的响应 |
 | 仍适用当前上下文 | 比对候选归属、当前投影及覆盖关系，不以“请求成功”代替历史校验 |
 
-`session_before_compact` 仅在 `reason === "threshold"` 时尝试复用。普通及带指令的手动 `/compact`、overflow 均取消未完成候选并直接返回 `undefined`，使用原生摘要；已提交文件列表的 preparation 桥独立于候选复用。
+`session_before_compact` 仅在 `reason === "threshold"`、`agent_end` 已发生且尚未 `agent_settled` 的 post-run 窗口内、并且不是 input preflight 时尝试复用。工具链执行中的 threshold 与 input preflight 即使已有 ready 候选也不调用 `offer`，交还原生压缩。普通及带指令的手动 `/compact`、overflow 均取消未完成候选并直接返回 `undefined`，使用原生摘要；已提交文件列表的 preparation 桥独立于候选复用。
 
 threshold 路径依次执行：
 
@@ -246,7 +249,8 @@ threshold 路径依次执行：
 | --- | --- |
 | Controller | 全部主/子 Agent 采用本机 on/off；latent On 不绕过实际模型/设置；取消导航与成功 tree、每 Agent 单任务、冷却、超时和跨 branch 迟到结果。旧“child 不启用”断言只证明当前 gate，须替换为目标适配验收 |
 | `compaction.ts` | 追加允许、prefix edit 拒绝、换分支、上一份摘要改变、工具配对、切点衔接及巨大增量 |
-| 原生压缩 hooks | 当前 settings/预算复核、普通及带指令 manual/overflow 原生旁路、其他 handler 覆盖、取消与实际采用确认 |
+| 工具回合预生成 | Pi 1.1.0 SDK 与内存 fake provider 覆盖多工具结果持久化后启动、后台未结算时前台继续、重复回合不绕过物理槽；资格检查与入口测试覆盖异常终态、不完整关联、开关刷新及软阈值。真实 provider 性能与摘要质量未验证，不据此声明压缩等待减少 |
+| 原生压缩 hooks | 当前 settings/预算复核、ready 候选在工具链执行中及 input preflight 的原生旁路、普通及带指令 manual/overflow 原生旁路、其他 handler 覆盖、取消与实际采用确认 |
 | 用量与恢复 | 采用/丢弃/失败/取消去重，unknown，关闭边界，连续压缩与会话恢复 |
 | machine preference / generic duration | [`machine-preferences.test.ts`](../../packages/async-compaction/test/machine-preferences.test.ts)、[`duration.test.ts`](../../packages/async-compaction/test/duration.test.ts) 是现有候选测试入口；新目标还需 RPC/JSON/print/SDK、两真实进程、在途状态更新和无 UI 本地恢复，不能只检查 JSON 文件 |
 | 真实宿主与入口组合 | 当前精确 1.0.4/1.1.0 是起点；先对齐共同宿主矩阵，再以真实 SDK/CLI/PTY 验证主/子、继续/重试、Fast 联用和多 handler，不能把原隔离模式通过当作全部 Agent 证明 |
