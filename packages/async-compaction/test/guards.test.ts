@@ -8,6 +8,9 @@ import { fileURLToPath } from "node:url";
 const cli = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js");
 import { Reporting } from "../src/reporting.ts";
 import { settings } from "../src/compaction.ts";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { writeMachinePreference } from "../src/machine-settings.ts";
+import { Controller } from "../src/controller.ts";
 
 const entry = "/tmp/repo/packages/async-compaction/src/index.ts";
 let agentDir: string;
@@ -102,6 +105,75 @@ test("enabled threshold input preflight preserves native ownership and shows/cle
     assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 1, "Off and unsupported opportunities do not create a foreground sample");
   } finally { process.argv = argv; }
 });
+test("ready candidate is offered only in the allowed post-run window; mid-run and preflight preserve native ownership", async () => {
+  const argv = process.argv; process.argv = ["node", cli, "-ne", "-e", entry];
+  const originalOffer = Controller.prototype.offer;
+  const offered: unknown[] = [];
+  Controller.prototype.offer = async function(ctx, preparation, signal) {
+    const result = await originalOffer.call(this, ctx, preparation, signal);
+    offered.push(result);
+    return result;
+  };
+  try {
+    for (const reason of ["allowed", "mid-run", "preflight", "manual", "overflow"] as const) {
+      await writeMachinePreference("asyncCompaction", true, join(agentDir, "settings.json"));
+      const sm = SessionManager.inMemory(agentDir);
+      const usage = { input: 18, output: 9, cacheRead: 0, cacheWrite: 0, totalTokens: 27, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      for (let n = 1; n <= 2; n++) {
+        sm.appendMessage({ role: "user", content: [{ type: "text", text: `user-${n} ` + "word ".repeat(160) }], timestamp: Date.now() });
+        sm.appendMessage({ role: "assistant", content: [{ type: "text", text: `answer-${n} ` + "answer ".repeat(40) }], api: "fake-api", provider: "fake", model: "m", stopReason: "stop", timestamp: Date.now(), usage });
+      }
+      let settle!: (value: unknown) => void;
+      let backgroundSignal!: AbortSignal;
+      const entries: { kind: string; data: any }[] = [], handlers = new Map<string, Function>();
+      let command!: (args: string, ctx: any) => Promise<void>;
+      const pi: any = {
+        registerCommand: (_name: string, options: any) => command = options.handler,
+        registerEntryRenderer() {}, appendEntry: (kind: string, data: any) => entries.push({ kind, data }),
+        getSettings: () => ({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } }), getAllTools: () => [], getActiveTools: () => [],
+        on: (name: string, callback: Function) => { handlers.set(name, callback); },
+      };
+      extension(pi, { settingsFile: join(agentDir, "settings.json"), agentType: "main" });
+      const ctx: any = {
+        mode: "tui", model: { provider: "fake", id: "m", api: "fake-api", contextWindow: 4096 }, thinkingLevel: "off", sessionManager: sm,
+        hasPendingMessages: () => false, getSystemPrompt: () => "system", getContextUsage: () => ({ tokens: 2900, contextWindow: 4096 }),
+        modelRegistry: { streamSimple: (_model: unknown, _messages: unknown, options: { signal: AbortSignal }) => { backgroundSignal = options.signal; return { result: () => new Promise(resolve => settle = resolve) }; } },
+        ui: { notify() {}, onTerminalInput: () => () => {} },
+      };
+      await handlers.get("session_start")!({}, ctx);
+      await command("on", ctx);
+      handlers.get("agent_end")!({ messages: [] }, ctx);
+      await handlers.get("turn_end")!({ message: { role: "assistant", stopReason: "stop" } }, ctx);
+      assert.equal(typeof settle, "function", "the setup produced a real scheduled candidate request");
+      settle({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ready summary" }], usage, api: "fake-api", provider: "fake", model: "m", timestamp: Date.now() });
+      await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
+      const generating = entries.find(entry => entry.kind === "async-compact-progress")?.data;
+      assert.ok(generating, "candidate generation started before exercising its consumer gate");
+      if (reason === "mid-run") handlers.get("agent_start")!({}, ctx);
+      if (reason === "preflight") {
+        handlers.get("agent_end")!({ messages: [] }, ctx);
+        await handlers.get("input")!({ type: "input", text: "next prompt", source: "interactive" }, ctx);
+      }
+      const before = { reason: reason === "manual" || reason === "overflow" ? reason : "threshold", signal: new AbortController().signal,
+        preparation: { tokensBefore: 2900, firstKeptEntryId: "unused", isSplitTurn: false, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, fileOps: { read: new Set(), edited: new Set(), written: new Set() } } };
+      const offersBefore = offered.length;
+      const result = await handlers.get("session_before_compact")!(before, ctx);
+      if (reason === "allowed") {
+        assert.ok(result, "a ready candidate with complete preparation is offered inside the allowed window");
+        assert.equal(offered.length, offersBefore + 1);
+        assert.ok(offered.at(-1), "the offer spy observed a usable candidate");
+      } else {
+        assert.equal(result, undefined, `${reason} must leave the native compaction path in control`);
+        assert.equal(offered.length, offersBefore, `${reason} must not call Controller.offer`);
+      }
+      if (reason === "manual" || reason === "overflow") assert.equal(backgroundSignal.aborted, true, `${reason} cancels the candidate and retains native ownership`);
+      else if (reason !== "allowed") assert.ok(entries.some(entry => entry.kind === "async-compact-progress" && entry.data.attemptId !== generating.attemptId), `${reason} signals native fallback rather than returning the candidate`);
+      assert.equal(sm.getBranch().some(entry => entry.type === "compaction"), false, "the extension never commits compaction itself");
+      handlers.get("session_shutdown")!({}, ctx);
+    }
+  } finally { Controller.prototype.offer = originalOffer; process.argv = argv; }
+});
+
 test("effective compaction settings respect auto-disabled and model override", () => {
   const ctx = { model: { provider: "fake", id: "m", contextWindow: 4096 } };
   const pi = (compaction: unknown) => ({ getSettings: () => ({ compaction }) });

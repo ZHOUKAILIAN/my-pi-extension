@@ -7,6 +7,7 @@ import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Controller } from "./controller.ts";
 import { committedFiles, settings } from "./compaction.ts";
 import type { TimingClock } from "./timing.ts";
+import { hasCompletedToolTurn } from "./tool-turn.ts";
 import { drainLocal, noteMetricFailure, shutdownDeadline } from '@pi/project-metrics/client';
 
 export function isolatedProfile(argv: string[] = process.argv): boolean {
@@ -135,7 +136,15 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
   pi.on("turn_start", async (_event, ctx) => { await refreshPreference(ctx); });
   pi.on("agent_end", (event, ctx) => { postRunWindow = true; if (event.messages.some(m => m.role === "assistant" && m.stopReason === "aborted")) control.stop(ctx); });
   pi.on("agent_settled", () => { postRunWindow = false; });
-  pi.on("turn_end", async (event, ctx) => { if (event.message.role === "assistant" && event.message.stopReason === "stop") { await refreshPreference(ctx); if (requested) control.schedule(ctx); } });
+  pi.on("turn_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    const stopTurn = event.message.stopReason === "stop";
+    const completedToolTurn = event.message.stopReason === "toolUse"
+      && hasCompletedToolTurn(event as any, ctx.sessionManager.getBranch());
+    if (!stopTurn && !completedToolTurn) return;
+    await refreshPreference(ctx);
+    if (requested) control.schedule(ctx);
+  });
   pi.on("session_before_compact", async (event, ctx) => {
     if (durationEnabled) { try { duration.before(event, ctx); } catch { /* diagnostic only */ } }
     let preferenceOk = false; try { preferenceOk = refreshPreferenceSync(ctx); } catch { preferenceOk = false; }
