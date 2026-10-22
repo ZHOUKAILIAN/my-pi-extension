@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { Timing } from "../src/timing.ts";
 import { Controller } from "../src/controller.ts";
 import extension from "../src/index.ts";
+import { isolatedSettingsFile } from "./test-settings.ts";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 
@@ -105,16 +106,97 @@ test("physical response outcomes, Off-late-stop, reject and duplicates are class
   for (const [reason, text, outcome] of [["stop", "summary", "completed"], ["aborted", "", "cancelled"], ["error", "", "failed"], ["stop", "", "failed"]] as const) {
     const f = controllerFixture(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.resolve(response(reason, text)); await tick();
     assert.equal(f.entries.find(e => e.type === "async-compact-timing")?.data.outcome, outcome); assert.equal(f.entries.filter(e => e.type === "async-compact-timing").length, 1);
+    if (reason === "stop" && text) assert.equal(f.entries.filter(e => e.type === "async-compact-failure").length, 0, "valid successful response has no failure diagnostic");
   }
   const f = controllerFixture(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.c.set(false, f.ctx); f.resolve(response()); await tick();
   assert.equal(f.entries.find(e => e.type === "async-compact-timing")?.data.outcome, "completed");
+  assert.equal(f.entries.filter(e => e.type === "async-compact-failure").length, 0, "Off followed by a late physical success does not create a failure diagnostic");
+});
+
+test("failure diagnostics classify bounded response shape and never persist injected provider secrets", async () => {
+  for (const [responseValue, expected] of [
+    [response("length", "cut"), ["non_stop", "length"]],
+    [response("toolUse", ""), ["non_stop", "toolUse"]],
+    [response("error", ""), ["non_stop", "error"]],
+    [response("aborted", ""), ["non_stop", "aborted"]],
+    [response("future-stop-reason", ""), ["non_stop", "other"]],
+    [response("stop", ""), ["empty_text", "stop"]],
+  ] as const) {
+    const f = controllerFixture(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.resolve(responseValue); await tick();
+    const diagnostic = f.entries.find(e => e.type === "async-compact-failure")?.data;
+    assert.ok(diagnostic, `missing failure diagnostic for ${JSON.stringify(expected)}; entries=${JSON.stringify(f.entries)}`);
+    assert.deepEqual([diagnostic.reason, diagnostic.stopReason], expected);
+    assert.equal(diagnostic.schemaVersion, 1); assert.equal(typeof diagnostic.attemptId, "string");
+    assert.doesNotMatch(JSON.stringify(f.entries), /private provider body|authorization|secret|summary|headers|errorMessage/);
+  }
+  const f = controllerFixture(); f.c.set(true, f.ctx); f.c.schedule(f.ctx);
+  f.resolve({ stopReason: "stop", content: [{ type: "thinking", thinking: "private thought" }], usage }); await tick();
+  assert.equal(f.entries.find(e => e.type === "async-compact-failure")?.data.reason, "thinking_only");
+  const malformedText = controllerFixture(); malformedText.c.set(true, malformedText.ctx); malformedText.c.schedule(malformedText.ctx);
+  malformedText.resolve({ stopReason: "stop", content: [{ type: "text", text: 123 }, { type: "text", text: "ok" }], usage }); await tick();
+  assert.equal(malformedText.entries.find(e => e.type === "async-compact-failure")?.data.reason, "malformed_response");
+  assert.equal(await malformedText.c.offer(malformedText.ctx, prep, new AbortController().signal), undefined, "non-string text cannot become a summary or be offered");
+  const unexpectedOnly = controllerFixture(); unexpectedOnly.c.set(true, unexpectedOnly.ctx); unexpectedOnly.c.schedule(unexpectedOnly.ctx);
+  unexpectedOnly.resolve({ stopReason: "stop", content: [{ type: "vendor-block", raw: "private" }], usage }); await tick();
+  assert.equal(unexpectedOnly.entries.find(e => e.type === "async-compact-failure")?.data.reason, "unexpected_content");
+  const g = controllerFixture(); g.c.set(true, g.ctx); g.c.schedule(g.ctx);
+  g.resolve({ stopReason: "stop", content: [{ type: "text", text: "secret text" }, { type: "toolCall", name: "private tool name", arguments: { secret: true } }, { type: "new-provider-block", raw: "secret" }], usage }); await tick();
+  const d = g.entries.find(e => e.type === "async-compact-failure")?.data;
+  assert.equal(d.reason, "unexpected_content"); assert.deepEqual(d.content.types, { text: 1, toolCall: 1, unknown: 1 }); assert.equal(d.content.textLength, 11);
+  assert.doesNotMatch(JSON.stringify(g.entries), /secret text|private tool name|new-provider-block|secret/);
+  const bounded = controllerFixture(); bounded.c.set(true, bounded.ctx); bounded.c.schedule(bounded.ctx);
+  bounded.resolve({ stopReason: "stop", content: [...Array.from({ length: 300 }, () => ({ type: "text", text: "ignored" })), { type: "untrusted-block" }], usage }); await tick();
+  const boundedDiagnostic = bounded.entries.find(e => e.type === "async-compact-failure")?.data;
+  assert.equal(boundedDiagnostic.content.count, null); assert.equal(boundedDiagnostic.content.truncated, true); assert.equal(boundedDiagnostic.content.textLength, null);
+});
+
+test("sync throws, promise rejection and malformed response processing have distinct safe diagnostics", async () => {
+  for (const [stage, reason] of [["stream_simple", "sync_throw"], ["result", "sync_throw"], ["result_value", "sync_throw"]] as const) {
+    const f = controllerFixture(); f.c.set(true, f.ctx);
+    f.ctx.modelRegistry.streamSimple = () => { if (stage === "stream_simple") throw Object.assign(Error("secret body"), { code: "ECONNRESET", status: 503 }); return { result: () => { if (stage === "result") throw Error("secret stack"); if (stage === "result_value") return { not: "a promise" }; throw Error("unexpected"); } }; };
+    f.c.schedule(f.ctx);
+    const d = f.entries.find(e => e.type === "async-compact-failure")?.data;
+    assert.equal(d.stage, stage === "result_value" ? "result" : stage); assert.equal(d.reason, reason);
+    if (stage === "stream_simple") { assert.equal(d.errorCategory, "ECONNRESET"); assert.equal(d.httpStatus, 503); }
+    assert.doesNotMatch(JSON.stringify(f.entries), /secret body|secret stack/);
+  }
+  const rejected = controllerFixture(); rejected.c.set(true, rejected.ctx); rejected.c.schedule(rejected.ctx); rejected.reject(Object.assign(Error("secret rejection"), { code: "UNKNOWN_PRIVATE_CODE", status: 700 })); await tick();
+  const rejectedDiagnostic = rejected.entries.find(e => e.type === "async-compact-failure")?.data;
+  assert.equal(rejectedDiagnostic.stage, "result"); assert.equal(rejectedDiagnostic.reason, "promise_rejected"); assert.equal(rejectedDiagnostic.errorCategory, "unknown"); assert.equal(rejectedDiagnostic.httpStatus, null);
+  const malformed = controllerFixture(); malformed.c.set(true, malformed.ctx); malformed.c.schedule(malformed.ctx);
+  malformed.resolve({ get stopReason() { throw Error("secret getter"); }, content: [] }); await tick();
+  const malformedDiagnostic = malformed.entries.find(e => e.type === "async-compact-failure")?.data;
+  assert.equal(malformedDiagnostic.stage, "response_processing"); assert.equal(malformedDiagnostic.reason, "processing_error");
+  assert.doesNotMatch(JSON.stringify(malformed.entries), /secret rejection|secret getter|UNKNOWN_PRIVATE_CODE/);
+  const appendFailure = controllerFixture({ failAppend: type => type === "async-compact-failure" });
+  appendFailure.c.set(true, appendFailure.ctx); appendFailure.c.schedule(appendFailure.ctx);
+  appendFailure.resolve(response("length", "truncated")); await tick();
+  assert.ok(appendFailure.attempts.some(e => e.type === "async-compact-failure"), "diagnostic append failure was injected");
+  assert.equal(appendFailure.entries.find(e => e.type === "async-compact-usage")?.data.outcome, "failed", "usage accounting continues when the separate diagnostic cannot persist");
+  assert.doesNotThrow(() => appendFailure.c.schedule(appendFailure.ctx), "diagnostic write failure does not throw into scheduling/cooldown callers");
+
+  const revoked = controllerFixture(); revoked.c.set(true, revoked.ctx); revoked.c.schedule(revoked.ctx);
+  const revocable = Proxy.revocable([], {}); revocable.revoke();
+  revoked.resolve({ stopReason: "stop", content: revocable.proxy, usage }); await tick();
+  assert.ok(revoked.entries.some(e => e.type === "async-compact-failure" && e.data.content === null && e.data.stopReason === "unknown" && e.data.reason === "processing_error"), "revoked Proxy falls back to a minimal unknown diagnostic");
+  assert.ok(revoked.entries.some(e => e.type === "async-compact-usage"), "diagnostic extraction failure cannot block attempt finalization");
+
+  const postProcess = controllerFixture(); postProcess.c.set(true, postProcess.ctx); postProcess.c.schedule(postProcess.ctx);
+  let textReads = 0;
+  const changingBlock = { type: "text", get text() { if (++textReads <= 4) return "valid text"; throw Error("private processing failure"); } };
+  postProcess.resolve({ stopReason: "stop", content: [changingBlock], usage }); await tick();
+  assert.equal(postProcess.entries.find(e => e.type === "async-compact-timing")?.data.outcome, "completed", "physical successful response timing remains settled when later local processing throws");
+  assert.equal(postProcess.entries.find(e => e.type === "async-compact-failure")?.data.reason, "processing_error");
+  assert.equal(postProcess.entries.find(e => e.type === "async-compact-usage")?.data.outcome, "failed", "attempt finalization records failed local processing separately from physical generation");
+  assert.doesNotMatch(JSON.stringify(postProcess.entries), /private processing failure/);
 });
 
 test("leave records unknown in old scope and late response never appends into new session", async () => {
   const f = controllerFixture(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.c.leave(f.ctx);
   const first = f.entries.filter(e => e.type === "async-compact-timing"); assert.equal(first.length, 1); assert.equal(first[0].data.durationMs, null); assert.equal(first[0].data.unknownReason, "scope_left");
-  f.sm.newSession(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.resolve(response()); await tick();
+  f.sm.newSession(); f.c.set(true, f.ctx); f.c.schedule(f.ctx); f.resolve(response("error", "")); await tick();
   assert.equal(f.entries.filter(e => e.type === "async-compact-timing").length, 1);
+  assert.equal(f.entries.filter(e => e.type === "async-compact-failure").length, 0, "late old-scope response cannot append failure diagnostics to replacement scope");
 });
 
 test("Reporting start/wait/fallback/finish/hide append and notice failures do not alter request or adoption", async () => {
@@ -172,10 +254,10 @@ function hookHarness(options: { failAppend?: (type: string, data: any) => boolea
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const agentDir = mkdtempSync(join(tmpdir(), 'async-duration-agent-')); preferenceDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 }, submitMetric: options.submitMetric as any });
+  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 }, submitMetric: options.submitMetric as any, settingsFile: isolatedSettingsFile(agentDir) });
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   const ctx: any = { mode: "tui", model: null, ui: { notify: (m: string) => { notices.push(m); if (options.failNotify) throw Error("private hook notify"); }, onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => { if (bumpTerminalGuard) { now += 900; bumpTerminalGuard = false; } return session; }, getBranch: () => { now += 37; return branch; } } };
-  const before = (reason: string) => emit("session_before_compact", { reason, signal: new AbortController().signal, preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
+  const before = (reason: string) => emit("session_before_compact", { reason, signal: new AbortController().signal, branchEntries: [...branch], preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
   const terminal = (failed = false, aborted = false, reason = 'threshold') => { bumpTerminalGuard = true; const endAt = now; if (!failed) branch.push({ id: `compact-${branch.length}`, type: 'compaction' }); emit(failed ? "session_compact_failed" : "session_compact", failed ? { aborted, reason } : { compactionEntry: { id: 'stale-host-pointer' }, reason }, ctx); bumpTerminalGuard = false; return endAt; };
   return { events, emit, entries, notices, command, ctx, before, terminal, setSession: (v: string) => session = v, advance: (n: number) => now += n, now: () => now, clockReads };
 }

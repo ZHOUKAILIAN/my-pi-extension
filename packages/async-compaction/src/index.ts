@@ -1,12 +1,13 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { buildSessionProjection, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readMachinePreference, readMachinePreferenceSync, updateMachinePreference, settingsFile } from './machine-settings.ts';
 import { installCompactionDurationObserver } from './duration.ts';
 import { Key, matchesKey } from "@earendil-works/pi-tui";
-import { Controller } from "./controller.ts";
+import { Controller, type BudgetClock } from "./controller.ts";
 import { committedFiles, settings } from "./compaction.ts";
 import type { TimingClock } from "./timing.ts";
+import { hasCompletedToolTurn } from "./tool-turn.ts";
 import { drainLocal, noteMetricFailure, shutdownDeadline } from '@pi/project-metrics/client';
 
 export function isolatedProfile(argv: string[] = process.argv): boolean {
@@ -47,8 +48,8 @@ export function createManagedExtensionFactory(context: ManagedExtensionContext):
   };
   return factory;
 }
-export default function extension(pi: ExtensionAPI, dependencies: { timingClock?: TimingClock; submitMetric?: typeof import('@pi/project-metrics/client').submitMetric; settingsFile?: string; agentType?: 'main' | 'subagent' | 'unknown' } = {}) {
-  const control = new Controller(pi, dependencies.timingClock, { submitMetric: dependencies.submitMetric, agentType: dependencies.agentType });
+export default function extension(pi: ExtensionAPI, dependencies: { timingClock?: TimingClock; budgetClock?: BudgetClock; submitMetric?: typeof import('@pi/project-metrics/client').submitMetric; settingsFile?: string; agentType?: 'main' | 'subagent' | 'unknown' } = {}) {
+  const control = new Controller(pi, dependencies.timingClock, { submitMetric: dependencies.submitMetric, agentType: dependencies.agentType }, dependencies.budgetClock);
   const duration = installCompactionDurationObserver(pi);
   const machinePreferenceFile = settingsFile(dependencies.settingsFile);
   let requested = false;
@@ -62,7 +63,7 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
     try { control.set(requested, ctx); } catch (error) { firstError = error; }
     try {
       if (!requested) { detachInput?.(); detachInput = undefined; }
-      else if (!detachInput && ctx.mode === 'tui' && typeof ctx.ui.onTerminalInput === 'function') detachInput = ctx.ui.onTerminalInput((data: string) => { if (matchesKey(data, Key.escape) && control.isEnabled) control.stop(ctx); return undefined; });
+      else if (!detachInput && ctx.mode === 'tui' && typeof ctx.ui.onTerminalInput === 'function') detachInput = ctx.ui.onTerminalInput((data: string) => { if (matchesKey(data, Key.escape) && control.isEnabled) control.stop(ctx, "user"); return undefined; });
     } catch (error) { firstError ??= error; }
     if (firstError !== undefined) throw firstError;
   };
@@ -81,7 +82,7 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
     requested = result.value ?? false; observed = requested; applyPreference(requested, ctx); return true;
   };
   const notify = (ctx: { ui: { notify: (message: string, level: "info" | "warning") => void } }, message: string, level: "info" | "warning") => { try { ctx.ui.notify(message, level); } catch { /* diagnostics are best-effort */ } };
-  let postRunWindow = false, preflight = false, durationEnabled = false;
+  let preflight = false, durationEnabled = false;
   let detachInput: (() => void) | undefined;
   let foreground: { finish: ReturnType<Controller["timing"]["begin"]>["finish"]; captureEnd: ReturnType<Controller["timing"]["begin"]>["captureEnd"]; session: string; epoch: number } | null = null;
   let closed = false;
@@ -123,19 +124,33 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
       if (firstError !== undefined) throw firstError;
     },
   });
-  const leave = (_event: unknown, ctx: Parameters<Controller["leave"]>[0]) => { lastContext = ctx; const old = foreground; foreground = null; if (old && old.session === ctx.sessionManager.getSessionId() && old.epoch === control.timing.epoch) old.finish("unknown", "scope_left"); duration.leave(ctx); postRunWindow = false; preflight = false; control.leave(ctx); detachInput?.(); detachInput = undefined; };
+  const leave = (_event: unknown, ctx: Parameters<Controller["leave"]>[0]) => { lastContext = ctx; const old = foreground; foreground = null; if (old && old.session === ctx.sessionManager.getSessionId() && old.epoch === control.timing.epoch) old.finish("unknown", "scope_left"); duration.leave(ctx); preflight = false; control.leave(ctx); detachInput?.(); detachInput = undefined; };
   pi.on("session_shutdown", async (event, ctx) => {
     lastContext = ctx;
     await shutdown(shutdownDeadline(event as object, 1000));
   });
-  pi.on("session_start", async (_event, ctx) => { foreground = null; postRunWindow = false; preflight = false; durationEnabled = true; try { duration.setBranch(ctx, true); } catch {} control.reset(ctx); await refreshPreference(ctx, true); });
-  pi.on("input", async (_event, ctx) => { await refreshPreference(ctx); preflight = true; postRunWindow = false; });
-  pi.on("session_tree", async (_event, ctx) => { try { duration.tree(ctx, durationEnabled); } catch { /* diagnostics cannot affect navigation */ } foreground = null; postRunWindow = false; preflight = false; control.resetTree(ctx); await refreshPreference(ctx, true); });
-  pi.on("agent_start", () => { preflight = false; postRunWindow = false; });
+  pi.on("session_start", async (_event, ctx) => { foreground = null; preflight = false; durationEnabled = true; try { duration.setBranch(ctx, true); } catch {} control.reset(ctx); await refreshPreference(ctx, true); });
+  pi.on("input", async (_event, ctx) => { await refreshPreference(ctx); preflight = true; });
+  pi.on("session_tree", async (_event, ctx) => { try { duration.tree(ctx, durationEnabled); } catch { /* diagnostics cannot affect navigation */ } foreground = null; preflight = false; control.resetTree(ctx); await refreshPreference(ctx, true); });
+  pi.on("agent_start", () => { preflight = false; });
   pi.on("turn_start", async (_event, ctx) => { await refreshPreference(ctx); });
-  pi.on("agent_end", (event, ctx) => { postRunWindow = true; if (event.messages.some(m => m.role === "assistant" && m.stopReason === "aborted")) control.stop(ctx); });
-  pi.on("agent_settled", () => { postRunWindow = false; });
-  pi.on("turn_end", async (event, ctx) => { if (event.message.role === "assistant" && event.message.stopReason === "stop") { await refreshPreference(ctx); if (requested) control.schedule(ctx); } });
+  pi.on("agent_end", (event, ctx) => { if (event.messages.some(m => m.role === "assistant" && m.stopReason === "aborted")) control.stop(ctx, ctx.signal?.aborted ? "scope" : "host"); });
+  pi.on("turn_end", async (event, ctx) => {
+    if (event.message.role !== "assistant") return;
+    const reason = event.message.stopReason;
+    const stopTurn = reason === "stop";
+    const completedToolTurn = reason === "toolUse"
+      && hasCompletedToolTurn(event as any, ctx.sessionManager.getBranch());
+    const trigger = stopTurn ? "assistant_stop" : completedToolTurn ? "completed_tool_turn" : "unknown";
+    const preference = await refreshPreference(ctx);
+    if (preference.readFailed) { control.diagnoseSchedule("preference_read_failed", ctx, false, trigger); return; }
+    if (!requested) { control.diagnoseSchedule("preference_off", ctx, false, trigger); return; }
+    if (!preferenceGate(ctx) || ctx.mode !== "tui") { control.diagnoseSchedule("unsupported_entry", ctx, true, trigger); return; }
+    if (reason === "aborted") { control.diagnoseSchedule("aborted_turn", ctx, true, trigger); return; }
+    if (reason !== "stop" && reason !== "toolUse") { control.diagnoseSchedule("failed_turn", ctx, true, trigger); return; }
+    if (!stopTurn && !completedToolTurn) { control.diagnoseSchedule("incomplete_turn", ctx, true, trigger); return; }
+    control.schedule(ctx, trigger);
+  });
   pi.on("session_before_compact", async (event, ctx) => {
     if (durationEnabled) { try { duration.before(event, ctx); } catch { /* diagnostic only */ } }
     let preferenceOk = false; try { preferenceOk = refreshPreferenceSync(ctx); } catch { preferenceOk = false; }
@@ -156,25 +171,52 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
       for (const path of files.readFiles) event.preparation.fileOps.read.add(path);
       for (const path of files.modifiedFiles) event.preparation.fileOps.edited.add(path);
     }
-    if (event.reason !== "threshold") { control.stop(ctx); return; }
-    if (!preferenceOk || !requested || !gateAtEntry || !gateBeforeOffer) return;
-    if (!postRunWindow || preflight) {
+    let preparedProjection: string | null = null;
+    try {
+      const preparedEntries = Array.isArray(event.branchEntries) ? event.branchEntries : ctx.sessionManager.getBranch();
+      preparedProjection = JSON.stringify(buildSessionProjection(preparedEntries).messages);
+    } catch { /* fail closed at the final hook result */ }
+    const nativePreparationStale = () => {
+      if (preparedProjection === null) return true;
+      try { return JSON.stringify(ctx.sessionManager.buildSessionProjection().messages) !== preparedProjection; } catch { return true; }
+    };
+    if (event.reason !== "threshold") { control.stop(ctx, "native"); return; }
+    if (!preferenceOk) { control.diagnoseSchedule("preference_read_failed", ctx, false, "threshold_offer"); return; }
+    if (!requested) { control.diagnoseSchedule("preference_off", ctx, false, "threshold_offer"); return; }
+    if (!gateAtEntry || !gateBeforeOffer || ctx.mode !== "tui") { control.diagnoseSchedule("unsupported_entry", ctx, true, "threshold_offer"); return; }
+    if (event.signal.aborted || ctx.signal?.aborted) { control.diagnoseSchedule("aborted_context", ctx, true, "threshold_offer"); return { cancel: true }; }
+    if (preflight) {
+      control.diagnoseSchedule("preflight_input", ctx, true, "threshold_offer");
       if (!event.signal.aborted) control.fallback(ctx);
-      return; // Preflight cannot offer a candidate; Pi still owns native compaction.
+      return; // Unmaterialized input cannot be budgeted; Pi still owns native compaction.
     }
     const compaction = await control.offer(ctx, event.preparation, event.signal);
+    if (compaction && "cancel" in compaction) return compaction;
+    if (nativePreparationStale()) return { cancel: true };
     if (!compaction && !event.signal.aborted) control.fallback(ctx);
-    if (!compaction) return undefined;
+    if (!compaction) {
+      // Keep the final preparation guard even when Async has no candidate. This
+      // permits native fallback on unchanged history but rejects stale host input
+      // if a later hook edits the live model projection.
+      return { get cancel() { return nativePreparationStale(); } };
+    }
     let decided = false;
     let decision: typeof compaction | undefined;
-    return { get compaction() {
-      if (decided) return decision;
-      decided = true;
-      try {
-        const can = refreshPreferenceSync(ctx) && requested && control.canAdopt?.(ctx, event.preparation, compaction); if (can) decision = compaction;
-      } catch { decision = undefined; }
-      return decision;
-    } };
+    return {
+      // The runner reads `cancel` once after each handler and the host reads it again
+      // after all handlers. Re-evaluate against the host's original branch snapshot so
+      // a later context edit cannot fall through to native compaction with stale prep.
+      get cancel() { return nativePreparationStale(); },
+      get compaction() {
+        if (nativePreparationStale()) return undefined;
+        if (decided) return decision;
+        decided = true;
+        try {
+          const can = refreshPreferenceSync(ctx) && requested && control.canAdopt?.(ctx, event.preparation, compaction); if (can) decision = compaction;
+        } catch { decision = undefined; }
+        return decision;
+      },
+    };
   });
   pi.on("session_compact", (event, ctx) => {
     const pending = foreground, end = pending?.captureEnd();

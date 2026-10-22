@@ -15,18 +15,88 @@ export function metering(response: Pick<AssistantMessage, "stopReason" | "usage"
 }
 
 export type Outcome = "adopted" | "discarded" | "failed" | "cancelled";
+export type FailureStage = "response" | "stream_simple" | "result" | "response_processing";
+export type FailureReason = "non_stop" | "empty_text" | "thinking_only" | "unexpected_content" | "sync_throw" | "promise_rejected" | "malformed_response" | "processing_error" | "unknown";
+export type FailureDiagnostic = {
+  schemaVersion: 1;
+  attemptId: string;
+  stage: FailureStage;
+  reason: FailureReason;
+  stopReason: "stop" | "length" | "toolUse" | "error" | "aborted" | "other" | "unknown";
+  content: { count: number | null; types: Record<string, number>; textLength: number | null; truncated: boolean } | null;
+  errorCategory: string | null;
+  httpStatus: number | null;
+};
+function buildFailureDiagnostic(input: {
+  attemptId: string; stage: FailureStage; reason: FailureReason; response?: unknown; error?: unknown;
+}): FailureDiagnostic {
+  const bounded = (value: unknown, max: number): number | null => typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.min(Math.floor(value), max) : null;
+  const read = (value: unknown, key: string): unknown => { try { return value != null ? (value as Record<string, unknown>)[key] : undefined; } catch { return undefined; } };
+  const rawReason = read(input.response, "stopReason");
+  const stopReason = (["stop", "length", "toolUse", "error", "aborted"] as unknown[]).includes(rawReason) ? rawReason as FailureDiagnostic["stopReason"] : input.response == null ? "unknown" : rawReason === undefined ? "unknown" : "other";
+  let content: FailureDiagnostic["content"] = null;
+  const rawContent = read(input.response, "content");
+  if (Array.isArray(rawContent)) {
+    try {
+      const types: Record<string, number> = {};
+      let totalText = 0, textKnown = true, textTruncated = false;
+      for (let i = 0; i < Math.min(rawContent.length, 256); i++) {
+        const block = rawContent[i], rawType = read(block, "type");
+        const type = (["text", "thinking", "toolCall", "image", "audio", "video", "document", "custom"] as unknown[]).includes(rawType) ? rawType as string : "unknown";
+        types[type] = Math.min((types[type] ?? 0) + 1, 256);
+        if (type === "text") { const text = read(block, "text"); if (typeof text === "string") { if (totalText + text.length > 1_000_000) { textKnown = false; textTruncated = true; } else totalText += text.length; } else textKnown = false; }
+      }
+      const truncated = rawContent.length > 256 || textTruncated;
+      content = { count: truncated ? null : bounded(rawContent.length, 256), types, textLength: textKnown && !truncated ? totalText : null, truncated };
+    } catch { content = null; }
+  }
+  const rawName = read(input.error, "name"), rawCode = read(input.error, "code");
+  const knownErrors = new Set(["AbortError", "TimeoutError", "NetworkError", "RateLimitError", "AuthenticationError", "InvalidRequestError", "ProviderError"]);
+  const knownCodes = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT"]);
+  const rawStatus = read(input.error, "status") ?? read(input.error, "statusCode");
+  const whitelistedStatus = typeof rawStatus === "number" && Number.isInteger(rawStatus) && (new Set([400, 401, 403, 404, 408, 409, 413, 422, 429]).has(rawStatus) || (rawStatus >= 500 && rawStatus <= 599));
+  return {
+    schemaVersion: 1, attemptId: input.attemptId, stage: input.stage, reason: input.reason, stopReason,
+    content, errorCategory: typeof rawName === "string" && knownErrors.has(rawName) ? rawName : typeof rawCode === "string" && knownCodes.has(rawCode) ? rawCode : input.error == null ? null : "unknown",
+    httpStatus: whitelistedStatus ? rawStatus as number : null,
+  };
+}
+export function failureDiagnostic(input: Parameters<typeof buildFailureDiagnostic>[0]): FailureDiagnostic {
+  try { return buildFailureDiagnostic(input); }
+  catch {
+    // Diagnostic extraction must never replace the physical result or interrupt finalization.
+    return { schemaVersion: 1, attemptId: input.attemptId, stage: input.stage, reason: input.reason, stopReason: "unknown", content: null, errorCategory: input.error == null ? null : "unknown", httpStatus: null };
+  }
+}
 export type RecordData = { attemptId: string; model: string; provider: string; outcome: Outcome; metering: Metering; usage: Usage | null; includedInNativeTotals: boolean };
 export type Phase = "generating" | "waiting" | "fallback";
+export type ScheduleTrigger = "assistant_stop" | "completed_tool_turn" | "threshold_offer" | "unknown";
+export type ScheduleReason = "preference_off" | "preference_read_failed" | "unsupported_entry" | "incomplete_turn" | "failed_turn" | "aborted_turn" | "aborted_context" | "pending_input" | "preflight_input" | "no_model" | "effective_settings_unavailable" | "unknown_usage" | "below_threshold" | "slot_busy" | "ready_candidate" | "settings_changed" | "invalid_candidate" | "insufficient_fit" | "cooldown" | "growth" | "no_plan" | "started" | "schedule_error" | "diagnostics_saturated";
+
 export class Reporting {
   private active = new Map<string, { phase: Phase; revision: number }>();
   private recorded = new Set<string>();
+  private scheduleKeys = new Set<string>();
+  private scheduleCount = 0;
+  private scheduleGeneration: number | null = null;
+  private scheduleSaturated = false;
   private pi: ExtensionAPI;
   private append(type: string, data: unknown) { try { this.pi.appendEntry(type, data); } catch { /* diagnostics are best-effort and never alter compaction */ } }
   constructor(pi: ExtensionAPI) {
     this.pi = pi;
-    pi.registerEntryRenderer<{ attemptId: string; revision: number }>("async-compact-progress", entry => ({ render: width => {
+    pi.registerEntryRenderer<{ attemptId: string; revision: number; phase: Phase | "idle" }>("async-compact-progress", entry => ({ render: width => {
       const state = this.active.get(entry.data?.attemptId ?? "");
       return state && state.revision === entry.data?.revision ? [`async-compact ${state.phase === "generating" ? "generating" : state.phase === "waiting" ? "waiting for background summary" : "native fallback"}`.slice(0, width)] : [];
+    }, invalidate() {} }));
+    pi.registerEntryRenderer<FailureDiagnostic>("async-compact-failure", entry => ({ render: width => {
+      const d = entry.data;
+      if (!d || d.schemaVersion !== 1 || typeof d.attemptId !== "string") return [];
+      const allowed = (values: readonly string[], value: unknown): string => typeof value === "string" && values.includes(value) ? value : "unknown";
+      const stage = allowed(["response", "stream_simple", "result", "response_processing"], d.stage);
+      const reason = allowed(["non_stop", "empty_text", "thinking_only", "unexpected_content", "sync_throw", "promise_rejected", "malformed_response", "processing_error", "unknown"], d.reason);
+      const stop = allowed(["stop", "length", "toolUse", "error", "aborted", "other", "unknown"], d.stopReason);
+      const text = `async-compact failure: ${stage}/${reason}; stop=${stop}`;
+      return [text.slice(0, Math.max(0, width))];
     }, invalidate() {} }));
     pi.registerEntryRenderer<RecordData>("async-compact-usage", (entry, options, theme) => {
       const data = entry.data;
@@ -39,22 +109,48 @@ export class Reporting {
       return new Text(theme.fg("muted", `${label}${totals ? ` — ${totals}` : ""}${detail}`), 0, 0);
     });
   }
+  schedule(data: { reason: ScheduleReason; trigger: ScheduleTrigger; generation: number; entry: string; tokens: number | null; window: number | null; reserve: number | null; threshold: number | null; hardLimit: number | null; enabled: boolean }) {
+    try {
+      if (this.scheduleGeneration !== data.generation) {
+        this.scheduleGeneration = data.generation;
+        this.scheduleKeys.clear(); this.scheduleCount = 0; this.scheduleSaturated = false;
+      }
+      // Token counts intentionally do not participate: repeated ordinary low-pressure polling
+      // must not consume separate slots before a later high-pressure reason is observed.
+      const key = `${data.reason}:${data.trigger}:${data.enabled}:${data.entry}:${data.window}:${data.reserve}`;
+      if (this.scheduleKeys.has(key)) return;
+      if (this.scheduleCount >= 64) {
+        if (!this.scheduleSaturated) {
+          this.scheduleSaturated = true;
+          this.append("async-compact-schedule", { schemaVersion: 1, ...data, reason: "diagnostics_saturated", suppressedReason: data.reason });
+        }
+        return;
+      }
+      this.scheduleKeys.add(key);
+      this.scheduleCount++;
+      this.append("async-compact-schedule", { schemaVersion: 1, ...data });
+    } catch { /* diagnostic only */ }
+  }
   start(id: string) { this.phase(id, "generating"); }
   phase(id: string, phase: Phase) {
     const revision = (this.active.get(id)?.revision ?? 0) + 1;
     this.active.set(id, { phase, revision });
-    this.append("async-compact-progress", { attemptId: id, revision });
+    this.append("async-compact-progress", { attemptId: id, revision, phase });
   }
-  finish(data: RecordData) {
+  cancellation(attemptId: string, reason: "deadline" | "user" | "host" | "off" | "scope" | "native" | "unknown") {
+    this.append("async-compact-cancellation", { schemaVersion: 1, attemptId, reason });
+  }
+  finish(data: RecordData, diagnostic?: FailureDiagnostic) {
     this.hide(data.attemptId);
 
     if (this.recorded.has(data.attemptId)) return;
     this.recorded.add(data.attemptId);
     this.append("async-compact-usage", data);
+    if (diagnostic) this.append("async-compact-failure", diagnostic);
   }
   hide(id: string, refresh = false) {
     if (!this.active.delete(id)) return;
     // A context-free entry causes InteractiveMode to render immediately, even without another user event.
-    if (refresh) this.append("async-compact-progress", { attemptId: id, revision: 0 });
+    if (refresh) this.append("async-compact-progress", { attemptId: id, revision: 0, phase: "idle" });
   }
 }

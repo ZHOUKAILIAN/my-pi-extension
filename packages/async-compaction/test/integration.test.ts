@@ -49,11 +49,21 @@ test("actual SDK threshold reuses an earlier user cut without waiting for backgr
     sm.appendMessage({ role: "toolResult", toolCallId: "edit-1", toolName: "edit", content: [{ type: "text", text: "edited" }], isError: false, timestamp: Date.now() });
     await session.prompt(user(2));
     assert.equal(background, 1, `turn_end returned before summary gate opened: ${JSON.stringify({ errors, branch: sm.getBranch().map(e => e.type), usage: session.getContextUsage() })}`);
-    release(); for (let i = 0; i < 100 && !completed; i++) await tick(); await tick();
-    await session.prompt(user(3));
+    const nextTurn = session.prompt(user(3));
+    let waitingAttempt: string | undefined;
+    for (let i = 0; i < 100 && !waitingAttempt; i++) {
+      const waiting = sm.getBranch().find(e => e.type === "custom" && e.customType === "async-compact-progress" && e.data?.revision === 2);
+      if (waiting) waitingAttempt = waiting.data.attemptId;
+      else await tick();
+    }
+    assert.ok(waitingAttempt, "real SDK next-turn threshold waits on the same generating attempt");
+    release(); await nextTurn;
+    for (let i = 0; i < 100 && !completed; i++) await tick(); await tick();
     const branch = sm.getBranch(), compact = branch.find(e => e.type === "compaction");
+    assert.ok(branch.some(e => e.type === "custom" && e.customType === "async-compact-schedule" && e.data?.trigger === "assistant_stop"), "ordinary assistant stop schedules carry their own bounded trigger classification");
     assert.ok(compact, JSON.stringify(errors));
     assert.equal(compact.details?.attemptId?.length > 0, true);
+    assert.equal(compact.details?.attemptId, waitingAttempt, "the waiting promise and adopted JSONL entry preserve the exact same attempt identity");
     assert.match(compact.summary, /CACHED SUMMARY with constraints/);
     assert.doesNotMatch(compact.summary, /synthetic hidden thinking/);
     assert.deepEqual(compact.details?.readFiles, ["history.ts"]);
