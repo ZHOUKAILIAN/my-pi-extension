@@ -5,7 +5,8 @@ import { Reporting, failureDiagnostic, metering, type FailureDiagnostic, type Me
 import { Timing } from "./timing.ts";
 import type { TimingClock } from "./timing.ts";
 
-const GENERATION_BUDGET_MS = 600_000;
+const GENERATION_BUDGET_MS = 900_000;
+const MAX_GENERATION_BUDGET_MS = 2_147_483_000;
 export type BudgetClock = { monotonic: () => number; setTimeout: typeof setTimeout; clearTimeout: typeof clearTimeout };
 const defaultBudgetClock: BudgetClock = { monotonic: () => performance.now(), setTimeout, clearTimeout };
 type Attempt = { id: string; snapshot: Snapshot; provider: string; model: string; abort: AbortController; done: Promise<void>; summary?: string; usage?: Usage; metering: Metering; nativeFallback: boolean; settled: boolean; offered: boolean; cancelled: boolean; deadline: ReturnType<typeof setTimeout>; boundary: string | null; recorded: boolean; timing: ReturnType<Timing["begin"]>; diagnostic?: FailureDiagnostic; deadlineAt: number; cancelReason?: "deadline" | "user" | "host" | "off" | "scope" | "native" | "unknown" };
@@ -126,8 +127,9 @@ export class Controller {
       this.report.schedule({ reason, trigger, generation: this.generation, enabled, entry: typeof ctx.mode === "string" ? ctx.mode.slice(0, 16) : "unknown", tokens: usage?.tokens ?? null, window, reserve, threshold, hardLimit });
     } catch { /* diagnostics never affect scheduling */ }
   }
-  schedule(ctx: ExtensionContext, trigger: ScheduleTrigger = "unknown") {
+  schedule(ctx: ExtensionContext, trigger: ScheduleTrigger = "unknown", configuredBudgetMs = GENERATION_BUDGET_MS) {
     const diagnose = (reason: import("./reporting.ts").ScheduleReason) => this.diagnoseSchedule(reason, ctx, this.enabled, trigger);
+    if (!Number.isSafeInteger(configuredBudgetMs) || configuredBudgetMs < 1_000 || configuredBudgetMs > MAX_GENERATION_BUDGET_MS) { diagnose("invalid_budget"); return; }
     if (!this.enabled) { diagnose("preference_off"); return; }
     if (ctx.mode !== "tui" || this.session !== ctx.sessionManager.getSessionId()) { diagnose("unsupported_entry"); return; }
     if (ctx.signal?.aborted) { diagnose("aborted_context"); return; }
@@ -156,10 +158,10 @@ export class Controller {
     const message = { role: "user" as const, content: [{ type: "text" as const, text: prompt(snapshot) }], timestamp: Date.now() };
     const options = { reasoning: thinking as Parameters<typeof ctx.modelRegistry.streamSimple>[2] extends infer O ? NonNullable<O> extends { reasoning?: infer R } ? R : never : never, signal: abort.signal, cacheRetention: "none" as const };
     let result: Promise<import("@earendil-works/pi-ai").AssistantMessage>;
-    a.timing = this.timing.begin("background_generation", model.id, model.provider);
+    a.timing = this.timing.begin("background_generation", model.id, model.provider, undefined, a.id);
     let expireDeadline = () => {};
     try {
-      a.deadlineAt = this.budgetNow() + GENERATION_BUDGET_MS;
+      a.deadlineAt = this.budgetNow() + configuredBudgetMs;
       expireDeadline = () => {
         if (a.settled || a.cancelled) return;
         a.cancelReason = "deadline"; a.cancelled = true;
@@ -169,7 +171,7 @@ export class Controller {
         if (live) try { this.report.cancellation(a.id, "deadline"); } catch { /* diagnostic only */ }
         this.report.hide(id, live);
       };
-      a.deadline = this.setBudgetTimer(expireDeadline, GENERATION_BUDGET_MS);
+      a.deadline = this.setBudgetTimer(expireDeadline, configuredBudgetMs);
       const stream = ctx.modelRegistry.streamSimple(model, { messages: [message] }, options);
       try { result = stream.result(); }
       catch (error) { a.diagnostic = failureDiagnostic({ attemptId: a.id, stage: "result", reason: "sync_throw", error }); this.observationFailed(ctx, a); return; }
@@ -222,6 +224,7 @@ export class Controller {
         this.fence(ctx);
       }
       this.report.hide(id, live);
+      if (a.summary && !a.cancelled && same) this.notify(ctx, "摘要已就绪，尚未应用", "info");
       if ((!a.summary || a.cancelled) && live) {
         this.record(a, a.cancelled ? "cancelled" : "failed", ctx);
         if (!a.cancelled && same) this.notify(ctx, "async-compact background summary failed; native compaction remains active", "warning");
@@ -313,17 +316,17 @@ export class Controller {
     const a = this.attempt;
     try { return !!a && this.enabled && !a.cancelled && a.offered && this.session === ctx.sessionManager.getSessionId() && this.generation === a.snapshot.generation && compaction.firstKeptEntryId === a.snapshot.cut && !!settings(this.pi, ctx) && JSON.stringify(settings(this.pi, ctx)) === JSON.stringify(preparation.settings) && !ctx.hasPendingMessages() && valid(this.pi, ctx, a.snapshot) && fits(this.pi, ctx, a.snapshot, compaction.summary, preparation.tokensBefore); } catch { return false; }
   }
-  compact(ctx: ExtensionContext, _entry: CompactionEntry) {
+  compact(ctx: ExtensionContext, _entry: CompactionEntry): string | null {
     // The host event can reference an older entry with identical summary text.
     // Deduplicate by the latest committed entry on the active branch instead.
     const branch = ctx.sessionManager.getBranch();
     const committed = branch.filter(e => e.type === "compaction").at(-1);
-    if (committed?.id && this.lastCompactId === committed.id) return;
+    if (committed?.id && this.lastCompactId === committed.id) return null;
     if (committed?.id) this.lastCompactId = committed.id;
     this.clearNative(ctx);
-    if (!committed) return;
+    if (!committed) return null;
     const a = this.attempt;
-    if (!a || a.nativeFallback) { this.afterNative(ctx, false); return; }
+    if (!a || a.nativeFallback) { this.afterNative(ctx, false); return null; }
     const boundaryIndex = branch.findIndex(e => e.id === a.boundary);
     const fresh = branch.slice(boundaryIndex + 1).filter(e => e.type === "compaction").at(-1);
     const details = committed.details;
@@ -345,9 +348,10 @@ export class Controller {
       && boundaryIndex >= 0 && fresh?.id === committed.id;
     if (!a.settled) { a.nativeFallback = true; this.cancel(ctx, "native"); } // Keep the physical slot and fence retries after settlement.
     else this.record(a, adopted ? "adopted" : "discarded", ctx);
-    if (adopted) this.notify(ctx, "async-compact context updated", "info");
+    if (adopted) this.notify(ctx, "已采用后台摘要", "info");
     if (a.settled) this.attempt = null;
     this.afterNative(ctx, !!adopted);
+    return adopted ? a.id : null;
   }
   failed(ctx: ExtensionContext) {
     this.clearNative(ctx);

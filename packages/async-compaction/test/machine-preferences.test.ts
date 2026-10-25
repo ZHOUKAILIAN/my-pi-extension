@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { readMachinePreference, writeMachinePreference } from '../src/machine-settings.ts';
+import { readMachineBudget, readMachinePreference, writeMachinePreference } from '../src/machine-settings.ts';
 const readPreference = async (root: string, _name: string) => { const result = await readMachinePreference('asyncCompaction', `${root}/settings.json`); return { snapshot: { enabled: result.value ?? false } }; };
 const writePreference = async (root: string, _name: string, value: boolean) => writeMachinePreference('asyncCompaction', value, `${root}/settings.json`);
 import { SessionManager } from '@earendil-works/pi-coding-agent';
@@ -13,7 +13,7 @@ import extension from '../src/index.ts';
 const cli = fileURLToPath(import.meta.resolve('@earendil-works/pi-coding-agent')).replace(/\/dist\/index\.js$/, '/dist/bundle/cli.js');
 const prefs: string[] = [];
 test.after(() => { for (const dir of prefs) rmSync(dir, { recursive: true, force: true }); });
-function harness(agentDir: string, contextOverrides: Record<string, unknown> = {}) {
+function harness(agentDir: string, contextOverrides: Record<string, unknown> = {}, dependencies: Record<string, unknown> = {}) {
   const lists = new Map<string, Function[]>(), handlers = new Map<string, Function>(), entries: { type: string; data: any }[] = []; let command!: (args: string, ctx: any) => Promise<void>;
   const emit = async (name: string, ...args: any[]) => { let result: unknown; for (const callback of lists.get(name) ?? []) { const value = await callback(...args); if (value !== undefined) result = value; } return result; };
   const pi: any = {
@@ -22,7 +22,7 @@ function harness(agentDir: string, contextOverrides: Record<string, unknown> = {
     on: (name: string, callback: Function) => { const entries = lists.get(name) ?? []; entries.push(callback); lists.set(name, entries); handlers.set(name, (...args: any[]) => emit(name, ...args)); },
   };
   const previous = process.env.PI_CODING_AGENT_DIR; process.env.PI_CODING_AGENT_DIR = agentDir;
-  try { extension(pi, { settingsFile: join(agentDir, 'settings.json'), submitMetric: async () => { throw new Error('unexpected metric'); } }); }
+  try { extension(pi, { settingsFile: join(agentDir, 'settings.json'), submitMetric: async () => { throw new Error('unexpected metric'); }, ...dependencies } as any); }
   finally { if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previous; }
   const notices: string[] = [];
   const ctx = {
@@ -35,6 +35,69 @@ function harness(agentDir: string, contextOverrides: Record<string, unknown> = {
   return { handlers, command, ctx, notices, emit, entries };
 }
 function supportedArgv(): string[] { return ['node', cli]; }
+
+test('machine timeout budget is global-only, defaults to 900s, strictly validates integers and survives preference writes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'async-budget-config-')); prefs.push(root);
+  const file = join(root, 'settings.json');
+  writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true }, compaction: { enabled: false } }));
+  assert.deepEqual(await readMachineBudget(file), { fileValid: true, enabledValid: true, enabled: true, valid: true, milliseconds: 900_000 });
+  for (const [value, expected] of [[1200, true], [1, true], [2_147_483, true], [0, false], [-1, false], [1.5, false], ["1200", false], [2_147_484, false]] as const) {
+    writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true, asyncCompactionTimeoutSeconds: value }, compaction: { enabled: false } }));
+    const result = await readMachineBudget(file);
+    assert.equal(result.fileValid, true);
+    assert.equal(result.valid, expected, `timeout ${JSON.stringify(value)} validation`);
+    if (expected) assert.equal(result.milliseconds, value * 1000);
+  }
+  writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true, asyncCompactionTimeoutSeconds: 1200 } }));
+  await writeMachinePreference('asyncCompaction', false, file);
+  assert.equal((JSON.parse(readFileSync(file, 'utf8')) as any).myPiExtensions.asyncCompactionTimeoutSeconds, 1200, 'on/off writes preserve the timeout key');
+  assert.deepEqual(await readMachineBudget(file), { fileValid: true, enabledValid: true, enabled: false, valid: true, milliseconds: 1_200_000 });
+  writeFileSync(file, '{broken');
+  assert.deepEqual(await readMachineBudget(file), { fileValid: false, enabledValid: false, valid: false, milliseconds: 900_000 }, 'malformed entire file is distinguished from an invalid budget field');
+});
+
+test('extension captures global 1200s deadline once; later invalid config neither cancels nor resets the in-flight attempt', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'async-budget-capture-')); prefs.push(root);
+  await writeMachinePreference('asyncCompaction', true, join(root, 'settings.json'));
+  const file = join(root, 'settings.json');
+  writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true, asyncCompactionTimeoutSeconds: 1200 } }));
+  const sm = SessionManager.inMemory(root), usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+  for (let i = 0; i < 2; i++) { sm.appendMessage({ role: 'user', content: [{ type: 'text', text: `u${i} ${'word '.repeat(160)}` }], timestamp: Date.now() }); sm.appendMessage({ role: 'assistant', content: [{ type: 'text', text: `a${i} ${'answer '.repeat(40)}` }], api: 'fake-api', provider: 'fake', model: 'm', stopReason: 'stop', usage, timestamp: Date.now() }); }
+  const timers: { delay: number; callback: () => void; active: boolean }[] = [], signals: AbortSignal[] = [], notices: string[] = [];
+  const budgetClock = { monotonic: () => 100, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; timers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((timer: any) => { if (timer) timer.active = false; }) as typeof clearTimeout };
+  const ctx: any = { mode: 'tui', model: { provider: 'fake', id: 'm', api: 'fake-api', contextWindow: 4096 }, thinkingLevel: 'off', sessionManager: sm, hasPendingMessages: () => false, getSystemPrompt: () => 'system', getContextUsage: () => ({ tokens: 2900, contextWindow: 4096 }), modelRegistry: { streamSimple: (_m: unknown, _c: unknown, options: { signal: AbortSignal }) => { signals.push(options.signal); return { result: () => new Promise(() => {}) }; } }, ui: { notify(message: string) { notices.push(message); }, onTerminalInput: () => () => {} } };
+  const oldArgv = process.argv; process.argv = supportedArgv();
+  try {
+    const h = harness(root, ctx, { budgetClock }); await h.emit('session_start', {}, ctx);
+    await h.emit('turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    assert.equal(signals.length, 1);
+    assert.ok(timers.some(timer => timer.active && timer.delay === 1_200_000), 'global 1200 second value is used for the real extension schedule');
+    const deadline = timers.find(timer => timer.active && timer.delay === 1_200_000)!;
+    writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true, asyncCompactionTimeoutSeconds: 1.5 } }));
+    await h.emit('turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    assert.equal(signals[0].aborted, false, 'invalid next-task setting does not cancel the captured task');
+    assert.equal(deadline.active, true, 'invalid setting does not reset or shorten the old absolute timer');
+    assert.equal(signals.length, 1);
+    assert.match(notices.join(' '), /timeout setting is invalid.*native compaction remains available/u);
+    writeFileSync(file, '{broken');
+    await h.emit('turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, ctx);
+    assert.equal(signals[0].aborted, true, 'an unreadable whole settings file retains existing Off/fence cancellation behavior');
+    await h.emit('session_shutdown', {}, ctx);
+
+    writeFileSync(file, JSON.stringify({ myPiExtensions: { asyncCompaction: true, asyncCompactionTimeoutSeconds: 7 } }));
+    const nextSm = SessionManager.inMemory(root);
+    for (let i = 0; i < 2; i++) { nextSm.appendMessage({ role: 'user', content: [{ type: 'text', text: `next-u${i} ${'word '.repeat(160)}` }], timestamp: Date.now() }); nextSm.appendMessage({ role: 'assistant', content: [{ type: 'text', text: `next-a${i} ${'answer '.repeat(40)}` }], api: 'fake-api', provider: 'fake', model: 'm', stopReason: 'stop', usage, timestamp: Date.now() }); }
+    const nextTimers: { delay: number; callback: () => void; active: boolean }[] = [];
+    const nextBudgetClock = { monotonic: () => 5, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; nextTimers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((timer: any) => { if (timer) timer.active = false; }) as typeof clearTimeout };
+    let nextCalls = 0;
+    const nextCtx: any = { mode: 'tui', model: ctx.model, thinkingLevel: 'off', sessionManager: nextSm, hasPendingMessages: () => false, getSystemPrompt: () => 'system', getContextUsage: () => ({ tokens: 2900, contextWindow: 4096 }), modelRegistry: { streamSimple: (_m: unknown, _c: unknown, options: { signal: AbortSignal }) => { nextCalls++; return { result: () => new Promise(() => {}) }; } }, ui: { notify() {}, onTerminalInput: () => () => {} } };
+    const next = harness(root, nextCtx, { budgetClock: nextBudgetClock }); await next.emit('session_start', {}, nextCtx);
+    await next.emit('turn_end', { message: { role: 'assistant', stopReason: 'stop' } }, nextCtx);
+    assert.equal(nextCalls, 1);
+    assert.ok(nextTimers.some(timer => timer.active && timer.delay === 7_000), 'a manual global-file edit applies to the next task deadline');
+    await next.emit('session_shutdown', {}, nextCtx);
+  } finally { process.argv = oldArgv; }
+});
 
 test('preference command tests ignore inherited external settings override and only write their fixture root', async () => {
   const externalRoot = mkdtempSync(join(tmpdir(), 'async-external-sentinel-'));

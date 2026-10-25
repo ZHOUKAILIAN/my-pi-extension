@@ -49,10 +49,10 @@ test("SDK threshold fallback commits natively while physical background slot is 
     await session.prompt(user(1)); await session.prompt(user(2));
     assert.equal(background, 1, JSON.stringify(errors));
     const pending = session.prompt(user(3));
-    for (let i = 0; i < 100 && timers.filter(timer => timer.active && timer.delay === 600_000).length < 2; i++) await tick();
-    const waitTimer = timers.filter(timer => timer.active && timer.delay === 600_000).at(-1);
+    for (let i = 0; i < 100 && timers.filter(timer => timer.active && timer.delay === 900_000).length < 2; i++) await tick();
+    const waitTimer = timers.filter(timer => timer.active && timer.delay === 900_000).at(-1);
     assert.ok(waitTimer, "SDK threshold entered the same-task background wait");
-    now = 600_000; waitTimer.callback();
+    now = 900_000; waitTimer.callback();
     await pending; // fake-clock deadline expires while provider ignores abort
     assert.ok(sm.getBranch().some(e => e.type === "compaction" && !e.fromHook), JSON.stringify(errors));
     const stage = sm.getBranch().find(e => e.type === "custom" && e.customType === "async-compact-timing" && e.data?.kind === "foreground_compaction");

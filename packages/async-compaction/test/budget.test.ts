@@ -43,7 +43,7 @@ function trackAbortListeners(signal: AbortSignal) {
   return () => ({ adds, removes });
 }
 
-test("600s budget starts at streamSimple, spends only the remainder, duplicate offers cannot renew it, timeout keeps the physical slot", async () => {
+test("900s budget starts at streamSimple, spends only the remainder, duplicate offers cannot renew it, timeout keeps the physical slot", async () => {
   const f = fixture();
   f.setNow(1234);
   const scope = new AbortController(); f.ctx.signal = scope.signal;
@@ -51,27 +51,43 @@ test("600s budget starts at streamSimple, spends only the remainder, duplicate o
   f.controller.schedule(f.ctx);
   assert.equal(f.calls(), 1);
   const trackedAttempt = trackAbortListeners(f.requestSignals[0]);
-  f.setNow(1234 + 250_000);
+  f.setNow(1234 + 300_000);
   const hostSignal = new AbortController().signal;
   const trackedHost = trackAbortListeners(hostSignal);
   const offer = f.controller.offer(f.ctx, preparation, hostSignal);
   await tick();
-  const waitTimer = f.timers.find(timer => timer.delay === 350_000 && timer.active);
-  assert.ok(waitTimer, "foreground waits the remaining 350 seconds, not a fresh budget");
+  const waitTimer = f.timers.find(timer => timer.delay === 600_000 && timer.active);
+  assert.ok(waitTimer, "foreground waits the remaining 600 seconds, not a fresh budget");
   assert.equal(await f.controller.offer(f.ctx, preparation, hostSignal), undefined, "a duplicate offer does not start another waiter");
-  f.setNow(1234 + 600_000);
+  f.setNow(1234 + 900_000);
   waitTimer.callback();
   const result = await offer;
   assert.equal(result, undefined);
   assert.equal(f.entries.find(entry => entry.kind === "async-compact-cancellation")?.data.reason, "deadline", "deadline is not confused with a user stop");
   for (const [name, counts] of [["host", trackedHost()], ["attempt", trackedAttempt()], ["scope", trackedScope()]] as const) assert.equal(counts.adds, counts.removes, `${name} abort listener is removed after timeout`);
-  assert.equal(f.timers.some(timer => timer.active && timer.delay === 600_000), false, "terminal timeout clears the generation deadline");
+  assert.equal(f.timers.some(timer => timer.active && timer.delay === 900_000), false, "terminal timeout clears the generation deadline");
   assert.equal(f.calls(), 1);
   f.controller.schedule(f.ctx);
   assert.equal(f.calls(), 1, "timeout does not release the physical slot before provider settlement");
   f.resolve(); await tick(); await tick();
   assert.equal(f.entries.filter(entry => entry.kind === "async-compact-usage").length, 1, "late physical usage settles once");
   assert.equal(f.entries.find(entry => entry.kind === "async-compact-cancellation")?.data.reason, "deadline");
+});
+
+test("a newly scheduled attempt captures its configured absolute budget while the default remains 900s", async () => {
+  const configured = fixture(); configured.controller.schedule(configured.ctx, "assistant_stop", 1_200_000);
+  assert.equal(configured.timers.find(timer => timer.active)?.delay, 1_200_000, "configured 1200s is captured at SDK start");
+  configured.setNow(600_000);
+  const pending = configured.controller.offer(configured.ctx, preparation, new AbortController().signal);
+  await tick();
+  assert.ok(configured.timers.some(timer => timer.active && timer.delay === 600_000), "threshold wait consumes only the original captured remainder");
+  configured.controller.schedule(configured.ctx, "assistant_stop", 1_000);
+  assert.equal(configured.timers.some(timer => timer.active && timer.delay === 1_200_000), true, "later scheduling input cannot change the existing absolute deadline");
+  configured.controller.set(false, configured.ctx); await pending; configured.resolve("aborted"); await tick();
+
+  const invalid = fixture(); invalid.controller.schedule(invalid.ctx, "assistant_stop", 1.5);
+  assert.equal(invalid.calls(), 0, "invalid budget fails closed before any provider request");
+  assert.equal(invalid.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "invalid_budget");
 });
 
 test("an initially invalid candidate returns without waiting on its otherwise-valid in-flight request", async () => {
@@ -101,10 +117,10 @@ test("in-flight attempts do not wait when a later oversized text or image tail m
   }
 });
 
-test("ready response before the deadline is offerable; a response at the exact deadline loses once", async () => {
-  const before = fixture(); before.controller.schedule(before.ctx); before.setNow(599_999); before.resolve(); await tick(); await tick();
-  assert.ok(await before.controller.offer(before.ctx, preparation, new AbortController().signal), "a ready result before the absolute deadline remains usable");
-  const at = fixture(); at.controller.schedule(at.ctx); at.setNow(600_000); at.resolve(); await tick(); await tick();
+test("600s remains inside the default 900s deadline; exact deadline response loses once", async () => {
+  const before = fixture(); before.controller.schedule(before.ctx); before.setNow(600_000); before.resolve(); await tick(); await tick();
+  assert.ok(await before.controller.offer(before.ctx, preparation, new AbortController().signal), "600 seconds does not trigger the default 900 second deadline");
+  const at = fixture(); at.controller.schedule(at.ctx); at.setNow(900_000); at.resolve(); await tick(); await tick();
   assert.equal(await at.controller.offer(at.ctx, preparation, new AbortController().signal), undefined, "the absolute deadline linearizes before a response at the same instant");
   assert.equal(at.entries.filter(entry => entry.kind === "async-compact-cancellation" && entry.data.reason === "deadline").length, 1);
   assert.equal(at.entries.filter(entry => entry.kind === "async-compact-usage").length, 1);

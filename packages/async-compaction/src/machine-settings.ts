@@ -14,6 +14,21 @@ const lockfile = createRequire(import.meta.url)('proper-lockfile') as LockApi;
 export type MachineExtensionSettings = { fast?: boolean; asyncCompaction?: boolean; [key: string]: unknown };
 export type MachineSettingsDocument = { [key: string]: unknown; myPiExtensions?: MachineExtensionSettings };
 export type MachinePreference = 'fast' | 'asyncCompaction';
+export type MachineBudgetResult = { fileValid: boolean; enabledValid: boolean; enabled?: boolean; valid: boolean; milliseconds: number };
+export const DEFAULT_ASYNC_COMPACTION_TIMEOUT_SECONDS = 900;
+export const MAX_ASYNC_COMPACTION_TIMEOUT_SECONDS = 2_147_483;
+const validTimeoutSeconds = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 && value <= MAX_ASYNC_COMPACTION_TIMEOUT_SECONDS;
+function budgetFromDocument(document: MachineSettingsDocument | undefined): MachineBudgetResult {
+  if (!document) return { fileValid: false, enabledValid: false, valid: false, milliseconds: DEFAULT_ASYNC_COMPACTION_TIMEOUT_SECONDS * 1000 };
+  const enabled = preferenceValue(document, 'asyncCompaction');
+  const enabledValid = document.myPiExtensions?.asyncCompaction === undefined || enabled !== undefined;
+  const base = { fileValid: true, enabledValid, ...(enabled !== undefined ? { enabled } : {}) };
+  const value = document.myPiExtensions?.asyncCompactionTimeoutSeconds;
+  if (value === undefined) return { ...base, valid: true, milliseconds: DEFAULT_ASYNC_COMPACTION_TIMEOUT_SECONDS * 1000 };
+  return validTimeoutSeconds(value)
+    ? { ...base, valid: true, milliseconds: value * 1000 }
+    : { ...base, valid: false, milliseconds: DEFAULT_ASYNC_COMPACTION_TIMEOUT_SECONDS * 1000 };
+}
 const MAX_BYTES = 1024 * 1024;
 const LOCK_OPTIONS = { stale: 5000, update: 1000, retries: { retries: 8, minTimeout: 20, maxTimeout: 125 } };
 const LOCK_SYNC_OPTIONS = { ...LOCK_OPTIONS, retries: { retries: 0 } };
@@ -129,6 +144,18 @@ function atomicWriteSync(file: string, document: MachineSettingsDocument): void 
   const fd = openSync(temporary, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
   try { writeFileSync(fd, text, 'utf8'); } finally { closeSync(fd); }
   renameSync(temporary, file); if (originalMode !== 0o600) chmodSync(file, originalMode);
+}
+export async function readMachineBudget(explicit?: string): Promise<MachineBudgetResult> {
+  let file: string;
+  try { file = settingsFile(explicit); } catch { return { fileValid: false, enabledValid: false, valid: false, milliseconds: 900_000 }; }
+  try { return await withLock(file, async () => budgetFromDocument(await readUnlocked(file))); }
+  catch { return { fileValid: false, enabledValid: false, valid: false, milliseconds: 900_000 }; }
+}
+export function readMachineBudgetSync(explicit?: string): MachineBudgetResult {
+  let file: string;
+  try { file = settingsFile(explicit); } catch { return { fileValid: false, enabledValid: false, valid: false, milliseconds: 900_000 }; }
+  try { return withLockSync(file, () => budgetFromDocument(readUnlockedSync(file))); }
+  catch { return { fileValid: false, enabledValid: false, valid: false, milliseconds: 900_000 }; }
 }
 export async function readMachinePreference(preference: MachinePreference, explicit?: string): Promise<{ value?: boolean; valid: boolean }> {
   let file: string;

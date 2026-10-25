@@ -71,7 +71,7 @@ export function failureDiagnostic(input: Parameters<typeof buildFailureDiagnosti
 export type RecordData = { attemptId: string; model: string; provider: string; outcome: Outcome; metering: Metering; usage: Usage | null; includedInNativeTotals: boolean };
 export type Phase = "generating" | "waiting" | "fallback";
 export type ScheduleTrigger = "assistant_stop" | "completed_tool_turn" | "threshold_offer" | "unknown";
-export type ScheduleReason = "preference_off" | "preference_read_failed" | "unsupported_entry" | "incomplete_turn" | "failed_turn" | "aborted_turn" | "aborted_context" | "pending_input" | "preflight_input" | "no_model" | "effective_settings_unavailable" | "unknown_usage" | "below_threshold" | "slot_busy" | "ready_candidate" | "settings_changed" | "invalid_candidate" | "insufficient_fit" | "cooldown" | "growth" | "no_plan" | "started" | "schedule_error" | "diagnostics_saturated";
+export type ScheduleReason = "preference_off" | "preference_read_failed" | "unsupported_entry" | "incomplete_turn" | "failed_turn" | "aborted_turn" | "aborted_context" | "pending_input" | "preflight_input" | "no_model" | "effective_settings_unavailable" | "unknown_usage" | "invalid_budget" | "below_threshold" | "slot_busy" | "ready_candidate" | "settings_changed" | "invalid_candidate" | "insufficient_fit" | "cooldown" | "growth" | "no_plan" | "started" | "schedule_error" | "diagnostics_saturated";
 
 export class Reporting {
   private active = new Map<string, { phase: Phase; revision: number }>();

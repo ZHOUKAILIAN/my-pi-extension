@@ -1,7 +1,7 @@
 import { readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { buildSessionProjection, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { readMachinePreference, readMachinePreferenceSync, updateMachinePreference, settingsFile } from './machine-settings.ts';
+import { readMachinePreference, readMachinePreferenceSync, readMachineBudget, updateMachinePreference, settingsFile } from './machine-settings.ts';
 import { installCompactionDurationObserver } from './duration.ts';
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import { Controller, type BudgetClock } from "./controller.ts";
@@ -54,6 +54,7 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
   const machinePreferenceFile = settingsFile(dependencies.settingsFile);
   let requested = false;
   let observed: boolean | undefined;
+  let budgetNoticeShown = false;
   let preferenceQueue: Promise<unknown> = Promise.resolve();
   // Normal main TUI is the supported entry; this is not an isolated-profile
   // development hook. The command remains explicitly user-controlled.
@@ -149,7 +150,24 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
     if (reason === "aborted") { control.diagnoseSchedule("aborted_turn", ctx, true, trigger); return; }
     if (reason !== "stop" && reason !== "toolUse") { control.diagnoseSchedule("failed_turn", ctx, true, trigger); return; }
     if (!stopTurn && !completedToolTurn) { control.diagnoseSchedule("incomplete_turn", ctx, true, trigger); return; }
-    control.schedule(ctx, trigger);
+    const budget = await readMachineBudget(machinePreferenceFile);
+    if (!budget.fileValid) {
+      requested = false; observed = undefined;
+      try { applyPreference(false, ctx); } catch { /* preserve Off/fence even if terminal input wiring fails */ }
+      control.diagnoseSchedule("preference_read_failed", ctx, false, trigger); return;
+    }
+    if (!budget.enabledValid || budget.enabled !== true) {
+      requested = false; observed = budget.enabledValid ? false : undefined;
+      try { applyPreference(false, ctx); } catch { /* preserve Off/fence */ }
+      control.diagnoseSchedule(budget.enabledValid ? "preference_off" : "preference_read_failed", ctx, false, trigger); return;
+    }
+    if (!budget.valid) {
+      control.diagnoseSchedule("invalid_budget", ctx, true, trigger);
+      if (!budgetNoticeShown) { budgetNoticeShown = true; notify(ctx, "async-compact timeout setting is invalid; native compaction remains available", "warning"); }
+      return;
+    }
+    budgetNoticeShown = false;
+    control.schedule(ctx, trigger, budget.milliseconds);
   });
   pi.on("session_before_compact", async (event, ctx) => {
     if (durationEnabled) { try { duration.before(event, ctx); } catch { /* diagnostic only */ } }
@@ -220,15 +238,18 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
   });
   pi.on("session_compact", (event, ctx) => {
     const pending = foreground, end = pending?.captureEnd();
-    try { duration.compact(event, ctx); } catch { /* diagnostic only */ }
+    const durationEnd = duration.captureEnd();
+    let adoptedAttemptId: string | null = null;
+    try { adoptedAttemptId = control.compact(ctx, event.compactionEntry) ?? null; } catch { /* controller bookkeeping is isolated from observer */ }
+    try { duration.compact(event, ctx, adoptedAttemptId, durationEnd); } catch { /* diagnostic only */ }
     if (pending && pending.session === ctx.sessionManager.getSessionId() && pending.epoch === control.timing.epoch) { foreground = null; pending.finish("completed", undefined, end); }
-    control.compact(ctx, event.compactionEntry);
   });
   pi.on("session_compact_failed", (event, ctx) => {
     const pending = foreground, end = pending?.captureEnd();
-    try { duration.failed(event, ctx); } catch { /* diagnostic only */ }
-    if (pending && pending.session === ctx.sessionManager.getSessionId() && pending.epoch === control.timing.epoch) { foreground = null; pending.finish(event.aborted ? "cancelled" : "failed", undefined, end); }
+    const durationEnd = duration.captureEnd();
     control.failed(ctx);
+    try { duration.failed(event, ctx, durationEnd); } catch { /* diagnostic only */ }
+    if (pending && pending.session === ctx.sessionManager.getSessionId() && pending.epoch === control.timing.epoch) { foreground = null; pending.finish(event.aborted ? "cancelled" : "failed", undefined, end); }
   });
   return { shutdown };
 }

@@ -150,10 +150,10 @@ for (const action of ["complete", "cancel", "cancel-kitty", "cancel-csiu", "canc
       const pending = session.prompt(user(3));
       for (let i = 0; i < 100 && phase() !== "async-compact waiting for background summary"; i++) await tick();
       assert.equal(phase(), "async-compact waiting for background summary", view());
-      for (let i = 0; i < 100 && budgetTimers.filter(timer => timer.active && timer.delay === 600_000).length < 2; i++) await tick();
-      const waitTimer = budgetTimers.filter(timer => timer.active && timer.delay === 600_000).at(-1);
-      assert.ok(waitTimer, "the active threshold wait is governed by the shared 600-second deadline");
-      budgetNow = 600_000; waitTimer.callback();
+      for (let i = 0; i < 100 && budgetTimers.filter(timer => timer.active && timer.delay === 900_000).length < 2; i++) await tick();
+      const waitTimer = budgetTimers.filter(timer => timer.active && timer.delay === 900_000).at(-1);
+      assert.ok(waitTimer, "the active threshold wait is governed by the shared 900-second deadline");
+      budgetNow = 900_000; waitTimer.callback();
       for (let i = 0; i < 100 && phase() !== "async-compact native fallback"; i++) await tick();
       assert.equal(phase(), "async-compact native fallback", view());
       release(); await tick(); await tick();

@@ -5,7 +5,7 @@
 | 项目 | 状态 |
 | --- | --- |
 | 产品依据 | [L1](../01-产品定义/扩展/async-compaction-扩展.md)：本机统一开关、全部 Pi Agent 与压缩耗时 |
-| 当前源码 | 本包实现完整回复/工具轮调度、候选 fencing、600 秒共享生成预算、原生入口等待与复用、阶段计量及安全本地诊断；SDK Worker 的 managed factory 接线不等于非 TUI 后台调度已开放 |
+| 当前源码 | 本包实现完整回复/工具轮调度、候选 fencing、本机可配置共享生成预算、原生入口等待与复用、阶段计量、压缩效果估算及安全本地诊断；SDK Worker 的 managed factory 接线不等于非 TUI 后台调度已开放 |
 | 当前准入 | CLI 版本由 `supportedHost()` 核验，后台调度仍要求 TUI；不要求 `--no-extensions` 单扩展 profile。已直接验证 Pi 1.0.4 / 1.1.0，peer 范围不代表每个 patch 都已验证 |
 | 验证边界 | Pi 1.1.0 类型检查及 1.0.4/1.1.0 的合成 SDK/TUI 路径已有证据；真实 provider 性能、实际用户终端、全部 Agent 接线及任意第三方组合仍未验收 |
 
@@ -129,7 +129,7 @@ flowchart TD
 | `reporting.ts` | 有界调度原因、过程阶段、取消/失败分类、用量记录和去重；均为非模型上下文本地诊断 |
 | `tool-turn.ts` | 核对工具调用与结果的完整性、成功状态及已持久化 entry 身份 |
 | `timing.ts` | Async 后台生成与符合条件的 threshold 前台阶段计时、epoch 隔离及历史 renderer |
-| `duration.ts` | 当前主 TUI 的通用阶段 observer 与 renderer 候选；目标扩展到全部入口，本地记录不使用 project-metrics |
+| `duration.ts` | 当前主 TUI 的通用阶段 observer、严格采用来源展示、提交前后同口径上下文估算及 renderer；目标扩展到全部入口，本地记录不使用 project-metrics |
 | `packages/async-compaction/src/machine-settings.ts`、`duration-schema.ts` | 本包专用偏好 I/O 与耗时合同；不引入共享状态层 |
 
 Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只有宿主负责提交压缩记录。
@@ -161,7 +161,7 @@ Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只
 
 ## 4. 阈值与任务预算
 
-以下是当前预览实现使用的参数与规则；功能默认关闭，不新增用户级参数配置：
+以下是当前预览实现使用的参数与规则；功能默认关闭。共享生成预算使用 [L3 本机配置](../03-项目落地/项目配置.md#本机功能开关)的 `myPiExtensions.asyncCompactionTimeoutSeconds`，不新增命令或单独配置文件：
 
 | 参数 | 当前值 / 规则 |
 | --- | --- |
@@ -169,16 +169,18 @@ Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只
 | 硬限制 | 由 Pi 原生压缩控制；扩展不关闭或抬高该边界 |
 | 保留原文预算 | 读取宿主的 `keepRecentTokens`，不另维护一份同名设置 |
 | 后台并发 | 每个主会话最多 1 个本扩展任务 |
-| 生成总预算 | 600 秒，从实际调用后台 SDK 前以单调时钟建立一次绝对 deadline；与诊断计时独立 |
+| 生成总预算 | 缺省 900 秒；下一次调度从同一本机全局文件读取并捕获有效预算，在实际调用后台 SDK 前以单调时钟建立一次绝对 deadline；与诊断计时独立 |
 | 原生入口等待已有任务 | 仅等待同一合格在途任务的剩余生成预算，不重新计时；已 ready 直接校验复用，无候选/失败/失效/到期则走原生 |
 | 失败后重做 | 至少冷却 60 秒且新增约 8000 tokens；同一压缩代际最多启动 2 次 |
 | 模型策略 | 当前实际聊天模型、provider 和 thinking；首版不增加自动模型 fallback |
+
+预算字段不接受项目合并值；秒数、有效范围和缺省值由 L3 拥有。读取预算时同时核验同一快照的开关，避免 Off 被旧读取覆盖；仅预算字段非法时记录 `invalid_budget` 并有界提示，不新增后台调用、不取消已有合法预算的任务。整份文件读取失败或开关无效时仍执行现有 Off/fence 规则。修改预算只影响下一次任务，不重置旧 deadline；on/off 的锁内写回保留此字段。
 
 用 `ctx.getContextUsage()` 和当前模型信息评估软触发，不把物理窗口当作剩余预算。通过 `pi.getSettings()` 读取宿主当前合并/内存设置，逐字段解析型号 override 及 fallback，不另读一份配置文件。采用时与 `preparation.settings` 对账；设置或窗口无法可靠解析时走原生路径。
 
 H 由当前型号窗口减去有效 reserve 得到；输入包括 system/tools 等已有内容。`hasPendingMessages()` 为真而无法取得体积时，拒绝采用候选；新输入尚未落入分支的 preflight 也按未知输入旁路，不能以“队列为空”推定没有即将发送的内容。已物化历史的运行中 next-turn 与 post-run 自动 threshold 可以等待，不再只限 post-run 窗口。超大工具结果仍可能一次跨过软硬阈值，交由原生保护与 overflow 恢复处理。
 
-等待同时竞争物理结果、剩余 deadline、宿主压缩 signal、本地取消及作用域 signal，并在退出时清理最初注册对象上的监听。用户/宿主取消结束当前压缩，不以原生兜底抵消取消；Off 允许原生继续。正常结束会清理生成 timer，截止竞争只使候选终态化一次。到期仅尽力 abort，物理请求未结算时仍占槽，迟到用量按真实结果单次结算；600 秒不包含随后原生兜底的耗时。
+等待同时竞争物理结果、剩余 deadline、宿主压缩 signal、本地取消及作用域 signal，并在退出时清理最初注册对象上的监听。用户/宿主取消结束当前压缩，不以原生兜底抵消取消；Off 允许原生继续。正常结束会清理生成 timer，截止竞争只使候选终态化一次。到期仅尽力 abort，物理请求未结算时仍占槽，迟到用量按真实结果单次结算；捕获的生成预算不包含随后原生兜底的耗时。
 
 ## 5. 快照与覆盖边界
 
@@ -245,11 +247,17 @@ Pi 1.1.0 的 runner 依次 await handler，并保留最后一个非空返回对�
 | shutdown | 禁止启动和采用，取消任务并有界结算已知用量；未结算后台计时以 `scope_left` 记 unknown，不阻塞退出，不使用失效 context 写入新会话 |
 | timing scope | Async 后台/threshold 阶段计时与通用 `compaction-duration` observer 分开。前者不随 Off、Esc 或 native commit 截断；后者在主 TUI 对 manual/threshold/overflow 开始独立单调计时，不依赖 Async 开关。shutdown 可在原 scope 记录 unknown；成功 tree 直接丢弃旧 branch 诊断，避免写入新分支。RPC/JSON/headless 不写通用行 |
 
-执行摘要时显示 `async-compact generating`，hook 等待期间显示 `waiting for background summary`；启用且受支持的 threshold 路径，包括 input preflight 旁路，在交还原生时显示 `native fallback`，终态或离开后收起。manual/overflow 使用宿主原生提示。非模型上下文 progress entry 含 attemptId、revision 和有限 phase，生成、等待、原生兜底及隐藏状态可在历史中区分；恢复历史不复活已结束的进度。不占 footer、不抢输入，也不覆盖其他工作消息。
+执行摘要时显示 `async-compact generating`，生成成功且仍属有效作用域时通知“摘要已就绪，尚未应用”；只有严格匹配宿主实际提交才通知“已采用后台摘要”。hook 等待期间显示 `waiting for background summary`；启用且受支持的 threshold 路径，包括 input preflight 旁路，在交还原生时显示 `native fallback`，终态或离开后收起。manual/overflow 使用宿主原生提示。非模型上下文 progress entry 含 attemptId、revision 和有限 phase，生成、等待、原生兜底及隐藏状态可在历史中区分；恢复历史不复活已结束的进度。不占 footer、不抢输入，也不覆盖其他工作消息。
 
 每次尝试单独记录已知 usage：SDK 合成的全零用量或没有可证明计量的响应标为 unknown，不解释为免费；error/aborted 响应有正数计量时保存这些值并标为 partial（余量未知）；stop/length/toolUse 的正数计量标为 reported。以物理响应终结状态而非本地取消标志判断完整性，迟到成功响应可为 reported。采用结果的已知 usage 交给原生 CompactionEntry；未采用请求需额外账目，不能假定自动进入原生会话总计。不进入模型上下文的 custom usage entry 记录 attemptId、型号、终态、已知用量及采用关系，详情按需展开，常规行展示已知 input/output/cache/total tokens 与 SDK 估算 cost，展开行显示费用分项及 reasoning/cacheWrite1h 子集；partial 保留已知数和未知余量，unknown 不标为零。已采用计入原生 totals，额外请求单列，避免重复。
 
-候选和原文副本只保存在内存，不新增摘要缓存文件。调度、progress、取消、失败、usage 及阶段耗时诊断通过 Pi 非模型上下文 custom entry 写入 Session JSONL，不新增数据库或传输。取消使用 deadline/user/host/off/scope/native/unknown 等有限分类；失败只保留阶段、stopReason、有限内容类型及长度统计、允许的错误分类/HTTP 状态，不保存原始错误文本或 provider body。未知用量不解释为零消耗，诊断故障不能替代业务终态；阶段记录为 schemaVersion 1，包含 sampleId、kind、startedAtUTC（时钟不可读时为 null）、durationMs、outcome、model/provider 和有限 unknownReason；时钟无效或物理终态不可观察时，durationMs 为 null 且 outcome 为 unknown，不伪造纪元时间或零耗时。不保存会话标识、原始 prompt、headers、provider body 或凭证。后台生成从 streamSimple 调用前开始，在 result resolve/reject 第一时间单调计时结算；前台阶段从符合条件的 threshold handler 入口开始，到宿主 compact/compact_failed 入口结算。阶段结束后以两个独立 renderer 标签显示秒数或“未知”。`reporting.ts` 对 progress/usage append 的公共出口做 best-effort 隔离，Controller 与命令提示异常也不传播到模型/原生 hook；诊断写入失败时不宣称记录成功、不补造样本、不重试，继续既有候选、取消、usage 与原生压缩路径。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复；`--no-session` 记录仅在当前进程可见。
+候选和原文副本只保存在内存，不新增摘要缓存文件。调度、progress、取消、失败、usage 及阶段耗时诊断通过 Pi 非模型上下文 custom entry 写入 Session JSONL，不新增数据库或传输。取消使用 deadline/user/host/off/scope/native/unknown 等有限分类；失败只保留阶段、stopReason、有限内容类型及长度统计、允许的错误分类/HTTP 状态，不保存原始错误文本或 provider body。未知用量不解释为零消耗，诊断故障不能替代业务终态；阶段记录为 schemaVersion 1，包含 sampleId、kind、startedAtUTC（时钟不可读时为 null）、durationMs、outcome、model/provider 和有限 unknownReason；后台样本另含本地 attemptId，用于匹配采用，不加入远端 DTO；时钟无效或物理终态不可观察时，durationMs 为 null 且 outcome 为 unknown，不伪造纪元时间或零耗时。不保存会话标识、原始 prompt、headers、provider body 或凭证。后台生成从 streamSimple 调用前开始，在 result resolve/reject 第一时间单调计时结算；前台阶段从符合条件的 threshold handler 入口开始，到宿主 compact/compact_failed 入口结算。阶段结束后以两个独立 renderer 标签区分后台生成与前台阶段，短于一秒使用毫秒，较长使用秒或分秒，未知不补零。
+
+主 TUI 的 `compaction-duration` 成功记录使用 schemaVersion 2，携带当前活动分支新 compaction ID、来源、匹配的后台耗时、上下文前后 token 估算及差值/比例；Controller 先给出严格 adopted attempt 判定，observer 只以此判定标为后台采用。原生、其他 hook 和未知来源分别展示，不能用同文摘要或旧事件指针借用后台耗时。计时终点在宿主终态 hook 入口捕获，不包含后续诊断处理。失败、取消、未知及旧记录保留 schemaVersion 1 语义，读取恢复不回填、不改写历史；关联丢失或数值校验失败时不展示采用或收益。
+
+效果估算分别重建实际新 compaction 提交前和提交边界处的 canonical 投影，不包括终态 handler 之后新增的内容；每侧通过公开的 `getCurrentSystemMessage` 还原 system/tools checkpoint，非 system 消息经 `convertToLlm` 后用 `estimateTokens` 计数，包含摘要包装。缺 checkpoint 时才使用当前 prompt/active tools 的估算，无法可靠取得则为未知。两侧使用相同本地估算方法，不混入宿主 usage 或下一次模型响应；与候选 `fits()` 的安全预算检查独立。零收益显示未减少，负收益显示增加，零分母比例未知；v2 校验差值及比例的一致性，不将损坏数据解释为收益。
+
+`reporting.ts` 对 progress/usage append 的公共出口做 best-effort 隔离，Controller 与命令提示异常也不传播到模型/原生 hook；诊断写入失败时不宣称记录成功、不补造样本、不重试，继续既有候选、取消、usage 与原生压缩路径。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复；`--no-session` 记录仅在当前进程可见。
 
 ## 8. 验证计划
 
@@ -257,7 +265,7 @@ Pi 1.1.0 的 runner 依次 await handler，并保留最后一个非空返回对�
 | --- | --- |
 | Controller | 全部主/子 Agent 采用本机 on/off；latent On 不绕过实际模型/设置；取消导航与成功 tree、每 Agent 单任务、冷却、超时和跨 branch 迟到结果。旧“child 不启用”断言只证明当前 gate，须替换为目标适配验收 |
 | `compaction.ts` | 追加允许、prefix edit 拒绝、换分支、上一份摘要改变、工具配对、切点衔接及巨大增量 |
-| 原生压缩 hooks | 已物化历史的 next-turn/post-run 同任务等待、未知 preflight 旁路、600 秒剩余预算与截止竞争、Esc/Off/宿主取消、manual/overflow、后置 handler 改历史或覆盖、实际采用及 JSONL 身份恢复 |
+| 原生压缩 hooks | 已物化历史的 next-turn/post-run 同任务等待、未知 preflight 旁路、默认及显式配置的剩余预算与截止竞争、Esc/Off/宿主取消、manual/overflow、后置 handler 改历史或覆盖、实际采用及 JSONL 身份恢复 |
 | 测试隔离 | 偏好写入显式注入合成 settings 路径；继承外部 `PI_MY_EXTENSIONS_SETTINGS_FILE` 的有效 JSON 哨兵保持字节不变，以解析、真实偏好读取及临时负控制排除无效配置造成的假通过，覆盖 loader/命令/恢复路径。SDK/TUI fixture 注销自身的进程监听，等待监听清理针对原始 signal 对象 |
 | 用量与恢复 | 采用/丢弃/失败/取消去重，unknown，关闭边界，连续压缩与会话恢复 |
 | machine preference / generic duration | [`machine-preferences.test.ts`](../../packages/async-compaction/test/machine-preferences.test.ts)、[`duration.test.ts`](../../packages/async-compaction/test/duration.test.ts) 是现有候选测试入口；新目标还需 RPC/JSON/print/SDK、两真实进程、在途状态更新和无 UI 本地恢复，不能只检查 JSON 文件 |
@@ -290,9 +298,9 @@ Pi 1.1.0 的 runner 依次 await handler，并保留最后一个非空返回对�
 | 目标 / 问题 | 当前事实 | 处理 |
 | --- | --- | --- |
 | 完整工具轮调度与可解释门禁 | 完整 stop 与已持久化完整工具轮均检查准备；有限原因按代际有界记录，配置读取失败及入口拒绝也可区分 | 历史没有记录的开关、队列或运行版本不能反推为已证实根因；诊断失败或容量限制不冒称完整记录 |
-| 自动压缩等待与生成预算 | 后台调用共用 600 秒单调生成预算，已物化历史的自动 threshold 可等待同一任务剩余时间；取消/Off/超时与迟到结算有合成测试 | 未物化新输入 preflight 保留原生；600 秒不是包含兜底的完成 SLA，真实 provider 延迟与费用仍未验收 |
+| 自动压缩等待与生成预算 | 后台调用捕获本机配置的单调生成预算（缺省 900 秒），已物化历史的自动 threshold 可等待同一任务剩余时间；显式配置、非法字段、在途 deadline 不变及取消/迟到结算有假时钟与扩展接线测试 | 未物化新输入 preflight 保留原生；生成预算不是包含兜底的完成 SLA；配置不修改 installed 副本，真实 provider 延迟与费用仍未验收 |
 | 实际采用与恢复身份 | 以活动分支新提交 entry 的合法 attempt details 确认采用，不按同文猜测、不事后补写宿主身份；同文覆盖与恢复有 SDK 回归 | 有限 SDK 组合不代表未来宿主或任意第三方组合通过 |
-| 本地阶段耗时 | `timing.ts` 有后台生成和受支持 threshold 阶段计量；`duration.ts` 候选有本地单调计时、branch delta 与 renderer，以及相应单测/隔离运行报告 | 全部 Agent 和无 UI 恢复尚未实现；候选未完成新目标的独立评审/验收；真实 provider 与 A12 效果未验证 |
+| 本地耗时与压缩效果 | `timing.ts` 有后台生成和受支持 threshold 阶段计量；主 TUI 的 `duration.ts` 以新提交关联来源、独立阶段及 canonical 前后估算，覆盖零/负收益、坏关联和 v1 恢复；单测与合成 SDK 路径有证据 | 全部 Agent 和无 UI 恢复尚未实现；新展示未在用户实际安装终端验收；真实 provider 与 A12 效果未验证 |
 | 后台生成、验证、原生接入 | 已实现完整用户切点、有效投影 hash、原生 threshold hook、连续同文提交与不同来源同文覆盖的身份校验 | 真实 provider、全部入口及未覆盖的第三方组合仍需验证；源码不以隔离 CLI profile 作为采用条件 |
 | 原生压缩入口复用 | 已注册 threshold hook 并交还 Pi 提交；单次隔离 SDK 命中已验证 | 以候选复用率、全量压缩等待及原生行为兼容为验收输入 |
 | 当前主对话识别与提示 | 命令及后台调度仍受 TUI/CLI 能力限制；有合成 SDK、InteractiveMode、Esc 和过程显示验证，不要求唯一显式扩展入口 | headless、SDK Worker 后台能力及真实完整组合未验收，读取本机偏好不等于全部入口可用 |
@@ -304,6 +312,6 @@ Pi 1.1.0 的 runner 依次 await handler，并保留最后一个非空返回对�
 | 真实宿主命中 | 既有两版本 SDK 验证连续 threshold 提交、文件接续及恢复；隔离 CLI/PTY 与本地合成 provider 的前置证据仍按原范围使用 | 不证明新目标的全部入口、fork/reload、Fast 联用、真实 provider 性能或多进程并发写 |
 | 阶段提示与开销 | 过程 entry 按 generating/waiting/native fallback 渲染；实际 CLI 验证等待/兜底期间可见、终态无需新输入收起，后台结算不清除前台阶段；已知数值及 native/extra/unknown 归属可见 | 真实 provider 的异常和用量形态仍需验收 |
 | 本机偏好 | 本包读取全局严格布尔字段并提供锁内更新；命令/生命周期/调度/采用边界刷新，测试显式隔离偏好路径并保护继承的外部哨兵 | 全部 Agent 的真实任务链及全机并发写仍需验收，不把 fixture 成功说成真实用户安装验证 |
-| 参数与效果门槛 | 默认 Off；600 秒预算、取消与迟到计量通过假时钟和 SDK 场景验证 | L1 A12 的完整 threshold 效果基线、真实摘要质量/费用/网络性能及人工终端体验未验收；未验证组合保留明确边界 |
+| 参数与效果门槛 | 默认 Off；全局可配置预算、取消与迟到计量通过假时钟和 SDK 场景验证 | L1 A12 的完整 threshold 效果基线、真实摘要质量/费用/网络性能及人工终端体验未验收；未验证组合保留明确边界 |
 
 外部实现和图示见 [调研报告](../归档/研究/2026-10-17-异步上下文压缩调研.md)。研究阶段的 [路线比较](../归档/评审/2026-10-17-异步压缩-需求与方案对齐.md)保留为证据；产品规则由 L1 拥有，运行事实以后续源码和测试为准。

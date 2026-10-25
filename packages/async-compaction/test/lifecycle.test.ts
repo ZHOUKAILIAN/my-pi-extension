@@ -240,8 +240,8 @@ test("generation timeout keeps physical slot until settlement; late result canno
   const budgetClock = { monotonic: () => now, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; timers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((handle: unknown) => { if (handle && typeof handle === "object" && "active" in handle) (handle as { active: boolean }).active = false; }) as typeof clearTimeout };
   const f = fixture(), c = new Controller(f.pi, undefined, undefined, budgetClock);
   c.set(true, f.ctx); c.schedule(f.ctx);
-  assert.equal(timers.find(timer => timer.delay === 600_000)?.active, true);
-  now = 600_000; timers.find(timer => timer.delay === 600_000)?.callback();
+  assert.equal(timers.find(timer => timer.delay === 900_000)?.active, true);
+  now = 900_000; timers.find(timer => timer.delay === 900_000)?.callback();
   assert.equal(await c.offer(f.ctx, prep, new AbortController().signal), undefined);
   c.schedule(f.ctx);
   assert.equal(f.entries.filter(e => e.kind === "async-compact-progress").length, 2, "no second background request while old physical slot remains open");
@@ -435,7 +435,7 @@ test("physical timeout settlement begins a new cooldown, not the original reques
   c.set(true, f.ctx); c.schedule(f.ctx);
   assert.equal(calls, 1, `a paid fake stream was started before the absolute generation deadline; ${JSON.stringify(f.entries.filter(entry => entry.kind === "async-compact-schedule"))}`);
   assert.equal(f.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "started", JSON.stringify(f.entries.filter(entry => entry.kind === "async-compact-schedule")));
-  budgetNow = 600_001; timers.find(timer => timer.delay === 600_000)?.callback();
+  budgetNow = 900_001; timers.find(timer => timer.delay === 900_000)?.callback();
   now += 600_001;
   assert.equal(f.hasResolver(), true);
   tokens = 54_000; f.response("late", usage);

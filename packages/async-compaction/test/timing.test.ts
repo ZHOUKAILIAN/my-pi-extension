@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from "node:assert/strict";
-import { Timing } from "../src/timing.ts";
+import { Timing, validateTimingSample } from "../src/timing.ts";
 import { Controller } from "../src/controller.ts";
 import extension from "../src/index.ts";
 import { isolatedSettingsFile } from "./test-settings.ts";
@@ -43,7 +43,7 @@ test("controlled background stamps bracket streamSimple and resolve classificati
   Object.defineProperty(result, "stopReason", { get() { f.setMono(f.callStart() + 875); return "stop"; } });
   f.resolve(result); await tick();
   let sample = f.entries.find(e => e.type === "async-compact-timing")?.data;
-  assert.equal(sample.durationMs, 775); assert.equal(sample.outcome, "completed");
+  assert.equal(sample.durationMs, 775); assert.equal(sample.outcome, "completed"); assert.match(sample.attemptId, /^[0-9a-f-]{36}$/u, "local generation duration carries an opaque per-attempt correlation key");
   f.setMono(90_000); assert.ok(await f.c.offer(f.ctx, prep, new AbortController().signal));
   sample = f.entries.find(e => e.type === "async-compact-timing")?.data; assert.equal(sample.durationMs, 775, "ready wait and adoption are outside the interval");
 });
@@ -68,14 +68,32 @@ test("wall-clock jumps do not change monotonic duration; invalid clocks and unkn
   assert.equal(records[1].durationMs, null); assert.equal(records[1].outcome, "unknown"); assert.equal(records[1].unknownReason, "scope_left");
 });
 
+test('one TimingSample validator rejects malformed identity, schema, clock, duration and enum fields', () => {
+  const valid = { schemaVersion: 1, sampleId: 'sample', kind: 'background_generation', startedAtUTC: new Date(1000).toISOString(), durationMs: 100, outcome: 'completed', model: 'm', provider: 'p', attemptId: 'attempt' };
+  assert.deepEqual(validateTimingSample(valid), valid, 'well-formed completed timing is accepted');
+  for (const damaged of [
+    { ...valid, schemaVersion: 999 }, { ...valid, startedAtUTC: null }, { ...valid, sampleId: [] },
+    { ...valid, durationMs: -1 }, { ...valid, outcome: ['completed'] }, { ...valid, kind: { value: 'background_generation' } },
+  ]) assert.equal(validateTimingSample(damaged), undefined, JSON.stringify(damaged));
+  assert.ok(validateTimingSample({ ...valid, kind: 'foreground_compaction', attemptId: undefined }), 'valid foreground samples need no attempt correlation');
+});
+
 test("renderer validates full persisted schema, known values, unknown and malformed history", () => {
   const f = timingFixture(), renderer: any = f.renderers.get("async-compact-timing");
   const render = (data: unknown, theme = { fg: (_c: string, s: string) => s }) => renderer({ data }, {}, theme).render(120).join("");
   const base = { schemaVersion: 1, sampleId: "sample", startedAtUTC: new Date(1000).toISOString(), model: "m", provider: "p" };
-  assert.match(render({ ...base, kind: "background_generation", durationMs: 1234, outcome: "completed" }), /后台生成耗时: 1\.234s \(completed\)/);
-  assert.match(render({ ...base, kind: "foreground_compaction", durationMs: 2500, outcome: "failed" }), /前台压缩阶段耗时: 2\.500s \(failed\)/);
+  assert.match(render({ ...base, kind: "background_generation", durationMs: 1234, outcome: "completed" }), /后台生成耗时: 1\.2s \(completed\)/);
+  assert.match(render({ ...base, kind: "foreground_compaction", durationMs: 2500, outcome: "failed" }), /前台压缩阶段耗时: 2\.5s \(failed\)/);
+  assert.match(render({ ...base, kind: "background_generation", durationMs: 42, outcome: "completed" }), /后台生成耗时: 42ms \(completed\)/);
   assert.match(render({ ...base, kind: "foreground_compaction", startedAtUTC: null, durationMs: null, outcome: "unknown" }), /前台压缩阶段耗时: 未知 \(unknown\)/);
   assert.match(render({ ...base, kind: "foreground_compaction", durationMs: -500, outcome: "completed" }), /前台压缩阶段耗时: 未知 \(unknown\)/);
+  for (const damaged of [
+    { ...base, kind: "background_generation", durationMs: 300, outcome: "completed", schemaVersion: 999 },
+    { ...base, kind: "background_generation", durationMs: 300, outcome: "completed", startedAtUTC: null },
+    { ...base, kind: "background_generation", durationMs: 300, outcome: "completed", sampleId: [] },
+    { ...base, kind: "background_generation", durationMs: -1, outcome: "completed" },
+    { ...base, kind: "background_generation", durationMs: 300, outcome: ["completed"] },
+  ]) assert.match(render(damaged), /后台生成耗时: 未知 \(unknown\)/, "the source renderer uses the shared full TimingSample validator");
   assert.match(render({ kind: "forged", durationMs: 500, outcome: "completed" }), /async-compact 耗时: 未知 \(unknown\)/);
   assert.doesNotThrow(() => render({ ...base, kind: "background_generation", durationMs: 300, outcome: "completed" }, { fg: () => { throw Error("theme private"); } }));
 });
