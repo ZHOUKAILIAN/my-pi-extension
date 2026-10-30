@@ -110,13 +110,16 @@ test("ready candidate can be offered at next-turn threshold; preflight/manual/ov
   const argv = process.argv; process.argv = ["node", cli, "-ne", "-e", entry];
   const originalOffer = Controller.prototype.offer;
   const offered: unknown[] = [];
+  let duringOffer: (() => Promise<void>) | undefined;
   Controller.prototype.offer = async function(ctx, preparation, signal) {
     const result = await originalOffer.call(this, ctx, preparation, signal);
+    await duringOffer?.();
     offered.push(result);
     return result;
   };
   try {
-    for (const reason of ["allowed", "mid-run", "preflight", "manual", "overflow"] as const) {
+    for (const reason of ["allowed", "mid-run", "steer", "followUp", "not-persisted", "still-queued", "new-input", "overlap-steer", "overlap-followUp", "during-offer", "before-getter", "preflight", "manual", "overflow"] as const) {
+      duringOffer = undefined;
       await writeMachinePreference("asyncCompaction", true, join(agentDir, "settings.json"));
       const sm = SessionManager.inMemory(agentDir);
       const usage = { input: 18, output: 9, cacheRead: 0, cacheWrite: 0, totalTokens: 27, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -150,22 +153,56 @@ test("ready candidate can be offered at next-turn threshold; preflight/manual/ov
       await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
       const generating = entries.find(entry => entry.kind === "async-compact-progress")?.data;
       assert.ok(generating, "candidate generation started before exercising its consumer gate");
-      if (reason === "mid-run") handlers.get("agent_start")!({}, ctx);
+      if (reason === "mid-run") handlers.get("agent_start")?.({}, ctx);
       if (reason === "preflight") {
         handlers.get("agent_end")!({ messages: [] }, ctx);
         await handlers.get("input")!({ type: "input", text: "next prompt", source: "interactive" }, ctx);
       }
+      if (["steer", "followUp", "not-persisted", "still-queued", "new-input"].includes(reason)) {
+        await handlers.get("input")!({ type: "input", text: "queued", source: "interactive", streamingBehavior: reason }, ctx);
+        const input = { role: "user" as const, content: "queued", timestamp: Date.now() };
+        await handlers.get("message_end")!({ message: input }, ctx);
+        if (reason !== "not-persisted") sm.appendMessage(input);
+        if (reason === "still-queued") ctx.hasPendingMessages = () => true;
+        if (reason === "new-input") await handlers.get("input")!({ type: "input", text: "not yet consumed", source: "interactive" }, ctx);
+      }
+      if (reason === "overlap-steer" || reason === "overlap-followUp") {
+        await handlers.get("input")!({ text: "A" }, ctx);
+        await handlers.get("input")!({ text: "B" }, ctx);
+        const a = { role: "user" as const, content: "A", timestamp: Date.now() };
+        await handlers.get("message_end")!({ message: a }, ctx);
+        sm.appendMessage(a); // B is still unmaterialized even though A left the queue.
+      }
+      if (reason === "during-offer") duringOffer = async () => { await handlers.get("input")!({ text: "arrives while waiting" }, ctx); };
       const before = { reason: reason === "manual" || reason === "overflow" ? reason : "threshold", signal: new AbortController().signal,
         preparation: { tokensBefore: 2900, firstKeptEntryId: "unused", isSplitTurn: false, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, fileOps: { read: new Set(), edited: new Set(), written: new Set() } } };
       const offersBefore = offered.length;
       const result = await handlers.get("session_before_compact")!(before, ctx);
-      if (reason === "allowed" || reason === "mid-run") {
+      if (reason === "before-getter") {
+        assert.ok(result);
+        await handlers.get("input")!({ text: "arrives after offer" }, ctx);
+        assert.equal(result.compaction, undefined, "final adoption rechecks unmaterialized input");
+        assert.equal(result.cancel, false, "unchanged preparation retains native ownership");
+      } else if (reason === "allowed" || reason === "mid-run" || reason === "steer" || reason === "followUp") {
         assert.ok(result, `${reason} ready candidate with complete preparation is offered`);
+        assert.equal(result.cancel, false);
+        assert.ok(result.compaction, "the final getter still permits the actual candidate");
         assert.equal(offered.length, offersBefore + 1);
         assert.ok(offered.at(-1), "the offer spy observed a usable candidate");
+        if (reason === "steer" || reason === "followUp") {
+          sm.appendMessage({ role: "user", content: "late change after preparation", timestamp: Date.now() });
+          assert.equal(result.cancel, true, "consumed-input path retains the final preparation guard");
+          assert.equal(result.compaction, undefined, "stale preparation cannot adopt even after an earlier getter read");
+        }
+      } else if (reason === "during-offer") {
+        assert.ok(result && "cancel" in result, "input arriving during wait retains final history guard");
+        assert.equal(result.cancel, false);
+        assert.equal(result.compaction, undefined);
+        sm.appendMessage({ role: "user", content: "changed after fallback", timestamp: Date.now() });
+        assert.equal(result.cancel, true, "fallback must not use stale preparation");
       } else {
         assert.equal(result, undefined, `${reason} must leave the native compaction path in control`);
-        assert.equal(offered.length, offersBefore, `${reason} must not call Controller.offer`);
+        assert.equal(offered.length, offersBefore + (reason === "during-offer" ? 1 : 0), `${reason} must not use an unsafe offer`);
       }
       if (reason === "manual" || reason === "overflow") {
         assert.equal(backgroundSignal.aborted, true, `${reason} cancels the candidate and retains native ownership`);

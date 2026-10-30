@@ -176,7 +176,7 @@ Controller 不直接修改活跃 SessionManager、agent messages 或 JSONL；只
 
 用 `ctx.getContextUsage()` 和当前模型信息评估软触发，不把物理窗口当作剩余预算。通过 `pi.getSettings()` 读取宿主当前合并/内存设置，逐字段解析型号 override 及 fallback，不另读一份配置文件。采用时与 `preparation.settings` 对账；设置或窗口无法可靠解析时走原生路径。
 
-H 由当前型号窗口减去有效 reserve 得到；输入包括 system/tools 等已有内容。`hasPendingMessages()` 为真而无法取得体积时，拒绝采用候选；新输入尚未落入分支的 preflight 也按未知输入旁路，不能以“队列为空”推定没有即将发送的内容。已物化历史的运行中 next-turn 与 post-run 自动 threshold 可以等待，不再只限 post-run 窗口。超大工具结果仍可能一次跨过软硬阈值，交由原生保护与 overflow 恢复处理。
+H 由当前型号窗口减去有效 reserve 得到；输入包括 system/tools 等已有内容。`hasPendingMessages()` 为真而无法取得体积时，拒绝采用候选；新输入尚未落入分支的 preflight 也按未知输入旁路，不能以“队列为空”推定没有即将发送的内容。运行中 steering/follow-up 每次进入 input 即登记一个未物化输入；user `message_end` 仅登记去重后的物化对象，待所有输入都有对应对象出现在活动分支且队列已空后才解除 preflight。较早消息不能解除较新输入的门禁，不能把事件发生等同于已经持久化；等待结束及最终候选 getter 再次核验，期间新增未物化输入则保留原生路径。被其他输入 handler 截获、失败或无法配对的输入保守阻止当前作用域复用，直到作用域重置；`agent_start` 不清计数，避免首条消息误消耗较新输入的证据。不按文本猜测对应关系。已进入等待后即使发现未物化输入，也保留即时及最终历史守卫，历史过期时取消而不使用旧 preparation 原生兜底。已物化历史的运行中 next-turn 与 post-run 自动 threshold 可以等待，不再只限 post-run 窗口。超大工具结果仍可能一次跨过软硬阈值，交由原生保护与 overflow 恢复处理。
 
 等待同时竞争物理结果、剩余 deadline、宿主压缩 signal、本地取消及作用域 signal，并在退出时清理最初注册对象上的监听。用户/宿主取消结束当前压缩，不以原生兜底抵消取消；Off 允许原生继续。正常结束会清理生成 timer，截止竞争只使候选终态化一次。到期仅尽力 abort，物理请求未结算时仍占槽，迟到用量按真实结果单次结算；600 秒不包含随后原生兜底的耗时。
 
@@ -251,12 +251,31 @@ Pi 1.1.0 的 runner 依次 await handler，并保留最后一个非空返回对�
 
 候选和原文副本只保存在内存，不新增摘要缓存文件。调度、progress、取消、失败、usage 及阶段耗时诊断通过 Pi 非模型上下文 custom entry 写入 Session JSONL，不新增数据库或传输。取消使用 deadline/user/host/off/scope/native/unknown 等有限分类；失败只保留阶段、stopReason、有限内容类型及长度统计、允许的错误分类/HTTP 状态，不保存原始错误文本或 provider body。未知用量不解释为零消耗，诊断故障不能替代业务终态；阶段记录为 schemaVersion 1，包含 sampleId、kind、startedAtUTC（时钟不可读时为 null）、durationMs、outcome、model/provider 和有限 unknownReason；时钟无效或物理终态不可观察时，durationMs 为 null 且 outcome 为 unknown，不伪造纪元时间或零耗时。不保存会话标识、原始 prompt、headers、provider body 或凭证。后台生成从 streamSimple 调用前开始，在 result resolve/reject 第一时间单调计时结算；前台阶段从符合条件的 threshold handler 入口开始，到宿主 compact/compact_failed 入口结算。阶段结束后以两个独立 renderer 标签显示秒数或“未知”。`reporting.ts` 对 progress/usage append 的公共出口做 best-effort 隔离，Controller 与命令提示异常也不传播到模型/原生 hook；诊断写入失败时不宣称记录成功、不补造样本、不重试，继续既有候选、取消、usage 与原生压缩路径。进程重启丢弃未采用候选，已采用摘要按宿主会话恢复；`--no-session` 记录仅在当前进程可见。
 
+### 后台失败诊断
+
+后台失败通过 `async-compact-failure` 非模型上下文 custom entry 留在当前 Session，`schemaVersion: 1`、`attemptId` 与对应 usage 关联。它说明可观察到的失败阶段和响应形态，不等于已确定 provider 根因；历史记录缺失时不回填，也不从诊断恢复任务。
+
+| 字段 / 路径 | 当前记录边界 |
+| --- | --- |
+| `stage` | `stream_simple` 调用、`result` 观察/拒绝、`response` 校验、`response_processing` 本地处理 |
+| `reason` | 非正常结束、空文本、仅思考、非预期内容、畸形响应、同步抛错、Promise 拒绝、本地处理异常或未知；使用固定枚举 |
+| `stopReason` | `stop`、`length`、`toolUse`、`error`、`aborted`；其它值归为 `other`，不可读取归为 `unknown` |
+| `content` | 白名单块类型计数与文本字符长度，不保存正文；最多检查 256 个块、累计文本长度上限 1,000,000，超限标记 `truncated`，无法完整计算的数量或长度为 `null` |
+| `errorCategory` / `httpStatus` | 仅保留白名单异常类别、网络错误码及有限 HTTP 错误状态；其它值为 `unknown` 或 `null`。不解析或保留任意异常文本 |
+| 展示与存储 | 可见行只显示阶段、原因、结束类型；不记录请求/响应 ID、原文、思考正文、工具参数、stack、headers 或原始 provider 响应；不新增远端指标字段或投递 |
+| 故障隔离 | 提取和写入为 best-effort，与 usage 分别写入且按 attempt 去重；只在原作用域可安全记账时追加，离开后的迟到结果不写入新 Session/分支 |
+
+物理生成计时、attempt 的取消/采用结果和失败诊断是不同事实。正常物理响应后本地处理异常可以同时出现 `completed` 阶段耗时、`processing_error` 诊断和失败的 attempt；取消后的迟到成功也不重新生成候选。响应已明确为 aborted 时可留 `non_stop` 诊断，但仅本地取消并不伪造模型失败。候选必须包含非空文本，且每个文本块均为字符串；畸形文本不接入原生上下文。
+
+这些分类由离线测试验证；真实 provider 请求、历史失败的具体根因与安装后的真实 TUI 展示未由这些测试证明。
+
 ## 8. 验证计划
 
 | 范围 | 验证重点 |
 | --- | --- |
 | Controller | 全部主/子 Agent 采用本机 on/off；latent On 不绕过实际模型/设置；取消导航与成功 tree、每 Agent 单任务、冷却、超时和跨 branch 迟到结果。旧“child 不启用”断言只证明当前 gate，须替换为目标适配验收 |
 | `compaction.ts` | 追加允许、prefix edit 拒绝、换分支、上一份摘要改变、工具配对、切点衔接及巨大增量 |
+| 工具回合预生成 | Pi 1.1.0 SDK 与内存 fake provider 覆盖多工具结果持久化后启动、后台未结算时前台继续、重复回合不绕过物理槽；资格检查与入口测试覆盖工具业务错误拒绝、异常终态、不完整关联、开关刷新及软阈值。真实 provider 性能与摘要质量未验证，不据此声明压缩等待减少 |
 | 原生压缩 hooks | 已物化历史的 next-turn/post-run 同任务等待、未知 preflight 旁路、600 秒剩余预算与截止竞争、Esc/Off/宿主取消、manual/overflow、后置 handler 改历史或覆盖、实际采用及 JSONL 身份恢复 |
 | 测试隔离 | 偏好写入显式注入合成 settings 路径；继承外部 `PI_MY_EXTENSIONS_SETTINGS_FILE` 的有效 JSON 哨兵保持字节不变，以解析、真实偏好读取及临时负控制排除无效配置造成的假通过，覆盖 loader/命令/恢复路径。SDK/TUI fixture 注销自身的进程监听，等待监听清理针对原始 signal 对象 |
 | 用量与恢复 | 采用/丢弃/失败/取消去重，unknown，关闭边界，连续压缩与会话恢复 |

@@ -9,7 +9,7 @@ const calls = [
 const assistant = { role: "assistant", content: calls, stopReason: "toolUse" };
 const results = [
   { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false },
-  // A protocol-complete business error remains a completed host tool result.
+  // Prewarming requires every persisted result to be successful.
   { role: "toolResult", toolCallId: "edit-1", toolName: "edit", isError: false },
 ];
 const branch = [

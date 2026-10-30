@@ -83,6 +83,21 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
   };
   const notify = (ctx: { ui: { notify: (message: string, level: "info" | "warning") => void } }, message: string, level: "info" | "warning") => { try { ctx.ui.notify(message, level); } catch { /* diagnostics are best-effort */ } };
   let preflight = false, durationEnabled = false;
+  let pendingInputs = 0;
+  const materializingInputs: unknown[] = [];
+  const resetInputFence = () => { preflight = false; pendingInputs = 0; materializingInputs.length = 0; };
+  const inputStillPending = (ctx: Parameters<Controller["schedule"]>[0]) => {
+    if (!preflight) return false;
+    // Each input needs its own consumed user message. In particular an older
+    // queued message cannot clear a newer input still inside async input hooks.
+    // message_end precedes persistence, so also prove every observed message
+    // is in the active branch before dropping the fence.
+    if (pendingInputs > 0 && materializingInputs.length === pendingInputs && !ctx.hasPendingMessages()) {
+      const branch = ctx.sessionManager.getBranch();
+      if (materializingInputs.every(message => branch.some(entry => entry.type === "message" && entry.message === message))) resetInputFence();
+    }
+    return preflight;
+  };
   let detachInput: (() => void) | undefined;
   let foreground: { finish: ReturnType<Controller["timing"]["begin"]>["finish"]; captureEnd: ReturnType<Controller["timing"]["begin"]>["captureEnd"]; session: string; epoch: number } | null = null;
   let closed = false;
@@ -124,15 +139,17 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
       if (firstError !== undefined) throw firstError;
     },
   });
-  const leave = (_event: unknown, ctx: Parameters<Controller["leave"]>[0]) => { lastContext = ctx; const old = foreground; foreground = null; if (old && old.session === ctx.sessionManager.getSessionId() && old.epoch === control.timing.epoch) old.finish("unknown", "scope_left"); duration.leave(ctx); preflight = false; control.leave(ctx); detachInput?.(); detachInput = undefined; };
+  const leave = (_event: unknown, ctx: Parameters<Controller["leave"]>[0]) => { lastContext = ctx; const old = foreground; foreground = null; if (old && old.session === ctx.sessionManager.getSessionId() && old.epoch === control.timing.epoch) old.finish("unknown", "scope_left"); duration.leave(ctx); resetInputFence(); control.leave(ctx); detachInput?.(); detachInput = undefined; };
   pi.on("session_shutdown", async (event, ctx) => {
     lastContext = ctx;
     await shutdown(shutdownDeadline(event as object, 1000));
   });
-  pi.on("session_start", async (_event, ctx) => { foreground = null; preflight = false; durationEnabled = true; try { duration.setBranch(ctx, true); } catch {} control.reset(ctx); await refreshPreference(ctx, true); });
-  pi.on("input", async (_event, ctx) => { await refreshPreference(ctx); preflight = true; });
-  pi.on("session_tree", async (_event, ctx) => { try { duration.tree(ctx, durationEnabled); } catch { /* diagnostics cannot affect navigation */ } foreground = null; preflight = false; control.resetTree(ctx); await refreshPreference(ctx, true); });
-  pi.on("agent_start", () => { preflight = false; });
+  pi.on("session_start", async (_event, ctx) => { foreground = null; resetInputFence(); durationEnabled = true; try { duration.setBranch(ctx, true); } catch {} control.reset(ctx); await refreshPreference(ctx, true); });
+  pi.on("input", async (_event, ctx) => { preflight = true; pendingInputs++; await refreshPreference(ctx); });
+  pi.on("message_end", (event) => { if (preflight && event.message.role === "user" && !materializingInputs.includes(event.message)) materializingInputs.push(event.message); });
+  pi.on("session_tree", async (_event, ctx) => { try { duration.tree(ctx, durationEnabled); } catch { /* diagnostics cannot affect navigation */ } foreground = null; resetInputFence(); control.resetTree(ctx); await refreshPreference(ctx, true); });
+  // A new run starts before its initial user message is persisted. Keep its
+  // input credit: otherwise that message could consume a newer input's credit.
   pi.on("turn_start", async (_event, ctx) => { await refreshPreference(ctx); });
   pi.on("agent_end", (event, ctx) => { if (event.messages.some(m => m.role === "assistant" && m.stopReason === "aborted")) control.stop(ctx, ctx.signal?.aborted ? "scope" : "host"); });
   pi.on("turn_end", async (event, ctx) => {
@@ -185,13 +202,14 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
     if (!requested) { control.diagnoseSchedule("preference_off", ctx, false, "threshold_offer"); return; }
     if (!gateAtEntry || !gateBeforeOffer || ctx.mode !== "tui") { control.diagnoseSchedule("unsupported_entry", ctx, true, "threshold_offer"); return; }
     if (event.signal.aborted || ctx.signal?.aborted) { control.diagnoseSchedule("aborted_context", ctx, true, "threshold_offer"); return { cancel: true }; }
-    if (preflight) {
+    if (inputStillPending(ctx)) {
       control.diagnoseSchedule("preflight_input", ctx, true, "threshold_offer");
       if (!event.signal.aborted) control.fallback(ctx);
       return; // Unmaterialized input cannot be budgeted; Pi still owns native compaction.
     }
-    const compaction = await control.offer(ctx, event.preparation, event.signal);
+    let compaction = await control.offer(ctx, event.preparation, event.signal);
     if (compaction && "cancel" in compaction) return compaction;
+    if (inputStillPending(ctx)) compaction = undefined;
     if (nativePreparationStale()) return { cancel: true };
     if (!compaction && !event.signal.aborted) control.fallback(ctx);
     if (!compaction) {
@@ -208,7 +226,7 @@ export default function extension(pi: ExtensionAPI, dependencies: { timingClock?
       // a later context edit cannot fall through to native compaction with stale prep.
       get cancel() { return nativePreparationStale(); },
       get compaction() {
-        if (nativePreparationStale()) return undefined;
+        if (nativePreparationStale() || inputStillPending(ctx)) return undefined;
         if (decided) return decision;
         decided = true;
         try {
