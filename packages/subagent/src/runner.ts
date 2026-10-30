@@ -493,13 +493,26 @@ function validWireSessionEntry(entry: Record<string, unknown>): boolean {
   return validTreeEntry(entry, 3);
 }
 
+// Keep lexical equality for existing identities and historical/offline sessions.
+// Different spellings are equivalent only when both resolve to the same live
+// directory (e.g. macOS /tmp -> /private/tmp); lookup failures never match.
+function sameSessionCwd(reported: string, expected: string): boolean {
+  if (path.resolve(reported) === path.resolve(expected)) return true;
+  try {
+    const real = fs.realpathSync(reported);
+    return real === fs.realpathSync(expected) && fs.statSync(real).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 function validSessionHeader(header: Record<string, unknown>, sessionId: string, cwd: string, version: DiskSessionVersion, wire = false): boolean {
   const hasVersion = Object.prototype.hasOwnProperty.call(header, "version");
   if (wire && (!hasVersion || header.version !== 3)) return false;
   if (!wire && hasVersion && (!validNonNegativeInteger(header.version) || header.version !== version)) return false;
   const required = ["type", "id", "timestamp", "cwd", ...(wire || version > 1 || hasVersion ? ["version"] : [])];
   const optional = version === 1 ? ["version", "parentSession", "branchedFrom", "provider", "modelId", "thinkingLevel"] : version === 2 ? ["parentSession", "branchedFrom"] : ["parentSession"];
-  if (!exactKeys(header, required, optional) || header.type !== "session" || !validSessionId(header.id) || header.id !== sessionId || !validTimestamp(header.timestamp) || typeof header.cwd !== "string" || !path.isAbsolute(header.cwd) || path.resolve(header.cwd) !== path.resolve(cwd)) return false;
+  if (!exactKeys(header, required, optional) || header.type !== "session" || !validSessionId(header.id) || header.id !== sessionId || !validTimestamp(header.timestamp) || typeof header.cwd !== "string" || !path.isAbsolute(header.cwd) || !sameSessionCwd(header.cwd, cwd)) return false;
   for (const key of ["parentSession", "branchedFrom", "provider", "modelId", "thinkingLevel"]) {
     if (header[key] !== undefined && !validString(header[key])) return false;
   }
@@ -1040,7 +1053,7 @@ export async function runPiAttempt(options: RunAttemptOptions): Promise<AttemptR
       try { await options.sideEffectFence?.close?.("runner_fenced_lifecycle_failure"); } catch { /* cleanup remains fail closed */ }
     }
 
-    const validHeader = sawHeader && headerId === options.childSessionId && path.resolve(headerCwd!) === path.resolve(options.cwd);
+    const validHeader = sawHeader && headerId === options.childSessionId && sameSessionCwd(headerCwd!, options.cwd);
     const finalErrorMessage = terminal?.stopReason === "error" && typeof terminal.errorMessage === "string" ? terminal.errorMessage : undefined;
     const finalStatus = terminal?.stopReason === "error" ? extractStatus(terminal) : undefined;
     if (wasAborted) result.failureKind = "cancelled";
