@@ -115,6 +115,8 @@ sequenceDiagram
 
 runner 必须解析 JSON stream 的首条 `session` header、`message_end` 和两代 Pi 共用的 `tool_execution_end.result`；不得继续监听不存在的 `tool_result_end`。child `close` 的 signal exit、空 stdout、缺 header、任一截断/无效非空 JSONL 记录或缺 terminal JSON 必须为失败，不能把 `code === null` 归零成功。
 
+stdout 首 header、进程结束复核及 on-disk header 共用 cwd 比较：词法规范路径相等时保留既有行为；不同拼写仅在双方 `realpath` 成功、结果相同且为目录时接受。不同目录、悬空链接或解析异常不匹配。该比较不改变 session ID、协议 schema、文件 owner/symlink 校验，也不改变持久 identity key 的词法 cwd 输入；同句柄续接仍需使用原请求 cwd。它不提供目录被并发替换时的 OS 级隔离保证。
+
 Pi 1.0.4 与 1.1.x 的 stdout 与 on-disk session 双边界定向校验已建模字段。两版共有 assistant 的 `thinkingLevel`、`providerThinkingLevel`、`diagnostics`、`usage` 与 `nestedCalls`；`durationMs` 是 1.1.x 新增字段，出现在 assistant/tool-result 消息以及 `tool_execution_end` 事件。runner 沿所有已建模的携带消息 stdout envelope（包括 `turn_end`、`agent_end`、`message_update`、`entry_appended` 的嵌套消息）检查该字段：settlement 之前记录版本约束，legacy settlement `{type}` 与任何 1.1-only `durationMs` 混用 fail closed。1.0.4 的 `agent_settled` 只有 `{type}`，只表示已 settle，不提供 abort bit，也不覆盖当前 terminal；1.1.x 的 `{type,aborted:boolean}` 才提供 settle-level abort 裁决；system `toolsAdded` 按 Tool 字段闭集及 `constrainedSampling` 类型校验，`turn_start` 只有 `type`。未知字段、错类型及未建模事件 fail closed。协议校验失败使用固定安全诊断 `Pi protocol validation failed`，与进程/生命周期及 provider 请求失败分开；本地 abort 的分类和原因优先。离线 dispatcher 回归覆盖该诊断经 attempt、details、metadata 与 registry reason 传播，raw prompt/task/stderr/token 不得穿透。quarantined 记录不自动解除或重跑。
 
 同一 identity 运行中再次委派应返回 session-busy，不允许两个 child 进程同时写同一历史。进程崩溃导致的 stale lock 只能在确认 child 已不存在后清理；不得自动删除未知存活进程的锁。当前实现的保守窗口是：`starting` 标记后默认 5 秒内不接管；窗口后检查记录 PID，并扫描同主机进程表中带匹配 `--mode json --session-id <childSessionId>` 或恢复用绝对 `--session <sessionPath>` 的 child。进程表失败、旧 lock 缺少可匹配 identity/path、PID 检查返回非 `ESRCH` 或发现匹配命令时均保持 busy；只有完整扫描成功且没有匹配 child 才允许接管。该机制只证明可观察到的同主机 Pi CLI 进程不存在，不等价于 OS sandbox，也不能覆盖进程表权限、平台命令差异或扫描竞态；真实跨进程崩溃回放仍未验证。
@@ -205,7 +207,7 @@ GC 只处理 Dispatcher 管理的 child session/lock/metadata。Extension 在每
 | 自动化覆盖 | Pi 1.0.4 与 1.1.0 正常流/持久会话、工具事件、同句柄续接、未知字段与错类型拒绝、legacy/current settled 裁决优先级、安全诊断传播、协议与生命周期原因分离，以及 v1/v2 拒绝新版 system 消息。 |
 | 并发门禁风险 | 默认并发全量测试存在 fence 握手失败：服务端发送 ACK 并 resolve handshake 后写 child stdin，不保证 child 已收到 ACK；存在 `stdin-before-handshake` 反例。graceful/handshake 超时的逐次原因与 adoption 并发测试波动的根因未确认。串行或隔离通过不能关闭默认并发门禁。 |
 | 真实运行覆盖 | 已验证隔离环境中的真实 Pi 1.0.4 与 1.1.0、确定性本地 provider、持久 child 创建、`read` 工具回合和同 handle/child session 续接；两版本的 registry settled 与完整 session 校验通过，1.1.x 其他 patch 未逐个做真实 E2E。禁用 ambient extensions/MCP/skills/context 的验证不等同于正常 TUI 安装链路或 reload 验收。 |
-| 路径身份 | `/var` 与 `/private/var` 别名可能被严格 header 身份校验拒绝；规范真实路径通过不代表任意别名受支持，也不自动解除已有 quarantine。 |
+| 路径身份 | stdout/on-disk header 支持能解析到同一目录的 cwd 别名（包括 macOS `/tmp` 与 `/private/tmp`），并在 child 退出时复核。离线回归覆盖双向别名、拒绝反例、目录链接改投、真实 Node 子进程 cwd 规范化及同句柄创建/续接；未验证正常安装链路的 Pi/provider E2E。不迁移 identity key，不自动解除已有 quarantine 或重跑任务。 |
 
 评审裁决、单次命令结果与验收经过见[兼容验证记录](../归档/评审/2026-10-08-subagent-pi-1.1-兼容验证记录.md)；这些过程证据不替代当前契约或未关闭的门禁。
 

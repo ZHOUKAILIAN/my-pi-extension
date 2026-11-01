@@ -83,6 +83,8 @@ test("real SDK tool turn starts background generation after all persisted result
     assert.equal(foreground, 6, "a later foreground run also proceeds while the same background call is pending");
     assert.equal(background, 1, "repeated qualifying tool turns cannot bypass the single physical request slot");
     const branch = sm.getBranch();
+    const scheduleRecords = branch.filter(entry => entry.type === "custom" && entry.customType === "async-compact-schedule");
+    assert.ok(scheduleRecords.some(entry => entry.data?.trigger === "completed_tool_turn"), "completed tool-turn scheduling is recorded distinctly");
     const toolCalls = branch.filter(entry => entry.type === "message" && entry.message.role === "assistant" && entry.message.stopReason === "toolUse");
     const toolResults = branch.filter(entry => entry.type === "message" && entry.message.role === "toolResult");
     assert.equal(toolCalls.length, 2);

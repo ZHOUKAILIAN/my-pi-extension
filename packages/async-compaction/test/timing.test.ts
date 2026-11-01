@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import { Timing } from "../src/timing.ts";
 import { Controller } from "../src/controller.ts";
 import extension from "../src/index.ts";
+import { isolatedSettingsFile } from "./test-settings.ts";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { fileURLToPath } from "node:url";
 
@@ -253,10 +254,10 @@ function hookHarness(options: { failAppend?: (type: string, data: any) => boolea
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const agentDir = mkdtempSync(join(tmpdir(), 'async-duration-agent-')); preferenceDirs.push(agentDir);
   process.env.PI_CODING_AGENT_DIR = agentDir;
-  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 }, submitMetric: options.submitMetric as any });
+  extension(pi as never, { timingClock: { monotonic: () => { clockReads.push(now); return now; }, utc: () => 1000 }, submitMetric: options.submitMetric as any, settingsFile: isolatedSettingsFile(agentDir) });
   if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR; else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
   const ctx: any = { mode: "tui", model: null, ui: { notify: (m: string) => { notices.push(m); if (options.failNotify) throw Error("private hook notify"); }, onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => { if (bumpTerminalGuard) { now += 900; bumpTerminalGuard = false; } return session; }, getBranch: () => { now += 37; return branch; } } };
-  const before = (reason: string) => emit("session_before_compact", { reason, signal: new AbortController().signal, preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
+  const before = (reason: string) => emit("session_before_compact", { reason, signal: new AbortController().signal, branchEntries: [...branch], preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() }, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } } }, ctx);
   const terminal = (failed = false, aborted = false, reason = 'threshold') => { bumpTerminalGuard = true; const endAt = now; if (!failed) branch.push({ id: `compact-${branch.length}`, type: 'compaction' }); emit(failed ? "session_compact_failed" : "session_compact", failed ? { aborted, reason } : { compactionEntry: { id: 'stale-host-pointer' }, reason }, ctx); bumpTerminalGuard = false; return endAt; };
   return { events, emit, entries, notices, command, ctx, before, terminal, setSession: (v: string) => session = v, advance: (n: number) => now += n, now: () => now, clockReads };
 }

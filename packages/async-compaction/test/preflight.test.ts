@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { ModelRuntime, SessionManager, SettingsManager, DefaultResourceLoader, createAgentSession } from "@earendil-works/pi-coding-agent";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import extension from "../src/index.ts";
+import { isolatedSettingsFile } from "./test-settings.ts";
 
 const tick = () => new Promise(r => setTimeout(r, 10));
 test("SDK threshold fallback commits natively while physical background slot is pending; late usage is accounted", async () => {
@@ -16,6 +17,9 @@ test("SDK threshold fallback commits natively while physical background slot is 
   process.argv = ["node", fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")).replace(/\/dist\/index\.js$/, "/dist/bundle/cli.js"), "--no-extensions", "-e", resolve("packages/async-compaction/src/index.ts")];
   let release!: () => void;
   const gate = new Promise<void>(r => release = r);
+  let now = 0;
+  const timers: { callback: () => void; delay: number; active: boolean }[] = [];
+  const budgetClock = { monotonic: () => now, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; timers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((handle: unknown) => { if (handle && typeof handle === "object" && "active" in handle) (handle as { active: boolean }).active = false; }) as typeof clearTimeout };
   let background = 0, foreground = 0;
   const errors: unknown[] = [];
   const runtime = await ModelRuntime.create({ authPath: join(cwd, "missing-auth.json"), modelsPath: null, refreshOnCreate: false });
@@ -36,7 +40,7 @@ test("SDK threshold fallback commits natively while physical background slot is 
     })(); return stream;
   }, models: [{ id: "m", name: "M", reasoning: true, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 4096, maxTokens: 512 }] });
   const sm = SessionManager.create(cwd, dir);
-  const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, extensionFactories: [extension] }); await loader.reload();
+  const loader = new DefaultResourceLoader({ cwd, agentDir, noExtensions: true, extensionFactories: [pi => extension(pi, { budgetClock, settingsFile: isolatedSettingsFile(agentDir) })] }); await loader.reload();
   const { session } = await createAgentSession({ cwd, agentDir, model: runtime.getModel("fake", "m"), thinkingLevel: "off", modelRuntime: runtime, resourceLoader: loader, sessionManager: sm, settingsManager: SettingsManager.inMemory({ compaction: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, retry: { enabled: false } }), noTools: true });
   await session.bindExtensions({ mode: "tui", uiContext: { notify() {}, onTerminalInput: () => () => {} } as never, onError: e => errors.push(e) });
   try {
@@ -44,7 +48,12 @@ test("SDK threshold fallback commits natively while physical background slot is 
     const user = (n: number) => `user-${n} ` + "word ".repeat(160);
     await session.prompt(user(1)); await session.prompt(user(2));
     assert.equal(background, 1, JSON.stringify(errors));
-    await session.prompt(user(3)); // bounded wait expires while the background request is still pending
+    const pending = session.prompt(user(3));
+    for (let i = 0; i < 100 && timers.filter(timer => timer.active && timer.delay === 600_000).length < 2; i++) await tick();
+    const waitTimer = timers.filter(timer => timer.active && timer.delay === 600_000).at(-1);
+    assert.ok(waitTimer, "SDK threshold entered the same-task background wait");
+    now = 600_000; waitTimer.callback();
+    await pending; // fake-clock deadline expires while provider ignores abort
     assert.ok(sm.getBranch().some(e => e.type === "compaction" && !e.fromHook), JSON.stringify(errors));
     const stage = sm.getBranch().find(e => e.type === "custom" && e.customType === "async-compact-timing" && e.data?.kind === "foreground_compaction");
     assert.ok(stage && stage.data.outcome === "completed" && stage.data.durationMs >= 0, "waiting then native fallback is one completed foreground stage");

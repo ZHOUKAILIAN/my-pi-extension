@@ -9,8 +9,8 @@ const calls = [
 const assistant = { role: "assistant", content: calls, stopReason: "toolUse" };
 const results = [
   { role: "toolResult", toolCallId: "read-1", toolName: "read", isError: false },
-  // A protocol-complete business error remains a completed host tool result.
-  { role: "toolResult", toolCallId: "edit-1", toolName: "edit", isError: true },
+  // Prewarming requires every persisted result to be successful.
+  { role: "toolResult", toolCallId: "edit-1", toolName: "edit", isError: false },
 ];
 const branch = [
   { id: "assistant-entry", type: "message", message: assistant },
@@ -22,8 +22,10 @@ const event = (overrides: Record<string, unknown> = {}) => ({
   messageEntryId: "assistant-entry", toolResultEntryIds: ["read-entry", "edit-entry"], ...overrides,
 });
 
-test("accepts a persisted multi-tool turn only when assistant calls and result entries match", () => {
+test("accepts only fully successful persisted multi-tool turns with matching assistant calls and results", () => {
   assert.equal(hasCompletedToolTurn(event() as any, branch), true);
+  assert.equal(hasCompletedToolTurn(event({ toolResults: [results[0], { ...results[1], isError: true }] }) as any, branch), false, "a business-error result rejects the complete turn");
+  assert.equal(hasCompletedToolTurn(event() as any, branch.map((entry, index) => index === 2 ? { ...entry, message: { ...entry.message, isError: true } } : entry)), false, "persisted error result rejects even if event metadata claims success");
   assert.equal(hasCompletedToolTurn(event({ toolResults: [{ ...results[0] }, { ...results[1], toolCallId: "other" }] }) as any, branch), false, "wrong call ID");
   assert.equal(hasCompletedToolTurn(event({ toolResultEntryIds: ["read-entry", "read-entry"] }) as any, branch), false, "duplicate result entry ID");
   assert.equal(hasCompletedToolTurn(event({ toolResultEntryIds: ["read-entry", "missing"] }) as any, branch), false, "unpersisted result");

@@ -11,6 +11,7 @@ import { settings } from "../src/compaction.ts";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { writeMachinePreference } from "../src/machine-settings.ts";
 import { Controller } from "../src/controller.ts";
+import { isolatedSettingsFile } from "./test-settings.ts";
 
 const entry = "/tmp/repo/packages/async-compaction/src/index.ts";
 let agentDir: string;
@@ -28,7 +29,7 @@ test("command validation, idempotence, mode rejection and session reset", async 
   let handler!: (args: string, ctx: unknown) => Promise<void>;
   const events = new Map<string, (event: unknown, ctx: unknown) => void>();
   const pi = { registerCommand: (_name: string, command: { handler: typeof handler }) => handler = command.handler, registerEntryRenderer() {}, appendEntry() {}, on: (name: string, callback: (event: unknown, ctx: unknown) => void) => events.set(name, callback) };
-  extension(pi as never);
+  extension(pi as never, { settingsFile: isolatedSettingsFile(agentDir) });
   const notices: string[] = [];
   const ctx = (mode: string) => ({ mode, ui: { notify: (s: string) => notices.push(s), onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => "a" } });
   for (const args of ["", "ON", "on extra", "reset", "on/off"]) await handler(args, ctx("tui"));
@@ -53,7 +54,7 @@ test("terminal escape observer leaves ordinary keys and paste unconsumed, and de
   let detaches = 0;
   const events = new Map<string, (event: unknown, ctx: any) => unknown>();
   extension({ registerCommand: (_name: string, command: { handler: typeof handler }) => handler = command.handler,
-    registerEntryRenderer() {}, appendEntry() {}, on: (name: string, cb: (event: unknown, ctx: any) => unknown) => events.set(name, cb) } as never);
+    registerEntryRenderer() {}, appendEntry() {}, on: (name: string, cb: (event: unknown, ctx: any) => unknown) => events.set(name, cb) } as never, { settingsFile: isolatedSettingsFile(agentDir) });
   const ctx = { mode: "tui", sessionManager: { getSessionId: () => "observer" },
     ui: { notify() {}, onTerminalInput: (cb: (data: string) => unknown) => { listener = cb; return () => { detaches++; listener = undefined; }; } } };
   const argv = process.argv; process.argv = ["node", cli, "-ne", "-e", entry];
@@ -80,19 +81,19 @@ test("enabled threshold input preflight preserves native ownership and shows/cle
     appendEntry: (kind: string, data: unknown) => entries.push({ kind, data }),
     on: (name: string, cb: (event: any, ctx: any) => unknown) => events.set(name, cb),
   };
-  extension(pi as never);
+  extension(pi as never, { settingsFile: isolatedSettingsFile(agentDir) });
   const ctx = { mode: "tui", ui: { notify() {}, onTerminalInput: () => () => {} }, sessionManager: { getSessionId: () => "a", getBranch: () => [] } };
   const argv = process.argv; process.argv = ["node", cli, "-ne", "-e", entry];
   const event = (reason: string) => ({ reason, signal: new AbortController().signal, preparation: { fileOps: { read: new Set(), edited: new Set(), written: new Set() } } });
   try {
     await handler("on", ctx);
     events.get("agent_end")!({ messages: [] }, ctx);
-    events.get("input")!({ type: "input", text: "/skill:large-prompt", source: "interactive" }, ctx);
+    await events.get("input")!({ type: "input", text: "/skill:large-prompt", source: "interactive" }, ctx);
     assert.equal(await events.get("session_before_compact")!(event("threshold"), ctx), undefined);
     assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 0, "the sample is persisted at the matching terminal hook, not at start");
     assert.equal(entries.filter(e => e.kind === "async-compact-progress").length, 1, "preflight bypass shows fallback without offering");
-    const progress = entries[0];
-    assert.deepEqual(renderer(progress).render(80), ["async-compact native fallback"]);
+    const progress = entries.find(e => e.kind === "async-compact-progress")!;
+    assert.deepEqual(renderer(progress).render(80), ["async-compact native fallback"], `entries=${JSON.stringify(entries)}`);
     events.get("session_compact")!({ compactionEntry: {} }, ctx);
     assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 1, "threshold input preflight still records a stage without a background attempt");
     assert.equal(entries.find(e => e.kind === "async-compact-timing")?.data.kind, "foreground_compaction");
@@ -105,17 +106,20 @@ test("enabled threshold input preflight preserves native ownership and shows/cle
     assert.equal(entries.filter(e => e.kind === "async-compact-timing").length, 1, "Off and unsupported opportunities do not create a foreground sample");
   } finally { process.argv = argv; }
 });
-test("ready candidate is offered only in the allowed post-run window; mid-run and preflight preserve native ownership", async () => {
+test("ready candidate can be offered at next-turn threshold; preflight/manual/overflow preserve native ownership", async () => {
   const argv = process.argv; process.argv = ["node", cli, "-ne", "-e", entry];
   const originalOffer = Controller.prototype.offer;
   const offered: unknown[] = [];
+  let duringOffer: (() => Promise<void>) | undefined;
   Controller.prototype.offer = async function(ctx, preparation, signal) {
     const result = await originalOffer.call(this, ctx, preparation, signal);
+    await duringOffer?.();
     offered.push(result);
     return result;
   };
   try {
-    for (const reason of ["allowed", "mid-run", "preflight", "manual", "overflow"] as const) {
+    for (const reason of ["allowed", "mid-run", "steer", "followUp", "not-persisted", "still-queued", "new-input", "overlap-steer", "overlap-followUp", "during-offer", "before-getter", "preflight", "manual", "overflow"] as const) {
+      duringOffer = undefined;
       await writeMachinePreference("asyncCompaction", true, join(agentDir, "settings.json"));
       const sm = SessionManager.inMemory(agentDir);
       const usage = { input: 18, output: 9, cacheRead: 0, cacheWrite: 0, totalTokens: 27, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
@@ -149,29 +153,91 @@ test("ready candidate is offered only in the allowed post-run window; mid-run an
       await new Promise(resolve => setImmediate(resolve)); await new Promise(resolve => setImmediate(resolve));
       const generating = entries.find(entry => entry.kind === "async-compact-progress")?.data;
       assert.ok(generating, "candidate generation started before exercising its consumer gate");
-      if (reason === "mid-run") handlers.get("agent_start")!({}, ctx);
+      if (reason === "mid-run") handlers.get("agent_start")?.({}, ctx);
       if (reason === "preflight") {
         handlers.get("agent_end")!({ messages: [] }, ctx);
         await handlers.get("input")!({ type: "input", text: "next prompt", source: "interactive" }, ctx);
       }
+      if (["steer", "followUp", "not-persisted", "still-queued", "new-input"].includes(reason)) {
+        await handlers.get("input")!({ type: "input", text: "queued", source: "interactive", streamingBehavior: reason }, ctx);
+        const input = { role: "user" as const, content: "queued", timestamp: Date.now() };
+        await handlers.get("message_end")!({ message: input }, ctx);
+        if (reason !== "not-persisted") sm.appendMessage(input);
+        if (reason === "still-queued") ctx.hasPendingMessages = () => true;
+        if (reason === "new-input") await handlers.get("input")!({ type: "input", text: "not yet consumed", source: "interactive" }, ctx);
+      }
+      if (reason === "overlap-steer" || reason === "overlap-followUp") {
+        await handlers.get("input")!({ text: "A" }, ctx);
+        await handlers.get("input")!({ text: "B" }, ctx);
+        const a = { role: "user" as const, content: "A", timestamp: Date.now() };
+        await handlers.get("message_end")!({ message: a }, ctx);
+        sm.appendMessage(a); // B is still unmaterialized even though A left the queue.
+      }
+      if (reason === "during-offer") duringOffer = async () => { await handlers.get("input")!({ text: "arrives while waiting" }, ctx); };
       const before = { reason: reason === "manual" || reason === "overflow" ? reason : "threshold", signal: new AbortController().signal,
         preparation: { tokensBefore: 2900, firstKeptEntryId: "unused", isSplitTurn: false, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 }, fileOps: { read: new Set(), edited: new Set(), written: new Set() } } };
       const offersBefore = offered.length;
       const result = await handlers.get("session_before_compact")!(before, ctx);
-      if (reason === "allowed") {
-        assert.ok(result, "a ready candidate with complete preparation is offered inside the allowed window");
+      if (reason === "before-getter") {
+        assert.ok(result);
+        await handlers.get("input")!({ text: "arrives after offer" }, ctx);
+        assert.equal(result.compaction, undefined, "final adoption rechecks unmaterialized input");
+        assert.equal(result.cancel, false, "unchanged preparation retains native ownership");
+      } else if (reason === "allowed" || reason === "mid-run" || reason === "steer" || reason === "followUp") {
+        assert.ok(result, `${reason} ready candidate with complete preparation is offered`);
+        assert.equal(result.cancel, false);
+        assert.ok(result.compaction, "the final getter still permits the actual candidate");
         assert.equal(offered.length, offersBefore + 1);
         assert.ok(offered.at(-1), "the offer spy observed a usable candidate");
+        if (reason === "steer" || reason === "followUp") {
+          sm.appendMessage({ role: "user", content: "late change after preparation", timestamp: Date.now() });
+          assert.equal(result.cancel, true, "consumed-input path retains the final preparation guard");
+          assert.equal(result.compaction, undefined, "stale preparation cannot adopt even after an earlier getter read");
+        }
+      } else if (reason === "during-offer") {
+        assert.ok(result && "cancel" in result, "input arriving during wait retains final history guard");
+        assert.equal(result.cancel, false);
+        assert.equal(result.compaction, undefined);
+        sm.appendMessage({ role: "user", content: "changed after fallback", timestamp: Date.now() });
+        assert.equal(result.cancel, true, "fallback must not use stale preparation");
       } else {
         assert.equal(result, undefined, `${reason} must leave the native compaction path in control`);
-        assert.equal(offered.length, offersBefore, `${reason} must not call Controller.offer`);
+        assert.equal(offered.length, offersBefore + (reason === "during-offer" ? 1 : 0), `${reason} must not use an unsafe offer`);
       }
-      if (reason === "manual" || reason === "overflow") assert.equal(backgroundSignal.aborted, true, `${reason} cancels the candidate and retains native ownership`);
-      else if (reason !== "allowed") assert.ok(entries.some(entry => entry.kind === "async-compact-progress" && entry.data.attemptId !== generating.attemptId), `${reason} signals native fallback rather than returning the candidate`);
+      if (reason === "manual" || reason === "overflow") {
+        assert.equal(backgroundSignal.aborted, true, `${reason} cancels the candidate and retains native ownership`);
+        assert.equal(entries.find(entry => entry.kind === "async-compact-cancellation")?.data.reason, "native", `${reason} retires only the async candidate and is not attributed to a user`);
+      }
+      else if (reason === "preflight") assert.ok(entries.some(entry => entry.kind === "async-compact-progress" && entry.data.attemptId !== generating.attemptId), `${reason} signals native fallback rather than returning the candidate`);
       assert.equal(sm.getBranch().some(entry => entry.type === "compaction"), false, "the extension never commits compaction itself");
       handlers.get("session_shutdown")!({}, ctx);
     }
   } finally { Controller.prototype.offer = originalOffer; process.argv = argv; }
+});
+
+test("schedule diagnostics are structured, deduplicated, bounded, and non-visible", () => {
+  const entries: { kind: string; data: any }[] = [];
+  const report = new Reporting({ registerEntryRenderer() {}, appendEntry: (kind: string, data: any) => entries.push({ kind, data }) } as never);
+  const sample = { reason: "below_threshold" as const, trigger: "assistant_stop" as const, generation: 1, entry: "tui", tokens: 100, window: 1000, reserve: 100, threshold: 585, hardLimit: 900, enabled: true };
+  report.schedule(sample); report.schedule(sample);
+  assert.equal(entries.length, 1, "identical repeated gate decisions are deduplicated");
+  assert.deepEqual(entries[0].data, { schemaVersion: 1, ...sample });
+  for (let n = 0; n < 100; n++) report.schedule({ ...sample, tokens: n });
+  assert.equal(entries.length, 1, "token fluctuations during low-pressure polling do not consume diagnostic slots");
+  for (const reason of ["pending_input", "preference_off", "effective_settings_unavailable"] as const) report.schedule({ ...sample, reason, tokens: 900 });
+  assert.deepEqual(entries.slice(1).map(entry => entry.data.reason), ["pending_input", "preference_off", "effective_settings_unavailable"], "later high-pressure and gate failures remain observable after repeated low-pressure checks");
+  for (let n = 0; n < 70; n++) report.schedule({ ...sample, reason: "slot_busy", window: 1000 + n });
+  assert.equal(entries.filter(entry => entry.data.reason === "slot_busy").length, 60, "distinct busy diagnostics remain bounded by the per-generation ceiling");
+  assert.equal(entries.at(-1)?.data.reason, "diagnostics_saturated", "omitted diagnostics leave one explicit bounded saturation marker");
+  assert.equal(entries.at(-1)?.data.suppressedReason, "slot_busy");
+  const saturatedCount = entries.length;
+  report.schedule({ ...sample, reason: "slot_busy", window: 9999 });
+  assert.equal(entries.length, saturatedCount, "repeated busy decisions after saturation do not emit repeated markers");
+  const beforeGeneration = entries.length;
+  report.schedule({ ...sample, generation: 2 });
+  assert.equal(entries.length, beforeGeneration + 1, "a new controller generation opens a fresh bounded diagnostic scope");
+  assert.equal(entries.at(-1)?.data.reason, "below_threshold");
+  assert.equal(entries.some(entry => entry.kind === "async-compact-progress"), false, "schedule explanations do not create visible progress");
 });
 
 test("effective compaction settings respect auto-disabled and model override", () => {
@@ -188,8 +254,10 @@ test("progress renders only while active; usage entries are deduplicated and con
   const pi = { appendEntry: (kind: string, data: unknown) => entries.push({ kind, data }), registerEntryRenderer: (kind: string, fn: typeof renderer) => { if (kind === "async-compact-progress") renderer = fn; else if (kind === "async-compact-usage") usageRenderer = fn as typeof usageRenderer; } };
   const report = new Reporting(pi as never);
   report.start("a");
+  assert.equal(entries.find(entry => entry.kind === "async-compact-progress")?.data.phase, "generating", "persisted progress identifies the actual phase, not only its revision");
   assert.deepEqual(renderer({ data: { attemptId: "a", revision: 1 } }).render(80), ["async-compact generating"]);
   report.phase("a", "waiting");
+  assert.equal(entries.filter(entry => entry.kind === "async-compact-progress").at(-1)?.data.phase, "waiting");
   assert.deepEqual(renderer({ data: { attemptId: "a", revision: 1 } }).render(80), []);
   assert.deepEqual(renderer({ data: { attemptId: "a", revision: 2 } }).render(80), ["async-compact waiting for background summary"]);
   report.phase("native", "fallback");

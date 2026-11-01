@@ -70,14 +70,21 @@ export function failureDiagnostic(input: Parameters<typeof buildFailureDiagnosti
 }
 export type RecordData = { attemptId: string; model: string; provider: string; outcome: Outcome; metering: Metering; usage: Usage | null; includedInNativeTotals: boolean };
 export type Phase = "generating" | "waiting" | "fallback";
+export type ScheduleTrigger = "assistant_stop" | "completed_tool_turn" | "threshold_offer" | "unknown";
+export type ScheduleReason = "preference_off" | "preference_read_failed" | "unsupported_entry" | "incomplete_turn" | "failed_turn" | "aborted_turn" | "aborted_context" | "pending_input" | "preflight_input" | "no_model" | "effective_settings_unavailable" | "unknown_usage" | "below_threshold" | "slot_busy" | "ready_candidate" | "settings_changed" | "invalid_candidate" | "insufficient_fit" | "cooldown" | "growth" | "no_plan" | "started" | "schedule_error" | "diagnostics_saturated";
+
 export class Reporting {
   private active = new Map<string, { phase: Phase; revision: number }>();
   private recorded = new Set<string>();
+  private scheduleKeys = new Set<string>();
+  private scheduleCount = 0;
+  private scheduleGeneration: number | null = null;
+  private scheduleSaturated = false;
   private pi: ExtensionAPI;
   private append(type: string, data: unknown) { try { this.pi.appendEntry(type, data); } catch { /* diagnostics are best-effort and never alter compaction */ } }
   constructor(pi: ExtensionAPI) {
     this.pi = pi;
-    pi.registerEntryRenderer<{ attemptId: string; revision: number }>("async-compact-progress", entry => ({ render: width => {
+    pi.registerEntryRenderer<{ attemptId: string; revision: number; phase: Phase | "idle" }>("async-compact-progress", entry => ({ render: width => {
       const state = this.active.get(entry.data?.attemptId ?? "");
       return state && state.revision === entry.data?.revision ? [`async-compact ${state.phase === "generating" ? "generating" : state.phase === "waiting" ? "waiting for background summary" : "native fallback"}`.slice(0, width)] : [];
     }, invalidate() {} }));
@@ -102,11 +109,36 @@ export class Reporting {
       return new Text(theme.fg("muted", `${label}${totals ? ` — ${totals}` : ""}${detail}`), 0, 0);
     });
   }
+  schedule(data: { reason: ScheduleReason; trigger: ScheduleTrigger; generation: number; entry: string; tokens: number | null; window: number | null; reserve: number | null; threshold: number | null; hardLimit: number | null; enabled: boolean }) {
+    try {
+      if (this.scheduleGeneration !== data.generation) {
+        this.scheduleGeneration = data.generation;
+        this.scheduleKeys.clear(); this.scheduleCount = 0; this.scheduleSaturated = false;
+      }
+      // Token counts intentionally do not participate: repeated ordinary low-pressure polling
+      // must not consume separate slots before a later high-pressure reason is observed.
+      const key = `${data.reason}:${data.trigger}:${data.enabled}:${data.entry}:${data.window}:${data.reserve}`;
+      if (this.scheduleKeys.has(key)) return;
+      if (this.scheduleCount >= 64) {
+        if (!this.scheduleSaturated) {
+          this.scheduleSaturated = true;
+          this.append("async-compact-schedule", { schemaVersion: 1, ...data, reason: "diagnostics_saturated", suppressedReason: data.reason });
+        }
+        return;
+      }
+      this.scheduleKeys.add(key);
+      this.scheduleCount++;
+      this.append("async-compact-schedule", { schemaVersion: 1, ...data });
+    } catch { /* diagnostic only */ }
+  }
   start(id: string) { this.phase(id, "generating"); }
   phase(id: string, phase: Phase) {
     const revision = (this.active.get(id)?.revision ?? 0) + 1;
     this.active.set(id, { phase, revision });
-    this.append("async-compact-progress", { attemptId: id, revision });
+    this.append("async-compact-progress", { attemptId: id, revision, phase });
+  }
+  cancellation(attemptId: string, reason: "deadline" | "user" | "host" | "off" | "scope" | "native" | "unknown") {
+    this.append("async-compact-cancellation", { schemaVersion: 1, attemptId, reason });
   }
   finish(data: RecordData, diagnostic?: FailureDiagnostic) {
     this.hide(data.attemptId);
@@ -119,6 +151,6 @@ export class Reporting {
   hide(id: string, refresh = false) {
     if (!this.active.delete(id)) return;
     // A context-free entry causes InteractiveMode to render immediately, even without another user event.
-    if (refresh) this.append("async-compact-progress", { attemptId: id, revision: 0 });
+    if (refresh) this.append("async-compact-progress", { attemptId: id, revision: 0, phase: "idle" });
   }
 }

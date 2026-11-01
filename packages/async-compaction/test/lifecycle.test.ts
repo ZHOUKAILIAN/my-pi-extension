@@ -24,7 +24,7 @@ function fixture() {
     modelRegistry: { streamSimple: () => ({ result: () => new Promise(r => resolve = r) }) },
   } as any;
   const response = (value = "summary", u: unknown = usage, stopReason = "stop") => resolve({ role: "assistant", stopReason, content: [{ type: "text", text: value }], usage: u, errorMessage: "private provider body", headers: { authorization: "secret" } });
-  return { sm, append, pi, ctx, entries, notices, response, respondBlocks: (content: unknown[], reason = "stop") => resolve({ role: "assistant", content, stopReason: reason, usage, api: "fake-api", provider: "fake", model: "m", timestamp: Date.now() }), setModel: (id: string) => ctx.model = model(id), setRaw: (value: unknown) => raw = value, setPending: (value: boolean) => pending = value };
+  return { sm, append, pi, ctx, entries, notices, response, hasResolver: () => typeof resolve === "function", respondBlocks: (content: unknown[], reason = "stop") => resolve({ role: "assistant", content, stopReason: reason, usage, api: "fake-api", provider: "fake", model: "m", timestamp: Date.now() }), setModel: (id: string) => ctx.model = model(id), setRaw: (value: unknown) => raw = value, setPending: (value: boolean) => pending = value };
 }
 const prep = { tokensBefore: 2900, firstKeptEntryId: "unused", isSplitTurn: false, settings: { enabled: true, reserveTokens: 512, keepRecentTokens: 1 } };
 
@@ -39,7 +39,20 @@ test("effective defaults, partial overrides, invalid values and virtual never se
   f.setRaw({ reserveTokens: -1 }); assert.equal(settings(f.pi, f.ctx), null);
   f.ctx.model.api = "pi-virtual"; f.setRaw({ reserveTokens: 512, keepRecentTokens: 1 });
   const c = new Controller(f.pi); c.set(true, f.ctx); c.schedule(f.ctx);
-  assert.equal(f.entries.length, 0);
+  assert.equal(f.entries.filter(entry => entry.kind === "async-compact-progress").length, 0);
+  assert.equal(f.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "effective_settings_unavailable", "configured model with unsupported compaction settings is distinct from no model");
+});
+
+test("schedule diagnostics distinguish aborted scope, pending input, missing model and unavailable effective settings", () => {
+  const aborted = fixture(), c1 = new Controller(aborted.pi); c1.set(true, aborted.ctx); const abort = new AbortController(); abort.abort(); aborted.ctx.signal = abort.signal; c1.schedule(aborted.ctx);
+  assert.equal(aborted.entries.at(-1)?.data.reason, "aborted_context");
+  const pending = fixture(), c2 = new Controller(pending.pi); c2.set(true, pending.ctx); pending.setPending(true); c2.schedule(pending.ctx);
+  assert.equal(pending.entries.at(-1)?.data.reason, "pending_input");
+  const noModel = fixture(), c3 = new Controller(noModel.pi); c3.set(true, noModel.ctx); noModel.ctx.model = undefined; c3.schedule(noModel.ctx);
+  assert.equal(noModel.entries.at(-1)?.data.reason, "no_model");
+  const noSettings = fixture(), c4 = new Controller(noSettings.pi); c4.set(true, noSettings.ctx); noSettings.setRaw({ enabled: false }); c4.schedule(noSettings.ctx);
+  assert.equal(noSettings.entries.at(-1)?.data.reason, "effective_settings_unavailable");
+  assert.ok(noSettings.entries.at(-1)?.data.trigger === "unknown", "direct controller callers are explicitly marked unknown rather than inferred from a stop reason");
 });
 
 test("ordinary effective defaults can actually start background generation without explicit token settings", async () => {
@@ -74,12 +87,14 @@ test("planning selects a useful complete prefix after a tiny first round; skips 
   g.sm.appendMessage({ role: "assistant", content: [{ type: "text", text: "tail" }], timestamp: Date.now(), api: "fake-api", provider: "fake", model: "m", stopReason: "stop", usage });
   assert.equal(plan(g.pi, g.ctx, 0), null, "even an empty summary cannot fit the tail");
   const noCall = new Controller(g.pi); noCall.set(true, g.ctx); noCall.schedule(g.ctx);
-  assert.equal(g.entries.length, 0);
+  assert.equal(g.entries.filter(entry => entry.kind === "async-compact-progress").length, 0);
+  assert.equal(g.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "no_plan", "an impossible plan has a safe reason and no request");
   const h = fixture();
   h.sm.appendMessage({ role: "user", content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }], timestamp: Date.now() });
   assert.equal(plan(h.pi, h.ctx, 0), null);
   const noImageCall = new Controller(h.pi); noImageCall.set(true, h.ctx); noImageCall.schedule(h.ctx);
-  assert.equal(h.entries.length, 0, "known image must not produce a paid request");
+  assert.equal(h.entries.filter(entry => entry.kind === "async-compact-progress").length, 0, "known image must not produce a paid request");
+  assert.equal(h.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "no_plan");
 });
 
 test("persisted system checkpoint and known file labels are budgeted before any model request", async () => {
@@ -164,6 +179,22 @@ test("ready survives generation deadline, uses new branch record even when event
   assert.equal(f.sm.getBranch().filter(e => e.type === "compaction").length, 2);
 });
 
+test("same-summary same-cut foreign or missing attempt details are never adopted or mutated", async () => {
+  for (const details of [{ kind: "other-handler", version: 1 }, undefined]) {
+    const f = fixture(), c = new Controller(f.pi);
+    c.set(true, f.ctx); c.schedule(f.ctx); f.response("same summary"); await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    const offered = await c.offer(f.ctx, { ...prep }, new AbortController().signal);
+    assert.ok(offered);
+    f.sm.appendCompaction(offered.summary, offered.firstKeptEntryId, offered.tokensBefore, details, true, offered.usage);
+    const entry = f.sm.getBranch().filter(e => e.type === "compaction").at(-1)!;
+    const before = JSON.stringify(entry);
+    c.compact(f.ctx, entry);
+    assert.equal(JSON.stringify(entry), before, "host-owned committed entry is never rewritten to manufacture Async identity");
+    assert.equal(f.entries.filter(e => e.kind === "async-compact-usage").at(-1)?.data.outcome, "discarded");
+    assert.equal(f.entries.filter(e => e.kind === "async-compact-usage").length, 1);
+  }
+});
+
 test("successful tree rotation retains a pending physical slot and never appends old work into the sibling branch", async () => {
   const f = fixture(); let calls = 0;
   f.ctx.modelRegistry.streamSimple = () => { calls++; return { result: () => new Promise(resolve => { f.response = (value = 'late', stopReason = 'stop') => resolve({ role: 'assistant', stopReason, content: [{ type: 'text', text: value }], usage, api: 'fake-api', provider: 'fake', model: 'm', timestamp: Date.now() }); }) }; };
@@ -173,6 +204,7 @@ test("successful tree rotation retains a pending physical slot and never appends
   f.sm.branch(earlierUser.id);
   c.resetTree(f.ctx); c.set(true, f.ctx);
   assert.equal(f.entries.filter(entry => entry.kind === 'async-compact-usage').length, 0);
+  assert.equal(f.entries.filter(entry => entry.kind === 'async-compact-cancellation').length, 0, "old-scope cancellation is not appended to the sibling branch");
   c.schedule(f.ctx); assert.equal(calls, 1, 'old physical request still occupies the single-request slot');
   f.response('', 'error'); await tick();
   assert.equal(f.sm.getBranch().some(entry => entry.id === originalLeaf), false);
@@ -202,11 +234,14 @@ test("cancel, late response, off/on, switch, failure and model ownership are ind
   assert.equal(h.entries.filter(e => e.kind === "async-compact-usage").at(-1)?.data.outcome, "failed");
 });
 
-test("generation timeout keeps physical slot until settlement; late result cannot revive it", async t => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  const f = fixture(), c = new Controller(f.pi);
+test("generation timeout keeps physical slot until settlement; late result cannot revive it", async () => {
+  let now = 0;
+  const timers: { callback: () => void; delay: number; active: boolean }[] = [];
+  const budgetClock = { monotonic: () => now, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; timers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((handle: unknown) => { if (handle && typeof handle === "object" && "active" in handle) (handle as { active: boolean }).active = false; }) as typeof clearTimeout };
+  const f = fixture(), c = new Controller(f.pi, undefined, undefined, budgetClock);
   c.set(true, f.ctx); c.schedule(f.ctx);
-  t.mock.timers.tick(120_001);
+  assert.equal(timers.find(timer => timer.delay === 600_000)?.active, true);
+  now = 600_000; timers.find(timer => timer.delay === 600_000)?.callback();
   assert.equal(await c.offer(f.ctx, prep, new AbortController().signal), undefined);
   c.schedule(f.ctx);
   assert.equal(f.entries.filter(e => e.kind === "async-compact-progress").length, 2, "no second background request while old physical slot remains open");
@@ -230,6 +265,7 @@ test("native preflight fallback retains a pending physical slot and records late
   f.setModel("changed"); f.response("late", usage); await tick();
   const records = f.entries.filter(e => e.kind === "async-compact-usage");
   assert.equal(records.length, 1);
+  assert.equal(f.entries.find(e => e.kind === "async-compact-cancellation")?.data.reason, "native", "native compaction retires the pending candidate with its known cause");
   assert.deepEqual(records[0].data.usage, usage);
   assert.equal(records[0].data.model, "m"); assert.equal(records[0].data.provider, "fake");
   assert.equal(records[0].data.outcome, "cancelled");
@@ -371,7 +407,7 @@ test("cleared offering failure and settled cancellation keep their fence across 
     if (outcome === "offered-failed") {
       assert.ok(await c.offer(f.ctx, prep, new AbortController().signal));
       now += 61_000; c.failed(f.ctx); // clears the settled offered attempt
-    } else { now += 61_000; c.stop(f.ctx); }
+    } else { now += 61_000; c.stop(f.ctx, "native"); }
     tokens = null;
     const kept = f.sm.getBranch().find(e => e.type === "message" && e.message.role === "user" && JSON.stringify(e.message.content).includes("user-2"))!;
     f.sm.appendCompaction("native", kept.id, 45_000, {}, false);
@@ -385,17 +421,23 @@ test("cleared offering failure and settled cancellation keep their fence across 
   }
 });
 
-test("physical timeout settlement begins a new cooldown, not the original request deadline", async t => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
-  let now = 1_000_000, tokens = 45_000, calls = 0;
-  t.mock.method(Date, "now", () => now);
-  const f = fixture(), c = new Controller(f.pi);
+test("physical timeout settlement begins a new cooldown, not the original request deadline", async () => {
+  let now = 1_000_000, budgetNow = 0, tokens = 45_000, calls = 0;
+  const originalDateNow = Date.now; Date.now = () => now;
+  const timers: { callback: () => void; delay: number; active: boolean }[] = [];
+  const budgetClock = { monotonic: () => budgetNow, setTimeout: ((callback: () => void, delay = 0) => { const timer = { callback, delay, active: true }; timers.push(timer); return timer; }) as typeof setTimeout, clearTimeout: ((handle: unknown) => { if (handle && typeof handle === "object" && "active" in handle) (handle as { active: boolean }).active = false; }) as typeof clearTimeout };
+  const f = fixture(), c = new Controller(f.pi, undefined, undefined, budgetClock);
+  for (let n = 3; n <= 160; n++) { f.append("user", n); f.append("assistant", n); }
   f.ctx.model.contextWindow = 64_000;
   f.ctx.getContextUsage = () => ({ tokens, contextWindow: 64_000 });
   const stream = f.ctx.modelRegistry.streamSimple;
   f.ctx.modelRegistry.streamSimple = (...args: unknown[]) => { calls++; return stream(...args); };
   c.set(true, f.ctx); c.schedule(f.ctx);
-  now += 120_001; t.mock.timers.tick(120_001);
+  assert.equal(calls, 1, `a paid fake stream was started before the absolute generation deadline; ${JSON.stringify(f.entries.filter(entry => entry.kind === "async-compact-schedule"))}`);
+  assert.equal(f.entries.find(entry => entry.kind === "async-compact-schedule")?.data.reason, "started", JSON.stringify(f.entries.filter(entry => entry.kind === "async-compact-schedule")));
+  budgetNow = 600_001; timers.find(timer => timer.delay === 600_000)?.callback();
+  now += 600_001;
+  assert.equal(f.hasResolver(), true);
   tokens = 54_000; f.response("late", usage);
   for (let i = 0; i < 5; i++) await Promise.resolve();
   c.schedule(f.ctx); assert.equal(calls, 1);
@@ -403,6 +445,7 @@ test("physical timeout settlement begins a new cooldown, not the original reques
   tokens = 62_000; c.schedule(f.ctx); assert.equal(calls, 2);
   c.set(false, f.ctx); f.response();
   for (let i = 0; i < 5; i++) await Promise.resolve();
+  Date.now = originalDateNow;
 });
 
 test("SDK zero error/abort and missing metering remain unknown; positive error is partial, complete late and adopted usage are reported", async () => {
